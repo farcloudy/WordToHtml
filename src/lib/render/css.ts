@@ -6,7 +6,7 @@
  * w:rFonts 的 ascii / eastAsia 分工。这是预览能和 docx 对上的基础。
  */
 
-import { BLOCK_KINDS } from '../spec'
+import { STYLE_KEYS } from '../spec'
 import type { Spec, TextStyleSpec } from '../spec'
 
 export const WTP = 'wtp'
@@ -44,14 +44,14 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     // 版心用 flex 纵向排列：flex 子项之间的 margin 不会合并，
     // 这一点很重要 —— Word 里段后与段前是相加的，而普通块级布局会取较大者。
     `.${ns}-content { display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }`,
-    `.${ns}-page-number { position: absolute; left: 0; right: 0; bottom: ${spec.page.footer}; ` +
-      `text-align: center; font-family: ${fontStack(spec.page.pageNumber.ascii, spec.page.pageNumber.eastAsia)}; ` +
-      `font-size: ${spec.page.pageNumber.sizePt}pt; line-height: 1; color: #000; }`,
+    // 页码元素只负责定位，字体字号对齐全部来自 .${ns}-footer（= 内置「页脚」样式），
+    // 这样预览的页码排版与 docx 里那条样式同源。
+    `.${ns}-page-number { position: absolute; left: 0; right: 0; bottom: ${spec.page.footer}; color: #000; }`,
     // 测量容器：必须参与布局（不能用 display:none），否则量不到行盒
     `.${ns}-probe { position: absolute; left: -100000px; top: 0; visibility: hidden; pointer-events: none; }`,
   )
 
-  for (const kind of BLOCK_KINDS) {
+  for (const kind of STYLE_KEYS) {
     const s = spec.styles[kind]
     out.push(
       `.${ns}-${kind} { font-family: ${fontStack(s.ascii, s.eastAsia)}; font-size: ${s.sizePt}pt; ` +
@@ -67,6 +67,8 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     `.${ns}-rev-ins { color: #1b7f3b; text-decoration: underline; text-decoration-color: #1b7f3b; }`,
     `.${ns}-rev-del { color: #b3261e; text-decoration: line-through; }`,
     `.${ns}-comment { background: rgba(255, 213, 0, 0.28); border-bottom: 1px dotted #a6791d; }`,
+    // 侧栏里选中某条批注时，正文里的锚点加深，方便对上位置
+    `.${ns}-comment-active { background: rgba(255, 213, 0, 0.62); }`,
   )
 
   return out.join('\n')

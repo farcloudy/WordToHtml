@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { createServer } from 'vite'
 
-import { ptToPx, resolveSpec } from '../dist-lib/wordtohtml.mjs'
+import { STYLE_KEYS, commentScopes, parseMd, ptToPx, resolveSpec } from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -76,18 +76,7 @@ try {
   })
   await page.waitForTimeout(800)
 
-  const report = await page.evaluate(() => {
-    const kinds = [
-      'title',
-      'h1',
-      'h2',
-      'h3',
-      'body',
-      'salutation',
-      'signature',
-      'listTitle',
-      'listItem',
-    ]
+  const report = await page.evaluate((kinds) => {
     const round = (v) => Math.round(v * 1000) / 1000
 
     const pages = Array.from(document.querySelectorAll('.wtp-page')).map((pageEl, index) => {
@@ -155,14 +144,33 @@ try {
     })
 
     const textarea = document.querySelector('textarea')
+    // 批注：侧栏条目 + 正文锚点。侧栏内容必须与正文锚点对得上，
+    // 否则「看得到底色、看不到内容」那个缺陷会以另一种形式回来。
+    const commentAside = document.querySelector('.wtp-comments')
+    const commentSidebar = {
+      present: commentAside !== null,
+      items: commentAside
+        ? Array.from(commentAside.querySelectorAll('li button')).map((b) => ({
+            scope: (b.querySelector('.wtp-comment-scope')?.textContent ?? '').trim(),
+            text: (b.querySelector('.wtp-comment-text')?.textContent ?? '').trim(),
+          }))
+        : [],
+    }
+    const commentAnchors = Array.from(document.querySelectorAll('.wtp-comment')).map((el) => ({
+      id: el.dataset.comment ?? '',
+      text: el.textContent ?? '',
+    }))
+
     return {
       pageCount: pages.length,
       pages,
       styles,
       continuations,
+      commentSidebar,
+      commentAnchors,
       source: textarea ? textarea.value : '',
     }
-  })
+  }, STYLE_KEYS)
 
   console.log('\n=== 1. 分页（每页内容不得超出该页版心）===')
   ok('至少渲染出一页', report.pageCount > 0)
@@ -210,13 +218,59 @@ try {
     ]
     console.log(
       `${checks.every(Boolean) ? 'ok  ' : 'FAIL'} ${kind.padEnd(10)} ` +
-        `${Math.round(got.fontSize * 100) / 100}px/${Math.round(got.lineHeight * 100) / 100}px ` +
+        `${Math.round(got.fontSize * 100) / 100}px/` +
+        `${Number.isFinite(got.lineHeight) ? Math.round(got.lineHeight * 100) / 100 : 'normal'}px ` +
         `字重${got.fontWeight} 对齐${got.textAlign} 缩进${Math.round(got.textIndent)}px ` +
         `段前后${Math.round(got.marginTop)}/${Math.round(got.marginBottom)}px`,
     )
   }
 
-  console.log('\n=== 3. 页首与续排的间距豁免 ===')
+  console.log('\n=== 3. 批注侧栏（侧栏、正文锚点、模型三者必须一致）===')
+  // 期望值不从 DOM 反推，而是把界面里的源码重新解析一遍 —— 从 DOM 反推只能证明
+  // 「DOM 与 DOM 自洽」，证明不了它跟模型一致，而模型才是导出 docx 的依据。
+  const commentModel = parseMd(report.source)
+  const expectedScopes = commentScopes(commentModel)
+  const hasComments = commentModel.comments.length > 0
+  eq('侧栏按有无批注出现', report.commentSidebar.present, hasComments)
+  eq('侧栏条目数', report.commentSidebar.items.length, hasComments ? commentModel.comments.length : 0)
+  eq('正文批注锚点数', report.commentAnchors.length, commentModel.comments.length)
+
+  for (const c of commentModel.comments) {
+    const item = report.commentSidebar.items[c.id]
+    const scope = expectedScopes.get(c.id) ?? ''
+    const anchor = report.commentAnchors.find((a) => a.id === String(c.id))
+    const checks = [
+      eq(`批注#${c.id + 1}·内容`, item?.text ?? '', c.text),
+      eq(`批注#${c.id + 1}·侧栏锚定文字`, item?.scope ?? '', `「${scope}」`),
+      eq(`批注#${c.id + 1}·正文锚点文字`, anchor?.text ?? '', scope),
+    ]
+    console.log(
+      `${checks.every(Boolean) ? 'ok  ' : 'FAIL'} 批注#${c.id + 1} ` +
+        `锚定"${anchor?.text ?? ''}" 内容"${item?.text ?? ''}"`,
+    )
+  }
+
+  // 点侧栏 → 正文锚点高亮。这条是「能看到批注内容」这个需求的落点，必须实测。
+  const firstComment = commentModel.comments[0]
+  if (firstComment) {
+    await page.click('.wtp-comments li button')
+    // Vue 的更新在微任务里，等一帧再读更稳；超时也让后面的断言给出真实差异
+    await page
+      .waitForFunction(() => document.querySelectorAll('.wtp-comment-active').length > 0, null, {
+        timeout: 3000,
+      })
+      .catch(() => {})
+    const clicked = await page.evaluate(() => ({
+      active: document.querySelectorAll('.wtp-comment-active').length,
+      text: document.querySelector('.wtp-comment-active')?.textContent ?? '',
+    }))
+    const expectedAnchor = expectedScopes.get(firstComment.id) ?? ''
+    ok('点侧栏条目后正文锚点高亮', clicked.active >= 1, `高亮 ${clicked.active} 处`)
+    eq('高亮的是被点的那条锚点', clicked.text, expectedAnchor)
+    console.log(`  ok   点第 1 条批注 → 正文高亮"${clicked.text}"`)
+  }
+
+  console.log('\n=== 4. 页首与续排的间距豁免 ===')
   for (const p of report.pages) {
     ok(
       `第${p.index}页首块段前距为 0`,
@@ -233,7 +287,7 @@ try {
     `  ok   续排片段 ${report.continuations.length} 处，页首块 ${report.pages.length} 处`,
   )
 
-  console.log('\n=== 4. 量测值 vs 渲染值（分页算术的对账）===')
+  console.log('\n=== 5. 量测值 vs 渲染值（分页算术的对账）===')
   const measurements = await page.evaluate(() => {
     const paper = window.__wtpPaper
     if (!paper) return null
@@ -289,7 +343,7 @@ try {
     }
   }
 
-  console.log('\n=== 5. 产出物 ===')
+  console.log('\n=== 6. 产出物 ===')
   const tmpDir = join(root, '.qwen', 'tmp')
   mkdirSync(tmpDir, { recursive: true })
   const sourcePath = join(tmpDir, 'demo-source.md')
@@ -314,12 +368,12 @@ try {
   console.log(`  ok   分页结果快照：${reportPath}`)
 
   const shotPath = join(tmpDir, 'preview.png')
-  const pagesEl = await page.$('.wtp-pages')
+  const pagesEl = await page.$('.wtp-root')
   if (pagesEl) {
     await pagesEl.screenshot({ path: shotPath })
-    console.log(`  ok   预览截图：${shotPath}`)
+    console.log(`  ok   预览截图（含批注侧栏）：${shotPath}`)
   } else {
-    failures.push('找不到 .wtp-pages，无法截图')
+    failures.push('找不到 .wtp-root，无法截图')
   }
 } finally {
   await browser?.close()
@@ -332,4 +386,4 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`)
   process.exit(1)
 }
-console.log('[PASS] 浏览器实测：分页无溢出、样式与规格表一致、分节页码已重排。')
+console.log('[PASS] 浏览器实测：分页无溢出、样式与规格表一致、分节页码已重排、批注侧栏与锚点一致。')

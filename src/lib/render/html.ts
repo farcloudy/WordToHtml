@@ -18,15 +18,24 @@ export function escapeHtml(text: string): string {
  * 渲染一段 inline 序列。
  *
  * prefix 是自动编号（如「一、」），跟在段首、随段落样式一起继承加粗。
- * 批注用 <span> 包住被锚定的文字，批注内容本身不进正文。
+ * 批注用 <span> 包住被锚定的文字，批注内容本身不进正文 —— 它由调用方
+ * 从模型的 comments 里取，渲染在侧栏。
+ *
+ * activeCommentId 只额外加一个类名（改背景色），不改变盒模型，
+ * 因此量测仍可复用同一个函数。
  */
-export function renderInlinesHtml(inlines: readonly Inline[], prefix = ''): string {
+export function renderInlinesHtml(
+  inlines: readonly Inline[],
+  prefix = '',
+  activeCommentId?: number | null,
+): string {
   let out = escapeHtml(prefix)
   const openComments: number[] = []
 
   for (const inline of inlines) {
     if (inline.t === 'commentStart') {
-      out += `<span class="wtp-comment" data-comment="${inline.commentId}">`
+      const active = activeCommentId != null && activeCommentId === inline.commentId
+      out += `<span class="wtp-comment${active ? ' wtp-comment-active' : ''}" data-comment="${inline.commentId}">`
       openComments.push(inline.commentId)
       continue
     }

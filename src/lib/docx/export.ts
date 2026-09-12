@@ -1,10 +1,15 @@
 /**
  * 文档模型 → docx。
  *
- * 全部走自定义段落样式（w:styleId 见 spec.ts），而不是给每个段落直接刷格式。
- * 这样有两个好处：
+ * 全部走段落样式（名字与 w:styleId 见 spec.ts），而不是给每个段落直接刷格式。
+ * 这样有三个好处：
  *   1. 在 Word 里改样式即可整篇生效，符合公文排版的工作习惯；
- *   2. 反向解析时只要认样式名就能还原层级（第 6 条的「样式名匹配」就挂在这里）。
+ *   2. 反向解析时只要认样式名就能还原层级（第 6 条的「样式名匹配」就挂在这里）；
+ *   3. 标题/正文/列表段落/页脚直接用 Word 的内置样式名，样式库里就是用户熟悉的
+ *      那几条（标题、标题 1、正文……），而不是一堆「公文××」自造样式。
+ *
+ * 「内置」的判定权在 Word 手里，依据是 w:name 是否等于它的本地化名 ——
+ * 不是 w:styleId。所以这里刻意保留 WT- 前缀的 id，只把 name 换成内置名。
  */
 
 import {
@@ -29,7 +34,7 @@ import type {
   ParagraphChild,
 } from 'docx'
 
-import { BLOCK_KINDS, ptToHalfPoints, ptToTwips } from '../spec'
+import { STYLE_KEYS, ptToHalfPoints, ptToTwips } from '../spec'
 import type { Align, LineRule, Spec, TextStyleSpec } from '../spec'
 import type { Block, DocModel, TextBlock } from '../types'
 import { computeNumbering } from '../numbering'
@@ -79,33 +84,33 @@ function lineRuleOf(r: LineRule): (typeof LineRuleType)[keyof typeof LineRuleTyp
  * 段前/段后按「行」换算成 twips。
  * docx 库没有暴露 Word 的 w:beforeLines（按行计的动态段距），所以这里按
  * 本段行距换算成固定磅值，视觉等价但不是随行距联动的动态值。
+ *
+ * 行距一律显式写出（含 auto → 单倍 240 twips）：正文的默认行距被定义成了
+ * 固定值，样式若不写就会继承它 —— 页脚那类要单倍行距的样式会被撑高。
  */
 function spacingOf(s: TextStyleSpec): {
   before: number
   after: number
-  line?: number
-  lineRule?: (typeof LineRuleType)[keyof typeof LineRuleType]
+  line: number
+  lineRule: (typeof LineRuleType)[keyof typeof LineRuleType]
 } {
-  const spacing: {
-    before: number
-    after: number
-    line?: number
-    lineRule?: (typeof LineRuleType)[keyof typeof LineRuleType]
-  } = {
+  return {
     before: ptToTwips(s.spaceBeforeLines * s.linePt),
     after: ptToTwips(s.spaceAfterLines * s.linePt),
+    line: s.lineRule === 'auto' ? 240 : ptToTwips(s.linePt),
+    lineRule: lineRuleOf(s.lineRule),
   }
-  if (s.lineRule !== 'auto') {
-    spacing.line = ptToTwips(s.linePt)
-    spacing.lineRule = lineRuleOf(s.lineRule)
-  }
-  return spacing
 }
 
-/** 导出全部段落样式定义。反向解析 docx 时用 id/name 反查 BlockKind。 */
+/**
+ * 导出全部段落样式定义。反向解析 docx 时按 name 反查 BlockKind。
+ *
+ * 不含 `body`：正文就是 Word 的 Normal，由 buildDocument 里的默认样式承担，
+ * 再单独定义一条「正文」段落样式只会多出一个同名的 Normal。
+ */
 export function paragraphStyles(spec: Spec): IParagraphStyleOptions[] {
-  return BLOCK_KINDS.map((kind) => {
-    const s = spec.styles[kind]
+  return STYLE_KEYS.filter((key) => key !== 'body').map((key) => {
+    const s = spec.styles[key]
     return {
       id: s.id,
       name: s.name,
@@ -119,32 +124,19 @@ export function paragraphStyles(spec: Spec): IParagraphStyleOptions[] {
       paragraph: {
         alignment: alignmentOf(s.align),
         spacing: spacingOf(s),
-        ...(s.firstLineChars > 0
-          ? { indent: { firstLineChars: s.firstLineChars * 100 } }
-          : {}),
+        // 必须显式写，哪怕为 0：正文的默认首行缩进会被基于它的样式继承，
+        // 抬头/落款/页脚这类不该有缩进的样式会被静默缩进 2 字符。
+        indent: { firstLineChars: s.firstLineChars * 100 },
       },
     }
   })
 }
 
-/** 页码段落。样式按需求固定：页脚居中、9pt。 */
+/** 页码段落。字体字号对齐全部来自「页脚」样式（Word 内置样式名）。 */
 function pageNumberParagraph(spec: Spec): Paragraph {
-  const pn = spec.page.pageNumber
   return new Paragraph({
-    alignment: AlignmentType.CENTER,
-    spacing: { before: 0, after: 0 },
-    children: [
-      new TextRun({
-        children: [PageNumber.CURRENT],
-        size: ptToHalfPoints(pn.sizePt),
-        font: {
-          ascii: pn.ascii,
-          hAnsi: pn.ascii,
-          eastAsia: pn.eastAsia,
-          cs: pn.ascii,
-        },
-      }),
-    ],
+    style: spec.styles.footer.id,
+    children: [new TextRun({ children: [PageNumber.CURRENT] })],
   })
 }
 
@@ -194,7 +186,13 @@ function textBlockParagraph(
     }
   }
 
-  return new Paragraph({ style: spec.styles[block.kind].id, children })
+  // 正文不挂样式：它就是 Word 的 Normal（内置「正文」），
+  // 格式定义在 buildDocument 的 styles.default.document 上。
+  const styleId = block.kind === 'body' ? undefined : spec.styles[block.kind].id
+  return new Paragraph({
+    ...(styleId ? { style: styleId } : {}),
+    children,
+  })
 }
 
 interface SectionGroup {
@@ -254,18 +252,20 @@ export function buildDocument(
     creator: meta.creator ?? 'WordToHtml',
     description: meta.description ?? '',
     styles: {
+      // 正文 = Word 的 Normal。这里定义的默认样式就是样式库里的「正文」，
+      // 正文段落不挂任何样式即落到它上面。
       default: {
         document: {
           run: {
-            font: {
-              ascii: spec.styles.body.ascii,
-              hAnsi: spec.styles.body.ascii,
-              eastAsia: spec.styles.body.eastAsia,
-              cs: spec.styles.body.ascii,
-            },
+            font: fontOf(spec.styles.body),
             size: ptToHalfPoints(spec.styles.body.sizePt),
+            bold: spec.styles.body.bold,
           },
-          paragraph: { spacing: { before: 0, after: 0 } },
+          paragraph: {
+            alignment: alignmentOf(spec.styles.body.align),
+            spacing: spacingOf(spec.styles.body),
+            indent: { firstLineChars: spec.styles.body.firstLineChars * 100 },
+          },
         },
       },
       paragraphStyles: paragraphStyles(spec),

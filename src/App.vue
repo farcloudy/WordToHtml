@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
-import { mm } from './lib/spec'
+import { MARGIN_PRESETS } from './lib/spec'
 import type { DeepPartial, Spec } from './lib/spec'
 
 const SAMPLE = [
@@ -49,15 +49,15 @@ const SAMPLE = [
 
 const source = ref(SAMPLE)
 const author = ref('张三')
-const marginMm = ref(25)
+const marginPreset = ref(MARGIN_PRESETS[0].key)
 const pageCount = ref(0)
 const exporting = ref(false)
 const paper = ref<InstanceType<typeof WordPaper> | null>(null)
 
-/** 页边距四边一起调，用来演示规格表是可覆盖的（默认 25mm 不是写死的） */
+/** 页边距整组按预设切换（四边各自取值），演示规格表可覆盖：默认值不是写死的 */
 const specOverride = computed<DeepPartial<Spec>>(() => {
-  const value = mm(marginMm.value)
-  return { page: { margin: { top: value, right: value, bottom: value, left: value } } }
+  const preset = MARGIN_PRESETS.find((p) => p.key === marginPreset.value) ?? MARGIN_PRESETS[0]
+  return { page: { margin: { ...preset.margin } } }
 })
 
 async function onExport(): Promise<void> {
@@ -83,8 +83,11 @@ onMounted(() => {
       <strong>WordToHtml · 公文 A4 预览</strong>
       <label class="field">
         页边距
-        <input v-model.number="marginMm" type="number" min="10" max="40" step="1" />
-        mm
+        <select v-model="marginPreset">
+          <option v-for="p in MARGIN_PRESETS" :key="p.key" :value="p.key">
+            {{ p.label }}
+          </option>
+        </select>
       </label>
       <label class="field">
         修订作者
@@ -160,12 +163,20 @@ onMounted(() => {
   color: #5a5f66;
 }
 
-.field input {
-  width: 56px;
+.field input,
+.field select {
   padding: 3px 6px;
   border: 1px solid #c8ccd2;
   border-radius: 4px;
   font: inherit;
+}
+
+.field input {
+  width: 56px;
+}
+
+.field select {
+  max-width: 230px;
 }
 
 .spacer {

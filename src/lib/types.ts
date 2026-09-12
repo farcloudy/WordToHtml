@@ -112,6 +112,35 @@ export function collectRevisions(doc: DocModel): RevMark[] {
 }
 
 /**
+ * 每条批注锚定的文字（Word 里叫 scope），按 id 索引。
+ * 批注可以嵌套，所以用栈而不是单个游标；锚点不成对时丢弃，不抛错。
+ */
+export function commentScopes(doc: DocModel): Map<number, string> {
+  const out = new Map<number, string>()
+  const open: { id: number; text: string }[] = []
+
+  for (const block of doc.blocks) {
+    if (block.t !== 'textBlock') continue
+    for (const inline of block.inlines) {
+      if (inline.t === 'commentStart') {
+        open.push({ id: inline.commentId, text: '' })
+        continue
+      }
+      if (inline.t === 'commentEnd') {
+        const at = open.map((o) => o.id).lastIndexOf(inline.commentId)
+        if (at >= 0) {
+          const entry = open.splice(at, 1)[0]
+          if (entry) out.set(entry.id, entry.text)
+        }
+        continue
+      }
+      for (const entry of open) entry.text += inline.text
+    }
+  }
+  return out
+}
+
+/**
  * 按字符区间切出 inline 片段（分页时把跨页的段落切开用）。
  * 批注锚点会跟着它夹住的那段文字一起被切走：起点落在 [from,to) 内才保留，
  * 终点同理，这样跨页后批注仍然锚定在同一段文字上。

@@ -60,6 +60,10 @@ const spec = ref<DeepPartial<Spec>>({
 props：`source`（类 md 源码）、`model`（直接给模型，优先于 source）、`spec`（规格覆盖）、`author`（修订与批注作者名）。
 事件：`paginated`（分页完成后给出页数）。
 
+文档含批注时，组件右侧自动出现审阅侧栏（锚定文字 + 作者 + 时间 + 内容），点条目会在正文里
+高亮对应锚点并滚动过去；没有批注时侧栏不占位。页边距预设见 `MARGIN_PRESETS`，取 `preset.margin`
+传给 `spec.page.margin` 即可整组切换。
+
 ## 源码语法
 
 一个非空行就是一段（**行与行不会合并成同一段** —— 公文写作习惯是一行一段，用空行分隔反而要多敲回车）。
@@ -105,25 +109,39 @@ props：`source`（类 md 源码）、`model`（直接给模型，优先于 sour
 | 列表标题 | 仿宋／Times New Roman | 10.5pt | ✓ | 居中 | — | 12pt 最小值 | 0／0 |
 | 列表段落 | 仿宋／Times New Roman | 10.5pt | — | 两端 | 2 字符 | 12pt 最小值 | 0／0 |
 
-- 页面默认 A4，四边 25mm（`page.margin` 可改）；页码固定在页脚居中 9pt，不提供修改入口。
-- Word 里的样式名统一带「公文」前缀（`公文正文` 等），样式 id 为 `WT-Body` 这类。
-  前缀是为了避开 Word 内置样式的中文名（中文版 Word 里 Normal 也叫「正文」，撞名会让人在
-  样式库里点错而静默串格式）。**反向解析按样式 id 匹配，不看显示名。**
+- 页面默认 A4，四边 25mm。`MARGIN_PRESETS` 提供「四边 25mm」与「公文标准（上37 下35 左28 右26）」
+  两组预设，四边各自取值；`page.margin` 也可以直接覆盖。页码段落用内置「页脚」样式（居中 9pt）。
+- 样式名对照：
+
+| 块 | docx 样式名 | 来源 |
+| --- | --- | --- |
+| `title` | 标题 | Word 内置（Title） |
+| `h1` / `h2` / `h3` | 标题 1 / 标题 2 / 标题 3 | Word 内置（Heading 1-3），自动带上大纲级别 |
+| `body` | 正文 | Word 内置（Normal）。正文段落不挂样式，格式定义在默认样式上 |
+| `listItem` | 列表段落 | Word 内置（List Paragraph） |
+| `footer` | 页脚 | Word 内置（Footer） |
+| `salutation` / `signature` / `listTitle` | 抬头 / 落款 / 列表标题 | 自定义（Word 无对应内置） |
+
+- **「内置」的判定依据是 `w:name` 与 Word 的本地化名逐字相等**（含「标题 1」中间那个空格），
+  不是 `w:styleId`。所以样式 id 仍保留 `WT-` 前缀 —— 既不影响内置归属，又能避开 `docx` 库的坑：
+  styleId 一旦撞上它的内置样式表（`Heading1`、`Title`），它会额外注入一份自己的默认定义，
+  同一份 `styles.xml` 里就会出现两个同 id 的 `w:style`。**反向解析按样式名匹配。**
+- 命中内置样式后 Word 会自动补上大纲级别，标题因此能出现在导航窗格里，这是改内置名顺带拿到的。
 
 ## 架构
 
 ```
 src/lib/
-  spec.ts            页面与样式的唯一真相源 + 单位换算
-  types.ts           文档模型（块 / 行内 / 修订 / 批注）
+  spec.ts            页面与样式的唯一真相源 + 页边距预设 + 单位换算
+  types.ts           文档模型（块 / 行内 / 修订 / 批注）+ 批注锚定文字提取
   numbering.ts       中文序数编号与层级重置
   md/parse.ts        类 md → 模型        md/serialize.ts  模型 → 类 md
-  docx/export.ts     模型 → docx（自定义段落样式、页码域、w:ins/w:del、批注）
+  docx/export.ts     模型 → docx（段落样式、页码域、w:ins/w:del、批注）
   render/css.ts      规格表 → 预览 CSS
   render/html.ts     行内标记 → HTML（预览与量测共用同一函数，保证量到即看到）
   render/measure.ts  DOM 实测：行数、行高、每行起始字符偏移
   render/paginate.ts 纯函数分页：装箱 + 跨页按行切开 + 分节重编号
-src/components/WordPaper.vue   预览组件
+src/components/WordPaper.vue   预览组件 + 批注审阅侧栏
 scripts/                       验收脚本（见下）
 ```
 
@@ -135,8 +153,8 @@ scripts/                       验收脚本（见下）
 
 | 命令 | 验的是什么 |
 | --- | --- |
-| `npm run verify:p1` | 生成 docx → **Word COM 打开** → 逐项读回 Word 实际生效的字体／字号／行距规则／段距／首行缩进字符数／样式归属／页码域／修订／批注，与规格表对账 |
-| `npm run verify:p2` | 分页器 39 项单测 + 真实浏览器（系统 Edge）实测：每页不得溢出、样式与规格表一致、页首与续排的间距豁免、**量测值与渲染值逐块对账** |
+| `npm run verify:p1` | 生成 docx → **Word COM 打开** → 逐项读回 Word 实际生效的字体／字号／行距规则／段距／首行缩进字符数／样式归属（含 Word 是否把它认成内置样式）／页码域／修订／批注，与规格表对账 |
+| `npm run verify:p2` | 分页器 39 项单测 + 真实浏览器（系统 Edge）实测：每页不得溢出、样式与规格表一致、页首与续排的间距豁免、**量测值与渲染值逐块对账**、批注侧栏与正文锚点同源（含点击高亮） |
 | `npm run verify:pages` | 同一份源码分别交给预览与 Word，比对页数与分节重编号是否一致 |
 | `npm run verify` | 以上全部 + 类型检查 |
 
@@ -161,8 +179,11 @@ scripts/                       验收脚本（见下）
 
 ## 待做
 
-- **P3 编辑层**：`WordPaper` 目前是只读的。编辑层要加的是：组件内 contenteditable、
-  仅当分页结果真的变化时才重排并恢复插入符（正常输入不重排）、工具栏（加粗／改色）、
-  修订模式开关、批注侧栏。
-- **P4 docx 反向导入**：解压 → 按 `w:styleId` 反查 `BlockKind` → 读 `w:ins`/`w:del` 与批注锚点 →
-  还原模型（`stripAutoNumber` 已备好，用于剥掉段首已有的编号避免重复编号）。
+- **P3 编辑层**：`WordPaper` 目前是只读的。已定的两点：
+  - 编辑形态：**直接在 A4 版面上编辑**（contenteditable 落在分页后的页面上，而不是另开一个编辑区）；
+  - 关键约束：**仅当分页结果真的变化时才重排并恢复插入符** —— 正常输入不得触发重排，否则每敲一个字就丢光标。
+
+  其余要补的是工具栏（加粗／改色）、修订模式开关，以及批注的新增与回复（侧栏已在，缺写入口）。
+- **P4 docx 反向导入**：解压 → **按样式名反查 `BlockKind`**（内置名与自定义名同一张表，见上）→
+  读 `w:ins`/`w:del` 与批注锚点 → 还原模型（`stripAutoNumber` 已备好，用于剥掉段首已有的编号避免重复编号）。
+  注意正文：导出时它不写 `w:pStyle`，导入时要把它当 `body`，不能当异常跳过。

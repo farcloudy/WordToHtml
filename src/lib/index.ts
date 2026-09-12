@@ -11,7 +11,10 @@
 
 export {
   BLOCK_KINDS,
+  DEFAULT_MARGIN,
   DEFAULT_SPEC,
+  MARGIN_PRESETS,
+  STYLE_KEYS,
   contentBoxPx,
   lengthToPx,
   mm,
@@ -26,13 +29,23 @@ export type {
   DeepPartial,
   Length,
   LineRule,
+  MarginPreset,
+  MarginSpec,
   NumberingStyle,
   PageSpec,
   Spec,
+  StyleKey,
   TextStyleSpec,
 } from './spec'
 
-export { collectRevisions, emptyDoc, nextBlockId, plainText, sliceInlines } from './types'
+export {
+  collectRevisions,
+  commentScopes,
+  emptyDoc,
+  nextBlockId,
+  plainText,
+  sliceInlines,
+} from './types'
 export type {
   Block,
   CommentDef,

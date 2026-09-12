@@ -37,6 +37,17 @@ export const BLOCK_KINDS: readonly BlockKind[] = [
   'listItem',
 ]
 
+/**
+ * 有样式定义的键 = 正文块 + 页脚。
+ *
+ * 页脚不是「块」：它不出现在正文流里，也不会被 md 解析产出，所以不进 BlockKind。
+ * 但它确实是一条要写进 docx 样式库、要在预览里生效的段落样式，所以和正文块一起
+ * 放进 STYLE_KEYS —— 这样导出、预览 CSS、两个验收脚本都只需要遍历一份清单。
+ */
+export type StyleKey = BlockKind | 'footer'
+
+export const STYLE_KEYS: readonly StyleKey[] = [...BLOCK_KINDS, 'footer']
+
 export type LineRule = 'exact' | 'atLeast' | 'auto'
 export type Align = 'left' | 'center' | 'right' | 'both'
 
@@ -44,9 +55,21 @@ export type Align = 'left' | 'center' | 'right' | 'both'
 export type NumberingStyle = 'chineseDot' | 'parenChinese' | 'arabicDot' | 'none'
 
 export interface TextStyleSpec {
-  /** docx 样式名（w:name）。反向解析 docx 时以它作为锚点，改了会导致旧文件读不回来 */
+  /**
+   * docx 样式名（w:name）。**Word 就是按这个字段判定「是不是内置样式」的**，
+   * 而且是按本地化名匹配：写「标题 1」Word 就认成内置的 Heading 1，
+   * 写「标题1」（少一个空格）就不认（实测 builtIn=false，2026-09-13）。
+   * 所以这里内置的那几个必须逐字照抄 Word 的中文名，含中间的空格。
+   * 没有内置对应的（抬头/落款/列表标题）才用自定义名。
+   * 反向解析 docx 时以它作为锚点，改了会导致旧文件读不回来。
+   */
   name: string
-  /** docx 样式 id（w:styleId），须是合法 XML 名 */
+  /**
+   * docx 样式 id（w:styleId）。不必是内置 id —— 名字已经决定了内置归属，
+   * 而沿用 WT- 前缀还能避开 docx 库的坑：一旦 styleId 撞上它的内置样式表
+   * （Heading1、Title 等），它会额外注入一份自己的默认定义，同一份 styles.xml
+   * 里就出现两个同 id 的 w:style。
+   */
   id: string
   /** 中文字体（w:rFonts/@w:eastAsia） */
   eastAsia: string
@@ -66,6 +89,7 @@ export interface TextStyleSpec {
   spaceBeforeLines: number
   /** 段后间距，行数 */
   spaceAfterLines: number
+  /** 自动编号规则；页脚这类不成块的样式固定填 'none' */
   numbering: NumberingStyle
 }
 
@@ -75,50 +99,75 @@ export interface TextStyleSpec {
  */
 export type Length = `${number}${'mm' | 'cm' | 'in' | 'pt' | 'pc' | 'pi'}`
 
+export type MarginSpec = { top: Length; right: Length; bottom: Length; left: Length }
+
 export interface PageSpec {
   /** 纸张尺寸 */
   size: { width: Length; height: Length }
-  /** 页边距 */
-  margin: { top: Length; right: Length; bottom: Length; left: Length }
+  /** 页边距。四边各自独立，不是单一值 —— 用 MARGIN_PRESETS 整体切换 */
+  margin: MarginSpec
   /** 页脚底边到纸张底边的距离 */
   footer: Length
   /** 页眉顶边到纸张顶边的距离 */
   header: Length
-  /**
-   * 页码样式。位置固定为页脚居中、字号固定 9pt、不允许修改，
-   * 集中放在这里只是为了让预览 CSS 和 docx 导出共用同一个数值。
-   */
-  pageNumber: { sizePt: number; eastAsia: string; ascii: string }
 }
+
+/**
+ * 页边距预设。四边分别取值，切换时整组替换；
+ * 页码样式不在这里 —— 它是 `styles.footer`（内置「页脚」样式）。
+ */
+export interface MarginPreset {
+  key: string
+  label: string
+  margin: MarginSpec
+}
+
+/** 默认页边距：四边等距 25mm */
+export const DEFAULT_MARGIN: MarginSpec = {
+  top: '25mm',
+  right: '25mm',
+  bottom: '25mm',
+  left: '25mm',
+}
+
+/** 至少一项，这样调用方取 [0] 当默认值时不必处理 undefined */
+export const MARGIN_PRESETS: readonly [MarginPreset, ...MarginPreset[]] = [
+  { key: 'default', label: '四边 25mm', margin: DEFAULT_MARGIN },
+  {
+    key: 'gov',
+    label: '公文标准（上37 下35 左28 右26 mm）',
+    margin: { top: '37mm', right: '26mm', bottom: '35mm', left: '28mm' },
+  },
+]
 
 export interface Spec {
   page: PageSpec
-  styles: Record<BlockKind, TextStyleSpec>
+  styles: Record<StyleKey, TextStyleSpec>
 }
 
 /**
  * 默认规格。
  *
  * 与需求文档的对应关系：
- *   title       (1) 文本标题
- *   body        (2) 正文
- *   h1/h2/h3    (2.1)(2.2)(2.3) 三级标题，自动编号
- *   salutation  (2.4) 抬头（正文但无首行缩进）
- *   signature   (2.5) 落款（正文但右对齐）
- *   listItem    (3) 列表段落
- *   listTitle   (3.1) 列表标题
+ *   title       (1) 文本标题        → 内置「标题」
+ *   body        (2) 正文            → 内置「正文」（即 Word 的 Normal，见 docx/export.ts）
+ *   h1/h2/h3    (2.1)(2.2)(2.3)     → 内置「标题 1/2/3」，自动编号
+ *   salutation  (2.4) 抬头（正文但无首行缩进）    → 自定义名
+ *   signature   (2.5) 落款（正文但右对齐）        → 自定义名
+ *   listItem    (3) 列表段落        → 内置「列表段落」
+ *   listTitle   (3.1) 列表标题      → 自定义名（Word 无对应内置）
+ *   footer      页脚页码段落        → 内置「页脚」
  */
 export const DEFAULT_SPEC: Spec = {
   page: {
     size: { width: '210mm', height: '297mm' },
-    margin: { top: '25mm', right: '25mm', bottom: '25mm', left: '25mm' },
+    margin: DEFAULT_MARGIN,
     footer: '12.5mm',
     header: '12.5mm',
-    pageNumber: { sizePt: 9, eastAsia: '宋体', ascii: 'Times New Roman' },
   },
   styles: {
     title: {
-      name: '公文标题',
+      name: '标题',
       id: 'WT-Title',
       eastAsia: '华文中宋',
       ascii: 'Times New Roman',
@@ -133,7 +182,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'none',
     },
     h1: {
-      name: '公文一级标题',
+      name: '标题 1',
       id: 'WT-H1',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -148,7 +197,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'chineseDot',
     },
     h2: {
-      name: '公文二级标题',
+      name: '标题 2',
       id: 'WT-H2',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -163,7 +212,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'parenChinese',
     },
     h3: {
-      name: '公文三级标题',
+      name: '标题 3',
       id: 'WT-H3',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -178,7 +227,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'arabicDot',
     },
     body: {
-      name: '公文正文',
+      name: '正文',
       id: 'WT-Body',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -193,7 +242,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'none',
     },
     salutation: {
-      name: '公文抬头',
+      name: '抬头',
       id: 'WT-Salutation',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -208,7 +257,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'none',
     },
     signature: {
-      name: '公文落款',
+      name: '落款',
       id: 'WT-Signature',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -223,7 +272,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'none',
     },
     listTitle: {
-      name: '公文列表标题',
+      name: '列表标题',
       id: 'WT-ListTitle',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -238,7 +287,7 @@ export const DEFAULT_SPEC: Spec = {
       numbering: 'none',
     },
     listItem: {
-      name: '公文列表段落',
+      name: '列表段落',
       id: 'WT-ListItem',
       eastAsia: '仿宋',
       ascii: 'Times New Roman',
@@ -247,6 +296,25 @@ export const DEFAULT_SPEC: Spec = {
       align: 'both',
       firstLineChars: 2,
       lineRule: 'atLeast',
+      linePt: 12,
+      spaceBeforeLines: 0,
+      spaceAfterLines: 0,
+      numbering: 'none',
+    },
+    /**
+     * 页脚页码段落。lineRule 为 auto（单倍行距）：正文的默认行距是固定值，
+     * 页脚若继承它会撑出行高，显式写单倍才与预览的 line-height 对得上。
+     */
+    footer: {
+      name: '页脚',
+      id: 'WT-Footer',
+      eastAsia: '宋体',
+      ascii: 'Times New Roman',
+      sizePt: 9,
+      bold: false,
+      align: 'center',
+      firstLineChars: 0,
+      lineRule: 'auto',
       linePt: 12,
       spaceBeforeLines: 0,
       spaceAfterLines: 0,
@@ -270,11 +338,11 @@ export type DeepPartial<T> = T extends readonly (infer U)[]
 export function resolveSpec(override?: DeepPartial<Spec>): Spec {
   const p = override?.page
   const styles = Object.fromEntries(
-    BLOCK_KINDS.map((kind) => [
-      kind,
-      { ...DEFAULT_SPEC.styles[kind], ...override?.styles?.[kind] },
+    STYLE_KEYS.map((key) => [
+      key,
+      { ...DEFAULT_SPEC.styles[key], ...override?.styles?.[key] },
     ]),
-  ) as Record<BlockKind, TextStyleSpec>
+  ) as Record<StyleKey, TextStyleSpec>
 
   return {
     page: {
@@ -282,7 +350,6 @@ export function resolveSpec(override?: DeepPartial<Spec>): Spec {
       margin: { ...DEFAULT_SPEC.page.margin, ...p?.margin },
       footer: p?.footer ?? DEFAULT_SPEC.page.footer,
       header: p?.header ?? DEFAULT_SPEC.page.header,
-      pageNumber: { ...DEFAULT_SPEC.page.pageNumber, ...p?.pageNumber },
     },
     styles,
   }
