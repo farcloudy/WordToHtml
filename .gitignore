@@ -10,9 +10,13 @@ lerna-debug.log*
 node_modules
 .DS_Store
 dist
+dist-lib
 dist-ssr
 coverage
 *.local
+
+# 验收脚本的临时产物（生成的 docx、模型快照）
+.qwen/tmp/
 
 # Editor directories and files
 .vscode/*
@@ -37,3 +41,5 @@ __screenshots__/
 
 # Vite
 *.timestamp-*-*.mjs
+
+/issues

@@ -1,0 +1,335 @@
+/**
+ * P2 的浏览器侧验收：用真实浏览器打开 demo，实测分页结果与排版样式。
+ *
+ * 为什么必须做这一步：分页器本身的单测只证明「给定量测值能算对」，
+ * 而「量得对不对、渲染出来和 docx 像不像」只有真排一遍才知道。
+ * 这里断言的是三类事实：
+ *   1. 每一页的内容都没有超出该页版心（超了就说明装箱算术和真实布局脱节）；
+ *   2. 每种样式的字号/行高/字重/对齐/缩进/段距，与规格表一致；
+ *   3. 分节后页码确实重排。
+ *
+ * 用 Vite 的编程式 API 起 dev server（不用子进程，也就不存在残留进程问题），
+ * 走系统 Edge（playwright-core 不自带浏览器，也不下载）。
+ *
+ * 用法：node scripts/verify-browser.mjs
+ */
+
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { chromium } from 'playwright-core'
+import { createServer } from 'vite'
+
+import { ptToPx, resolveSpec } from '../dist-lib/wordtohtml.mjs'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const root = resolve(here, '..')
+const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
+const PORT = 5199
+
+const spec = resolveSpec()
+const failures = []
+
+function eq(label, actual, expected) {
+  if (actual === expected) return true
+  failures.push(`${label} → 期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`)
+  return false
+}
+
+function approx(label, actual, expected, tol = 0.6) {
+  if (Number.isFinite(actual) && Math.abs(actual - expected) <= tol) return true
+  failures.push(`${label} → 期望 ≈${Math.round(expected * 100) / 100}（容差 ${tol}），实际 ${actual}`)
+  return false
+}
+
+function ok(label, condition, detail = '') {
+  if (condition) return true
+  failures.push(`${label}${detail ? ` — ${detail}` : ''}`)
+  return false
+}
+
+const round2 = (v) => Math.round(v * 100) / 100
+
+const server = await createServer({
+  root,
+  logLevel: 'warn',
+  server: { port: PORT, strictPort: true },
+})
+await server.listen()
+const url = server.resolvedUrls?.local?.[0] ?? `http://localhost:${PORT}/`
+console.log(`dev server: ${url}`)
+
+let browser
+try {
+  browser = await chromium.launch({ executablePath: EDGE, headless: true })
+  const page = await browser.newPage({
+    viewport: { width: 1700, height: 1100 },
+    deviceScaleFactor: 2,
+  })
+
+  await page.goto(url, { waitUntil: 'load' })
+  await page.waitForSelector('.wtp-page', { timeout: 30000 })
+  // 等字体就绪：组件就绪后会再排一次，此时量到的才是最终结果
+  await page.evaluate(async () => {
+    await document.fonts.ready
+  })
+  await page.waitForTimeout(800)
+
+  const report = await page.evaluate(() => {
+    const kinds = [
+      'title',
+      'h1',
+      'h2',
+      'h3',
+      'body',
+      'salutation',
+      'signature',
+      'listTitle',
+      'listItem',
+    ]
+    const round = (v) => Math.round(v * 1000) / 1000
+
+    const pages = Array.from(document.querySelectorAll('.wtp-page')).map((pageEl, index) => {
+      const content = pageEl.querySelector('.wtp-content')
+      const kids = content ? Array.from(content.children) : []
+      let used = 0
+      const items = kids.map((el, i) => {
+        const cs = getComputedStyle(el)
+        const height = round(el.getBoundingClientRect().height)
+        const mt = parseFloat(cs.marginTop) || 0
+        const mb = i < kids.length - 1 ? parseFloat(cs.marginBottom) || 0 : 0
+        used += height + mt + mb
+        return {
+          kind: el.className.replace('wtp-', ''),
+          blockId: el.dataset.blockId ?? '',
+          height,
+          marginTop: round(mt),
+          marginBottom: round(mb),
+          text: (el.textContent ?? '').slice(0, 14),
+        }
+      })
+      return {
+        index: index + 1,
+        number: (pageEl.querySelector('.wtp-page-number')?.textContent ?? '').trim(),
+        contentHeight: content ? round(content.clientHeight) : 0,
+        usedHeight: round(used),
+        fragments: kids.length,
+        items,
+        first: (kids[0]?.textContent ?? '').slice(0, 18),
+        last: (kids[kids.length - 1]?.textContent ?? '').slice(-18),
+      }
+    })
+
+    // 样式必须在「挂到 body 上的探针元素」上读，不能读分页片段本身：
+    // 页首那一块会被刻意去掉段前距，读它会拿到豁免后的值，从而掩盖规格表的问题。
+    const styles = {}
+    for (const kind of kinds) {
+      const el = document.createElement('div')
+      el.className = `wtp-${kind}`
+      el.textContent = '测量'
+      document.body.appendChild(el)
+      const cs = getComputedStyle(el)
+      styles[kind] = {
+        fontFamily: cs.fontFamily,
+        fontSize: parseFloat(cs.fontSize),
+        fontWeight: cs.fontWeight,
+        textAlign: cs.textAlign,
+        lineHeight: parseFloat(cs.lineHeight),
+        textIndent: parseFloat(cs.textIndent),
+        marginTop: parseFloat(cs.marginTop),
+        marginBottom: parseFloat(cs.marginBottom),
+      }
+      el.remove()
+    }
+
+    const continuations = Array.from(
+      document.querySelectorAll('[data-continuation="1"]'),
+    ).map((el) => {
+      const cs = getComputedStyle(el)
+      return {
+        textIndent: parseFloat(cs.textIndent),
+        marginTop: parseFloat(cs.marginTop),
+        text: (el.textContent ?? '').slice(0, 16),
+      }
+    })
+
+    const textarea = document.querySelector('textarea')
+    return {
+      pageCount: pages.length,
+      pages,
+      styles,
+      continuations,
+      source: textarea ? textarea.value : '',
+    }
+  })
+
+  console.log('\n=== 1. 分页（每页内容不得超出该页版心）===')
+  ok('至少渲染出一页', report.pageCount > 0)
+  for (const p of report.pages) {
+    ok(`第${p.index}页未溢出`, p.usedHeight <= p.contentHeight + 1, `已用 ${p.usedHeight}px / 版心 ${p.contentHeight}px`)
+    ok(`第${p.index}页有页码`, p.number !== '')
+    console.log(
+      `  ${p.usedHeight <= p.contentHeight + 1 ? 'ok  ' : 'FAIL'} 第${p.index}页 ` +
+        `页码"${p.number}" 片段${p.fragments} 占位${p.usedHeight}/${p.contentHeight}px ` +
+        `剩余${round2(p.contentHeight - p.usedHeight)}px`,
+    )
+    for (const it of p.items) {
+      console.log(
+        `        ${it.kind.padEnd(10)} 高${String(round2(it.height)).padStart(7)} ` +
+          `前${String(round2(it.marginTop)).padStart(5)} 后${String(round2(it.marginBottom)).padStart(5)} ` +
+          `"${it.text}"`,
+      )
+    }
+  }
+  const numbers = report.pages.map((p) => p.number).join(',')
+  console.log(`  页码序列：${numbers}`)
+  eq('末页页码（分节应重排为 1）', report.pages[report.pages.length - 1]?.number, '1')
+
+  console.log('\n=== 2. 预览样式 vs 规格表 ===')
+  for (const kind of Object.keys(spec.styles)) {
+    const s = spec.styles[kind]
+    const got = report.styles[kind]
+    if (!got) {
+      failures.push(`预览里找不到 .wtp-${kind} 元素`)
+      continue
+    }
+    const checks = [
+      approx(`${kind}·字号`, got.fontSize, ptToPx(s.sizePt)),
+      s.lineRule === 'auto' ? true : approx(`${kind}·行高`, got.lineHeight, ptToPx(s.linePt)),
+      eq(`${kind}·字重`, got.fontWeight, s.bold ? '700' : '400'),
+      eq(`${kind}·对齐`, got.textAlign, s.align === 'both' ? 'justify' : s.align),
+      approx(`${kind}·首行缩进`, got.textIndent, s.firstLineChars * ptToPx(s.sizePt)),
+      approx(`${kind}·段前`, got.marginTop, ptToPx(s.spaceBeforeLines * s.linePt)),
+      approx(`${kind}·段后`, got.marginBottom, ptToPx(s.spaceAfterLines * s.linePt)),
+      ok(
+        `${kind}·字体栈含中西文`,
+        got.fontFamily.includes(s.ascii) && got.fontFamily.includes(s.eastAsia),
+        got.fontFamily,
+      ),
+    ]
+    console.log(
+      `${checks.every(Boolean) ? 'ok  ' : 'FAIL'} ${kind.padEnd(10)} ` +
+        `${Math.round(got.fontSize * 100) / 100}px/${Math.round(got.lineHeight * 100) / 100}px ` +
+        `字重${got.fontWeight} 对齐${got.textAlign} 缩进${Math.round(got.textIndent)}px ` +
+        `段前后${Math.round(got.marginTop)}/${Math.round(got.marginBottom)}px`,
+    )
+  }
+
+  console.log('\n=== 3. 页首与续排的间距豁免 ===')
+  for (const p of report.pages) {
+    ok(
+      `第${p.index}页首块段前距为 0`,
+      (p.items[0]?.marginTop ?? -1) === 0,
+      `实际 ${p.items[0]?.marginTop}`,
+    )
+  }
+  ok('样本里出现了跨页续排', report.continuations.length > 0)
+  for (const c of report.continuations) {
+    ok(`续排块取消首行缩进「${c.text}」`, c.textIndent === 0, `实际 ${c.textIndent}px`)
+    ok(`续排块段前距为 0「${c.text}」`, c.marginTop === 0, `实际 ${c.marginTop}px`)
+  }
+  console.log(
+    `  ok   续排片段 ${report.continuations.length} 处，页首块 ${report.pages.length} 处`,
+  )
+
+  console.log('\n=== 4. 量测值 vs 渲染值（分页算术的对账）===')
+  const measurements = await page.evaluate(() => {
+    const paper = window.__wtpPaper
+    if (!paper) return null
+    return paper.getMeasurements().map((m) =>
+      m.t === 'break'
+        ? { t: 'break' }
+        : {
+            t: 'block',
+            id: m.blockId,
+            kind: m.kind,
+            rows: m.rows,
+            lineHeight: m.lineHeight,
+            before: m.spaceBefore,
+            after: m.spaceAfter,
+            length: m.displayLength,
+          },
+    )
+  })
+
+  if (!measurements) {
+    failures.push('拿不到量测值：window.__wtpPaper 未挂载（demo 的 dev 钩子失效？）')
+    console.log('  FAIL 无法读取量测值')
+  } else {
+    const rendered = new Map()
+    for (const p of report.pages) {
+      for (const it of p.items) {
+        const cur = rendered.get(it.blockId) ?? { height: 0, pieces: 0 }
+        cur.height += it.height
+        cur.pieces += 1
+        rendered.set(it.blockId, cur)
+      }
+    }
+
+    for (const m of measurements) {
+      if (m.t === 'break') {
+        console.log('        [分节符]')
+        continue
+      }
+      const r = rendered.get(m.id) ?? { height: 0, pieces: 0 }
+      const fromMeasurement = round2(m.rows * m.lineHeight)
+      const match = Math.abs(fromMeasurement - r.height) < 1.5
+      if (!match) {
+        failures.push(
+          `${m.kind} 量测 ${m.rows}行×${round2(m.lineHeight)}=${fromMeasurement}px，` +
+            `渲染 ${r.height}px`,
+        )
+      }
+      console.log(
+        `  ${match ? 'ok  ' : 'BAD '} ${m.kind.padEnd(10)} ` +
+          `量测 ${m.rows}行×${String(round2(m.lineHeight)).padStart(6)}=${String(fromMeasurement).padStart(7)}px ` +
+          `渲染${String(r.height).padStart(7)}px(${r.pieces}片) 段前后${round2(m.before)}/${round2(m.after)}`,
+      )
+    }
+  }
+
+  console.log('\n=== 5. 产出物 ===')
+  const tmpDir = join(root, '.qwen', 'tmp')
+  mkdirSync(tmpDir, { recursive: true })
+  const sourcePath = join(tmpDir, 'demo-source.md')
+  writeFileSync(sourcePath, report.source, 'utf8')
+  console.log(`  ok   界面源码已导出：${sourcePath}`)
+
+  // 供 verify-page-count.mjs 与 Word 的页数对账
+  const reportPath = join(tmpDir, 'pagination-report.json')
+  writeFileSync(
+    reportPath,
+    JSON.stringify(
+      {
+        pageCount: report.pageCount,
+        pageNumbers: report.pages.map((p) => p.number),
+        contentHeight: report.pages[0]?.contentHeight ?? 0,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  console.log(`  ok   分页结果快照：${reportPath}`)
+
+  const shotPath = join(tmpDir, 'preview.png')
+  const pagesEl = await page.$('.wtp-pages')
+  if (pagesEl) {
+    await pagesEl.screenshot({ path: shotPath })
+    console.log(`  ok   预览截图：${shotPath}`)
+  } else {
+    failures.push('找不到 .wtp-pages，无法截图')
+  }
+} finally {
+  await browser?.close()
+  await server.close()
+}
+
+console.log('')
+if (failures.length > 0) {
+  console.error(`[FAIL] 共 ${failures.length} 项不符：`)
+  for (const f of failures) console.error(`  - ${f}`)
+  process.exit(1)
+}
+console.log('[PASS] 浏览器实测：分页无溢出、样式与规格表一致、分节页码已重排。')
