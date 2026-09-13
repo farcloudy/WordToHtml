@@ -492,6 +492,21 @@ function caretPoint(): DisplayPoint | null {
   return selectionRange()?.start ?? lastCaret
 }
 
+/**
+ * 焦点已经离开正文时的选区兜底（点下拉切模板、点工具栏都会发生）。
+ * 浏览器可能把原生选区整个收掉，那时 selectionRange() 就什么都没有了，
+ * 而 stickyRanges 里存着最近一次「真的选中了文字」的区间。
+ */
+function rangeOfSticky(): { start: DisplayPoint; end: DisplayPoint } | null {
+  const first = stickyRanges[0]
+  const last = stickyRanges[stickyRanges.length - 1]
+  if (!first || !last) return null
+  return {
+    start: { blockId: first.blockId, offset: first.from },
+    end: { blockId: last.blockId, offset: last.to },
+  }
+}
+
 /** 事件目标所在的页面版心。事件是在 .wtp-content 上派发的，所以目标本身可能不是片段 */
 function pageElementOf(node: Node | null): HTMLElement | null {
   if (!node) return null
@@ -1089,7 +1104,21 @@ watch([() => props.source, () => props.model], () => {
 watch(
   () => props.spec,
   () => {
-    refreshLayout()
+    /*
+     * 换规格表（切文件模板）必须清量测缓存并整篇重量：页边距一变版心就变，
+     * measure.ts 里所有行数与行高全部失效 —— 不清缓存就会拿旧版心的量测值算页码，
+     * 而新版心越接近旧版心，这个错越不容易被看出来。
+     *
+     * 落点要在重量之前取：整篇的行边界都会挪，插入符与选区只能靠「块 id + 字符偏移」
+     * 还回去（DOM 节点会被重建），不能靠节点引用。
+     */
+    const range = selectionRange() ?? rangeOfSticky()
+    clearMeasureCache(cache)
+    refreshLayout({
+      anchor: range?.start ?? lastCaret,
+      anchorEnd: range?.end ?? null,
+      force: true,
+    })
   },
   { deep: true },
 )
@@ -1357,11 +1386,15 @@ defineExpose({
 .wtp-comment-actions button:hover {
   border-color: #8a9099;
 }
-/* 页间换页标记：放在两页之间的空隙里，不占版心 */
+/* 页间换页标记：放在两页之间的空隙里，不占版心。
+   flex-basis 100% 是必须的：页带是可换行的横排（见 lib/render/css.ts），
+   标记若不占满整行，并排时它会被塞进两页之间，把第二页顶到下一行去。
+   负外边距照旧 —— 它负责把这个不占版心的标记压进页间那道 18px 的缝里。 */
 .wtp-break {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 0 100%;
   margin: -6px 0;
   color: #8a9099;
   font-size: 11px;

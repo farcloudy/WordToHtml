@@ -4,8 +4,11 @@
  * 顺带做「模型 → md → 模型」的往返一致性检查，确认解析与序列化没有暗坑。
  * 产物写两份：
  *   - .qwen/tmp/verify.docx  留档，你也能直接打开看
- *   - 系统临时目录的 wtp-verify.docx  纯 ASCII 路径，给 Word COM 脚本用
+ *   - 系统临时目录的 wtp-verify-<pid>-<时间戳>.docx  纯 ASCII 路径，给 Word COM 脚本用
  *     （避免中文路径在 cmd.exe → powershell.exe 之间被改写编码）
+ *
+ * 用法：node scripts/verify-docx.mjs [--source <文件>] [--template <key>]
+ *   不传 --source 用内置样本；不传 --template 用 DOC_TEMPLATES 的第一套。
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -15,10 +18,23 @@ import { fileURLToPath } from 'node:url'
 
 import JSZip from 'jszip'
 
-import { normalizeBlocks, parseMd, resolveSpec, toBase64, toMd } from '../dist-lib/wordtohtml.mjs'
+import {
+  DOC_TEMPLATES,
+  normalizeBlocks,
+  parseMd,
+  resolveSpec,
+  toBase64,
+  toMd,
+} from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
+
+/** 取一个 `--flag value` 形式的命令行参数 */
+function argValue(flag) {
+  const index = process.argv.indexOf(flag)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
 
 const SAMPLE = [
   '# 关于爱康光电资产核查情况的说明',
@@ -71,17 +87,36 @@ const SAMPLE = [
 
 // 允许用外部源码覆盖内置样本：verify-docx.mjs --source <文件>。
 // demo 页的页数对账就靠它把界面里的源码原样喂进来。
-const sourceIndex = process.argv.indexOf('--source')
-const source =
-  sourceIndex >= 0 && process.argv[sourceIndex + 1]
-    ? readFileSync(process.argv[sourceIndex + 1], 'utf8')
-    : SAMPLE
+const source = (() => {
+  const path = argValue('--source')
+  return path ? readFileSync(path, 'utf8') : null
+})()
+
+/*
+ * 用哪套文件模板：verify-docx.mjs [--template <key>]，默认第一套。
+ * 页边距是模板的一部分，所以这里必须整份 spec 从 DOC_TEMPLATES 推导，
+ * 不能只换页边距 —— 否则「简易公文格式」的 docx 就不是它自己了。
+ */
+const templateKey = argValue('--template')
+const template = templateKey
+  ? DOC_TEMPLATES.find((t) => t.key === templateKey)
+  : DOC_TEMPLATES[0]
+if (!template) {
+  console.error(
+    `[FAIL] 未知模板：${templateKey}（可选：${DOC_TEMPLATES.map((t) => t.key).join(' / ')}）`,
+  )
+  process.exit(2)
+}
+console.log(`[ok] 文件模板：${template.label}（${template.key}）`)
+
+const usedBuiltinSample = source === null
+const bodySource = source ?? SAMPLE
 
 const FIXED_DATE = new Date('2026-09-12T08:00:00Z')
 const now = () => FIXED_DATE
 
-const spec = resolveSpec()
-const model = parseMd(source, { author: '张三', now })
+const spec = resolveSpec(template.spec)
+const model = parseMd(bodySource, { author: '张三', now })
 
 const md2 = toMd(model)
 const model2 = parseMd(md2, { author: '张三', now })
@@ -150,7 +185,7 @@ writeFileSync(outPath, buffer)
     .filter((i) => i.t === 'text' && i.underline).length
   // 只有内置样本才要求「必须验到下划线」：这个脚本也接受外部源码（verify:pages 把
   // 界面里的源码原样喂进来），而别人的源码里没有下划线是正常的。
-  if (sourceIndex < 0 && modelUnderlined === 0) {
+  if (usedBuiltinSample && modelUnderlined === 0) {
     problems.push('内置样本里没有带下划线的文字 —— 这一项等于没验')
   }
   if (underlineTags.length !== modelUnderlined) {
@@ -173,9 +208,10 @@ writeFileSync(outPath, buffer)
   console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
 }
 
-// 临时副本名带上 pid：Word 退出后会短暂占住文件，用固定名会让下一次运行
-// 撞上 EBUSY。每次换一个新名字就永远不会冲突，跑完由 verify-p1.mjs 清理。
-const asciiPath = join(tmpdir(), `wtp-verify-${process.pid}.docx`)
+// 临时副本名带上 pid 与时间戳：Word 退出后会短暂占住文件，用固定名会让下一次运行
+// 撞上 EBUSY —— verify:pages 会在同一个进程里连着生成两套模板的 docx，更是必须换名。
+// 跑完由调用方清理。
+const asciiPath = join(tmpdir(), `wtp-verify-${process.pid}-${Date.now()}.docx`)
 writeFileSync(asciiPath, buffer)
 
 const modelPath = join(root, '.qwen', 'tmp', 'model.json')
@@ -185,6 +221,7 @@ console.log(
   JSON.stringify(
     {
       ok: true,
+      template: template.key,
       bytes: buffer.length,
       outPath,
       asciiPath,

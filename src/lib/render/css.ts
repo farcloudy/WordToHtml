@@ -43,8 +43,15 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
   const out: string[] = []
 
   out.push(
-    `.${ns}-pages { display: flex; flex-direction: column; align-items: center; gap: 18px; }`,
-    `.${ns}-page { position: relative; width: ${spec.page.size.width}; height: ${spec.page.size.height}; ` +
+    /*
+     * 页带：横排 + 可换行。容器够宽时两页并排，不够时自动回落到一页一排
+     * ——「宽度足够就并排」这个条件由 flex-wrap 自己满足，不做缩放或适配页宽。
+     * 打印不受影响：@media print 里把这里改回 display:block，仍是一页一张纸。
+     */
+    `.${ns}-pages { display: flex; flex-direction: row; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 18px; }`,
+    // flex: none（不放大也不缩小）：纸宽是绝对的，容器不够宽时宁可让外层横向滚动，
+    // 也不能把纸压窄 —— 纸一窄版心就变，实测出来的行盒和分页算术立刻全体对不上。
+    `.${ns}-page { flex: none; position: relative; width: ${spec.page.size.width}; height: ${spec.page.size.height}; ` +
       `padding: ${spec.page.margin.top} ${spec.page.margin.right} ${spec.page.margin.bottom} ${spec.page.margin.left}; ` +
       `box-sizing: border-box; background: #fff; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18); }`,
     // 版心用 flex 纵向排列：flex 子项之间的 margin 不会合并，

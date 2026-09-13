@@ -146,9 +146,14 @@ function measureElement(
  *
  * 编辑时每次敲键都要重排判断「分页有没有变」，但整篇重新量测太贵
  * （长段落要跑二分找行首，每次 getClientRects 都会触发布局）。
- * 块的排版只取决于「排版宽度（全局固定）+ 本块内容 + 本块样式」，
+ * 块的排版只取决于「版心宽度 + 本块内容 + 本块样式」，
  * 所以内容没变的块可以直接复用上次的结果，只量改过的那一块。
  * 签名里带上渲出来的 HTML，等于把「文字、加粗、颜色、修订、编号」一起算了进去。
+ *
+ * **缓存只在同一份规格表下有效**：版心宽度由 spec.page.margin 决定，换文件模板（DOC_TEMPLATES）
+ * 就会变，而签名里**故意不含宽度与样式值** —— 否则每次敲键都要为每个块序列化一遍 spec。
+ * 所以规格表一变就必须 clearMeasureCache，否则会拿旧版心的量测值算分页；
+ * 调用点见 WordPaper.vue 里 props.spec 的 watcher（清缓存 → 还原插入符 → force 重排）。
  */
 export interface MeasureCacheEntry {
   signature: string

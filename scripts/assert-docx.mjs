@@ -4,12 +4,16 @@
  * 断言全部从 resolveSpec() 推导，不在这里重复写死数值 —— 否则改规格时
  * 测试会跟着一起错，就失去意义了。
  *
- * 用法：node scripts/assert-docx.mjs <word-dump.json> <model.json>
+ * 用法：node scripts/assert-docx.mjs <word-dump.json> <model.json> [--template <key>]
+ *
+ * 规格表**按 --template 的 key 从 DOC_TEMPLATES 现推**，不从 model.json 里读：
+ * model.json 是上一步自己写出来的，拿它当期望值等于自己给自己判卷。
  */
 
 import { readFileSync } from 'node:fs'
 
 import {
+  DOC_TEMPLATES,
   computeNumbering,
   lengthToPx,
   lineSpacePt,
@@ -19,14 +23,28 @@ import {
 
 const [, , dumpPath, modelPath] = process.argv
 if (!dumpPath || !modelPath) {
-  console.error('用法: node scripts/assert-docx.mjs <word-dump.json> <model.json>')
+  console.error('用法: node scripts/assert-docx.mjs <word-dump.json> <model.json> [--template <key>]')
+  process.exit(2)
+}
+
+const templateIndex = process.argv.indexOf('--template')
+const templateKey = templateIndex >= 0 ? process.argv[templateIndex + 1] : undefined
+const template = templateKey
+  ? DOC_TEMPLATES.find((t) => t.key === templateKey)
+  : DOC_TEMPLATES[0]
+if (!template) {
+  console.error(
+    `[FAIL] 未知模板：${templateKey}（可选：${DOC_TEMPLATES.map((t) => t.key).join(' / ')}）`,
+  )
   process.exit(2)
 }
 
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
 const dump = readJson(dumpPath)
+// 只取模型；期望值（规格表）由下面的 resolveSpec 现推
 const { model } = readJson(modelPath)
-const spec = resolveSpec()
+const spec = resolveSpec(template.spec)
+console.log(`=== 文件模板：${template.label}（${template.key}）===`)
 
 // Word 的枚举取值
 const ALIGN = { left: 0, center: 1, right: 2, both: 3 }

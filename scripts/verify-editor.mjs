@@ -9,7 +9,8 @@
  *      批注、撤销，都能落到模型上，并且导出用的就是这份模型；
  *   4. 快捷键：Ctrl+U 下划线、Ctrl+Shift+E 修订模式、Alt+4 金额格式（含无效输入的提示条）、
  *      工具栏「插入空格」下拉的三个特殊空格码点；
- *   5. 打印：编辑器外壳全部隐藏、每张纸各占一页、纸张尺寸取自规格表（真打一份 PDF 数页数）。
+ *   5. 打印：编辑器外壳全部隐藏、每张纸各占一页、纸张尺寸取自规格表（真打一份 PDF 数页数）；
+ *   6. 切文件模板：页数变了、插入符与选区都按坐标找回、文字没丢。
  *
  * 每一步都同时看两边：DOM 上看到了什么，模型里记下了什么。只看 DOM 会漏掉
  * 「界面改了、导出没改」，只看模型会漏掉「模型改了、界面没跟上」。
@@ -908,7 +909,66 @@ try {
   )
 
   /* ------------------------------------------------------------------ */
-  console.log('\n=== N. 打印：只出 A4 纸，且不多不少 ===')
+  console.log('\n=== N. 切文件模板：页数变、插入符与选区不丢、文字不丢 ===')
+  await openApp()
+
+  // 模板清单从下拉里读：这是 UI 测试，就照界面给的选项走
+  const templateOptions = await page.$$eval('.bar select option', (els) =>
+    els.map((el) => ({ key: el.value, label: (el.textContent ?? '').trim() })),
+  )
+  ok(
+    '顶栏「文件模板」下拉有至少两套模板',
+    templateOptions.length >= 2,
+    JSON.stringify(templateOptions),
+  )
+  const defaultKey = await page.$eval('.bar select', (el) => el.value)
+  eq('默认选中的是第一套模板', defaultKey, templateOptions[0]?.key)
+  const otherKey = templateOptions.find((t) => t.key !== defaultKey)?.key ?? ''
+
+  const textsBefore = heroBlocks(await getModel()).map(textOfBlock)
+
+  // 插入符放到文档中段的一块正文里：公文版心更矮，这一块一定会被重新分页，
+  // 落点与选区只能靠「块 id + 字符偏移」找回来（DOM 节点全被重建了）。
+  const caretSeeded = await page.evaluate(() =>
+    window.__wtpTest.caretAtEndOf('债务人爱康光电科技有限公司'),
+  )
+  ok('找到了要落插入符的段落', caretSeeded !== null, JSON.stringify(caretSeeded))
+  await page.waitForTimeout(80)
+  const caretBefore = await page.evaluate(() => window.__wtpTest.caretInfo())
+  const pagesBefore = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+
+  await page.selectOption('.bar select', otherKey)
+  await page.waitForTimeout(1000)
+
+  const pagesAfter = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  const caretAfter = await page.evaluate(() => window.__wtpTest.caretInfo())
+  ok('切模板后页数变了（说明整篇按新版心重量了）', pagesAfter !== pagesBefore, `${pagesBefore} → ${pagesAfter}`)
+  eq('插入符还在同一块', caretAfter?.blockId, caretBefore?.blockId)
+  eq('插入符还在同一字符偏移', caretAfter?.offset, caretBefore?.offset)
+  eq('插入符那一块的文字没变', caretAfter?.text, caretBefore?.text)
+
+  // 选区：选中一段文字再切回第一套模板，选区与文字都该原样回来
+  const selectedText = await page.evaluate(() =>
+    window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6),
+  )
+  ok('切换前选中了六个字', selectedText === '债务人爱康光', selectedText ?? '未选中')
+  await page.waitForTimeout(80)
+  await page.selectOption('.bar select', defaultKey)
+  await page.waitForTimeout(1000)
+  const selectionNow = await page.evaluate(() => document.getSelection()?.toString() ?? '')
+  eq('切回来选区仍在（还是那六个字）', selectionNow, selectedText)
+  eq(
+    '切回第一套模板后页数回到原值',
+    await page.evaluate(() => document.querySelectorAll('.wtp-page').length),
+    pagesBefore,
+  )
+
+  const textsAfter = heroBlocks(await getModel()).map(textOfBlock)
+  eq('切模板没有改动任何文字', JSON.stringify(textsAfter), JSON.stringify(textsBefore))
+  await checkNoOverflow('N 切模板后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== O. 打印：只出 A4 纸，且不多不少 ===')
   await openApp()
 
   /** 打印媒体下这些选择器的 display（元素不存在时给 'missing'，别把「没有」当成「隐藏了」） */
@@ -1021,4 +1081,4 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`)
   process.exit(1)
 }
-console.log('[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、金额格式、特殊空格、打印均落到模型。')
+console.log('[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、金额格式、特殊空格、切文件模板、打印均落到模型。')

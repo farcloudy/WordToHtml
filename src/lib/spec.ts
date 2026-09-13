@@ -114,7 +114,7 @@ export type MarginSpec = { top: Length; right: Length; bottom: Length; left: Len
 export interface PageSpec {
   /** 纸张尺寸 */
   size: { width: Length; height: Length }
-  /** 页边距。四边各自独立，不是单一值 —— 用 MARGIN_PRESETS 整体切换 */
+  /** 页边距。四边各自独立，不是单一值 —— 用 DOC_TEMPLATES 整组切换 */
   margin: MarginSpec
   /** 页脚底边到纸张底边的距离 */
   footer: Length
@@ -138,6 +138,8 @@ export interface PageSpec {
 /**
  * 页边距预设。四边分别取值，切换时整组替换；
  * 页码样式不在这里 —— 它是 `styles.footer`（内置「页脚」样式）。
+ *
+ * 它是 `DOC_TEMPLATES` 的投影（见下），保留这个导出只是因为它已在 lib 接口里。
  */
 export interface MarginPreset {
   key: string
@@ -145,7 +147,7 @@ export interface MarginPreset {
   margin: MarginSpec
 }
 
-/** 默认页边距：四边等距 25mm */
+/** 默认页边距：四边等距 25mm，即「管理人文件」模板的页边距 */
 export const DEFAULT_MARGIN: MarginSpec = {
   top: '25mm',
   right: '25mm',
@@ -153,15 +155,63 @@ export const DEFAULT_MARGIN: MarginSpec = {
   left: '25mm',
 }
 
+/** 公文标准页边距：上 37 / 下 35 / 左 28 / 右 26 mm（「简易公文格式」模板用） */
+const GOV_MARGIN: MarginSpec = {
+  top: '37mm',
+  right: '26mm',
+  bottom: '35mm',
+  left: '28mm',
+}
+
+/**
+ * 文件模板：**样式覆盖与页边距绑成一体**。
+ *
+ * 为什么不让人分别选「样式」和「页边距」：公文体例里页边距本身就是格式的一部分，
+ * 让两者可以自由组合只会拼出既不是甲模板也不是乙模板的东西。
+ *
+ * 现在两套模板的样式值完全相同（只差页边距），但覆盖写成整份 spec 的 DeepPartial
+ * 而不是只有 page.margin：将来真要给第二套不同的字体字号，往 spec.styles 里加即可，
+ * 不用改结构、也不用改调用方（预览 CSS 与 docx 样式都从 resolveSpec 派生）。
+ */
+export interface DocTemplate {
+  key: string
+  label: string
+  spec: DeepPartial<Spec>
+}
+
 /** 至少一项，这样调用方取 [0] 当默认值时不必处理 undefined */
-export const MARGIN_PRESETS: readonly [MarginPreset, ...MarginPreset[]] = [
-  { key: 'default', label: '四边 25mm', margin: DEFAULT_MARGIN },
+export const DOC_TEMPLATES: readonly [DocTemplate, ...DocTemplate[]] = [
   {
-    key: 'gov',
-    label: '公文标准（上37 下35 左28 右26 mm）',
-    margin: { top: '37mm', right: '26mm', bottom: '35mm', left: '28mm' },
+    key: 'manager',
+    label: '管理人文件',
+    spec: { page: { margin: DEFAULT_MARGIN } },
+  },
+  {
+    key: 'govDoc',
+    label: '简易公文格式',
+    spec: { page: { margin: GOV_MARGIN } },
   },
 ]
+
+/**
+ * 页边距预设。**由 DOC_TEMPLATES 派生** —— 边距是模板的一部分，另留一份字面量
+ * 迟早会和模板分家（那是两份真相，改一处忘一处）。
+ *
+ * 不用 resolveSpec() 派生：它在文件后面，而这里要的只是页边距，浅合并默认边距
+ * 与 resolveSpec 对 page.margin 的处理完全一致。
+ */
+export const MARGIN_PRESETS: readonly [MarginPreset, ...MarginPreset[]] = [
+  marginPresetOf(DOC_TEMPLATES[0]),
+  ...DOC_TEMPLATES.slice(1).map(marginPresetOf),
+]
+
+function marginPresetOf(template: DocTemplate): MarginPreset {
+  return {
+    key: template.key,
+    label: template.label,
+    margin: { ...DEFAULT_MARGIN, ...template.spec.page?.margin },
+  }
+}
 
 export interface Spec {
   page: PageSpec

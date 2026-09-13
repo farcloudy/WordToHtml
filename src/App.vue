@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
-import { BLOCK_KINDS, MARGIN_PRESETS, ptToPx, resolveSpec } from './lib/spec'
+import { BLOCK_KINDS, DOC_TEMPLATES, ptToPx, resolveSpec } from './lib/spec'
 import type { BlockKind, DeepPartial, Spec } from './lib/spec'
 import type { EditorSelection } from './lib/edit/model'
 
@@ -38,6 +38,8 @@ const SAMPLE = [
   '债务人申报的生产设备共47台（套），管理人已现场清点，{红|其中3台因搬迁灭失}[[其中3台|灭失设备的名称与型号需另行说明]]，其余设备存放于厂区内。',
   '',
   '关于对外投资部分，债务人申报其持有苏州爱康新材料有限公司30%股权、苏州爱康智能装备有限公司18%股权以及江苏爱康光电研究所有限公司10%股权。经调取市场监管部门登记信息核对，上述三家公司均处于存续状态，其中苏州爱康新材料有限公司已于2025年8月被列入经营异常名录，苏州爱康智能装备有限公司的注册资本尚未实缴到位。管理人已分别向上述三家公司发出书面通知，要求其提供最近三年经审计的财务报表、公司章程、股东会决议以及股权质押情况说明；截至本说明出具之日，仅苏州爱康智能装备有限公司回函表示正在整理资料，其余两家公司未予回复。鉴于股权价值评估须以财务报表为基础，管理人拟在收齐上述材料后另行委托评估机构对股权价值进行评估，评估结论将作为后续财产变价方案的依据。此外，债务人陈述其曾于2024年6月与第三方签订股权转让框架协议，约定转让所持苏州爱康新材料有限公司全部股权，因受让方未按期支付首期款，该协议已于2025年3月解除，相关违约金债权是否已实际发生，管理人正在进一步核查。另据债务人陈述，其于2023年以设备融资租赁方式取得生产设备11台（套），租赁期限五年，截至本说明出具之日尚有租金未付，出租人已向管理人申报债权，管理人正在对该笔融资租赁的性质进行审查，即认定为融资租赁债权抑或取回权，将直接影响该批设备是否纳入债务人财产范围。关于应收账款，债务人账面记载的应收账款共37笔，金额合计人民币2860万元，其中账龄超过三年的有14笔；管理人已向全部债务人发出催收通知，截至本说明出具之日收到回函9份，回款人民币118万元，其余款项管理人将继续跟进催收。此外，管理人于2026年7月10日向全体已知债权人发出债权申报通知，申报期限至2026年8月25日止；截至本说明出具之日，共收到债权申报43笔，申报金额合计人民币1.14亿元，管理人已完成初步审查38笔，其中确认32笔、不予确认2笔、暂缓确认4笔。对于暂缓确认的债权，管理人的主要考虑是其担保物权是否已经依法设立并办理登记，以及申报人所主张的利息计算标准是否符合合同约定与法律规定，管理人将在补充核查后另行出具审查意见。同时，管理人对债务人涉诉及执行情况进行了梳理，债务人作为被告的民事诉讼案件共计6件，涉案金额约人民币3200万元，其中2件已经一审判决、1件处于二审阶段、3件尚未开庭；债务人作为被执行人的执行案件共计4件，执行标的合计约人民币900万元，管理人已向各执行法院提交了中止执行的申请。上述诉讼与执行情况可能对债务人财产范围及债权数额产生影响，管理人将持续跟进并及时向你单位报告。',
+  '',
+  '关于债务人财产的变价方案，管理人已依照《中华人民共和国企业破产法》第一百一十二条的规定拟定初步意见，并提交第一次债权人会议审议。会议召开前，管理人已将变价方案的征求意见稿送达全体已知债权人，其中三名债权人提出了书面异议，异议主要集中在评估基准日的选取以及部分机器设备是否应当与厂房一并处置两个方面。管理人经研究认为，评估基准日以人民法院受理破产申请之日为宜，理由是该日的资产状况有完整的财务凭证与现场盘点记录可供核对；至于机器设备与厂房是否应当一并处置，管理人倾向于分别处置，因为厂房的抵押权人已明确表示愿意单独受让，若将两者合并处置，可能导致抵押权人的优先受偿顺位与其他债权人的利益发生冲突，且不利于财产的及时变价。此外，管理人已就评估机构的选聘事项征询了债权人委员会的意见，拟从人民法院管理人名册中随机确定三家候选机构，再以书面询价的方式确定受托机构，评估费用列入破产费用优先支付；评估报告出具后，管理人将把评估结论与变价方案一并提交债权人会议表决，并根据会议决议另行公告拍卖或者变卖的安排。上述评估与变价工作预计在债权申报期届满后两个月内完成，管理人会按期向你单位书面报告进展；如发现债务人有转移财产或者其他损害债权人利益的行为，管理人将及时提请人民法院处理。',
   '',
   '---',
   '',
@@ -86,7 +88,8 @@ const SPACES = [
 const mode = ref<'edit' | 'source'>('edit')
 const source = ref(SAMPLE)
 const author = ref('张三')
-const marginPreset = ref(MARGIN_PRESETS[0].key)
+/** 当前文件模板（样式 + 页边距是一体的，所以只有一个下拉）。默认第一套，与既有行为一致 */
+const templateKey = ref(DOC_TEMPLATES[0].key)
 const trackChanges = ref(false)
 const pageCount = ref(0)
 const exporting = ref(false)
@@ -99,8 +102,8 @@ const toastText = ref('')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 const specOverride = computed<DeepPartial<Spec>>(() => {
-  const preset = MARGIN_PRESETS.find((p) => p.key === marginPreset.value) ?? MARGIN_PRESETS[0]
-  return { page: { margin: { ...preset.margin } } }
+  const template = DOC_TEMPLATES.find((t) => t.key === templateKey.value) ?? DOC_TEMPLATES[0]
+  return template.spec
 })
 
 /** 完整规格表。样式库要按每条样式自己的字体字号预览，所以这里要拿到解析后的值。 */
@@ -219,10 +222,10 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <label class="field">
-        页边距
-        <select v-model="marginPreset">
-          <option v-for="p in MARGIN_PRESETS" :key="p.key" :value="p.key">
-            {{ p.label }}
+        文件模板
+        <select v-model="templateKey">
+          <option v-for="t in DOC_TEMPLATES" :key="t.key" :value="t.key">
+            {{ t.label }}
           </option>
         </select>
       </label>
