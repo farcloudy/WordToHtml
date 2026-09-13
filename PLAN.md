@@ -635,6 +635,85 @@ NaN/空串/0/负数/小数/超大值全部落在界内、U 节断言不放水也
 提交前主 session 还误跑过一次 `prettier --write`（见 9.4），已逐字节还原，并就此单独派了一轮增量复核，
 结论同为**「可接受」**。
 
+### 6.12 W4b-2 待做清单（2026-09-13 用户追加三条）
+
+**W4b-2 = 键盘跨格 + 下面三条**，一起做。
+
+**原有内容（行为已由用户拍板）**：Tab / Shift+Tab 行优先跨格（unit/note 行整行算一格）；**Tab 停在最后一个
+格子时按了不作任何响应**；←/→ 在格首/格尾跨格；↑/↓ 在格内首/末视觉行跨格（用 `getClientRects()` 比较插入符
+与格内首字符/末字符的 top 判定）。这部分是纯手感，只能人工核对。
+
+#### 追加一：删除整张表格的按钮
+
+- **编辑层现在没有删整表的入口**：`edit/model.ts` 的 `removeBreak` 只拒 `textBlock`，
+  拿**表格 id 调它会直接把整张表删掉**（是个陷阱，别顺手复用）；而正路（`removeBlock` / 退格合并）
+  都只认段落。要新增 `removeTable(doc, tableId)`，并顺手把 `removeBreak` 收紧到只接受
+  `pageBreak` / `sectionBreak`，别让它继续兼职。
+- 组件层：`pushHistory` 之后删块，**锚点必须落到一个还存在的地方** —— 优先上一块的末尾
+  （`prefixLength + 该块长度`），没有上一块就用下一块的开头；然后 `refreshLayout({force:true})`
+  并补 `nextTick(emitSelection)`（工具条会随光标离开表格而收起）。
+- UI：上下文工具条加「删除表格」，放最右、与行/列按钮隔开。**是否要二次确认待定** —— 本仓库其它不可逆
+  操作靠 `pushHistory` 的撤销而不是弹窗，但删整表丢的东西多，开工前问用户一句。
+- 验收：`test-edit-model` 加删表用例（删首/中/尾各一次 + 不存在的 id 是空操作 + `removeBreak` 不再吃表格）；
+  `verify-editor` 加「点删除表格 → 模型少一个 `table` 块、DOM 里不再有 `.wtp-tableFrag`、插入符落在上一块末尾」。
+
+#### 追加二：格内文字可以套用别的样式（默认仍是「列表段落」）
+
+**这条改数据格式（`TableCellModel` 要加字段），按本项目规矩要先出设计给用户过目再写码。**
+它同时**推翻了 W4a 过审时那条「表内文字直接复用列表段落、不新增表格文字样式」的决策** —— 用户现在明确
+要求可换样式，照新的来。
+
+现状（实现锚点，改之前先读这几处）：
+- `types.ts` 的 `TableCellModel` **只有 `inlines`**，没有样式字段；
+- `render/html.ts` 的 `tableCellHtml` 把类名**硬编码**成 `wtp-listItem`；
+- `docx/export.ts` 的 `cellParagraph` 把 `style` **硬编码**成 `spec.styles.listItem.id`；
+- `App.vue` 的样式 chip 行调 `paper.setBlockKind(kind)`，而 `edit/model.ts` 的 `setBlockKind` 走 `findBlock`
+  —— **只认 textBlock，格子会被静默忽略**；`WordPaper.vue` 的 `emitSelection` 现在也只能给格子回一个
+  假的 `kind: 'listItem'`。
+
+要定的事（开工前出设计）：
+1. 字段形状（`TableCellModel.kind?: BlockKind`，缺省 = `listItem`）。**行高最小值按谁的 `linePt` 算**是个真问题：
+   现在 CSS 的 `min-height` 与 docx 的 `w:trHeight` 都写死取「列表段落」的 `linePt`
+   （`render/css.ts` 的 `.wtp-table .wtp-listItem { min-height: … }`、`export.ts` 的
+   `rowHeight = minLines * spec.styles.listItem.linePt`）。格内换成别的样式后，同一行不同格会给出不同的
+   「一行」高 → 要么按该格自己的样式（行高取各格最大值），要么仍然一律按列表段落。**建议前者，但需拍板。**
+2. **md 往返语法**：`verify-docx` 断言「模型 → md → 模型 → md」字节稳定，所以格内样式必须有 md 写法。
+   候选：格内指令（如 `{@body|文字}`，`@` 用来与既有的 `{#FF0000|…}` 颜色指令区分）、围栏里加声明行
+   （如 `::cells 2:body`）、单元格前缀标记。**必须不与现有 `{}` 指令族冲突**（现有：`{+ins}` / `{-del}` /
+   `{#RRGGBB|…}` / `{br}`）。
+3. 界面：复用现有那条样式 chip 行（`App.vue` 的 `KIND_LABEL` / `.styles`），让它在光标位于格内时作用于
+   **该格**；随之 `emitSelection` 要给格子回**真实**的 `kind`。
+- 验收：`test-edit-model`（改样式 + md 往返）、`verify-docx`（格内 `<w:pStyle>` 对账）、
+  `verify-editor`（光标在格内点样式 chip → 只有该格类名变）。
+
+#### 追加三：两组对齐按钮（水平 / 垂直）
+
+**同样改数据格式 —— 对齐现在只有样式级，没有逐格覆盖。**
+
+现状：`Align` 只挂在样式上（`spec.styles[k].align`），`TextBlock` 没有任何对齐字段；表格里唯一的逐格对齐先例
+是 `render/html.ts` 给 unit/note 行的格内 div 写死 `text-align: right|left`；`render/css.ts` 的
+`.wtp-table td { vertical-align: top }` 是全局写死；docx 侧两个映射都已具备
+（`cellParagraph(cell, spec, alignment)` → 格内 `Paragraph.alignment`；`TableCell.verticalAlign` → `w:vAlign`）。
+
+用户的要求：**两个按钮组** —— 水平（左 / 居中 / 右）与垂直（顶端 / 居中 / 底端）。要定的事：
+1. 存哪一层：逐格（`TableCellModel.align?: { h?: Align; v?: 'top'|'middle'|'bottom' }`）/ 整行 / 整表。
+   用户说的是光标处，按**逐格**做最直接；unit/note 行现在写死的右/左与顶端对齐**降级为默认值**（可覆盖）。
+2. 水平要不要含**两端对齐**（`Align` 里已有 `justify`，用户没提）？垂直要不要 `distributed`？
+   **先只做用户说的三档**，多出来的等用户加。
+3. md 往返语法（与追加二的第 2 条是同一类问题，**最好两件事共用一套写法**，别搞出两套指令）。
+4. 渲染：水平 → 格内 div 的行内 `text-align`（有先例）；垂直 → `<td>` 的行内 `vertical-align`
+   （全局 CSS 是 top，逐格覆盖只能靠行内样式）。
+5. **分页影响**：垂直对齐只挪格内文字在行里的位置、不改行高；水平对齐对单段落也不改换行点
+   （两端对齐除外）。所以这三条**不应**改变页数 —— 这条要落进断言（浏览器侧/人工），别默默忽略。
+- 验收：`test-edit-model`（改对齐 + md 往返）、`verify-docx`（`w:jc` / `w:vAlign` 对账）、
+  `verify-editor`（两组按钮的 active 态与作用范围）、人工核对。
+
+#### 三条一起带来的排版问题
+
+W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按钮 + 行高 2 档 radio + 表头行/附注行 2 组 radio。
+再加「删除表格」「样式 chip 行」「两组对齐」会明显变长 —— 开工时先定**排版**（分组、换行、或收进一个小
+「表格属性」区域），别让它挤成一坨；窄窗口下也不许换行错位。
+
 ---
 
 ## 7. W5 —— 节编辑框架
@@ -797,7 +876,7 @@ NaN/空串/0/负数/小数/超大值全部落在界内、U 节断言不放水也
 | W4a-1 | 表格：模型 + md 围栏语法 + docx 导出 + Word 读回对账 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——格内 `{红|…}` / `[[]]` 里的竖线被当列分隔符，修完聚焦复核「可接受」且做了变异测试；结论见第 6.7 节） |
 | W4a-2 | 表格：预览渲染 + 量测 + 分页 + 编辑读回收口 + demo 样本放表 + 「插入表格」按钮 + 软换行 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收「可接受」并修掉一处必修缺陷；**版式一致性改人工核对**，结论见 6.9） |
 | W4b-1 | 表格：结构操作（增删行列、unit/note radio、行高两档）+ 上下文工具条 + 格内 Shift+Enter + 边界护栏 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收与增量复核均判「可接受」，结论见 6.11） |
-| W4b-2 | 表格：Tab / 方向键跨格导航（用户已定：Tab 停在最后一格时按了不作任何响应） | 未开工（设计见 6.10 末段） |
+| W4b-2 | 表格：Tab / 方向键跨格导航 + 追加三条（删除整表的按钮、格内可套用其它样式、水平/垂直两组对齐） | 未开工（清单见 6.12；**追加二、三改数据格式，开工前要先出设计给用户过目**） |
 | W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |
 
 **收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。
