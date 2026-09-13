@@ -40,6 +40,7 @@ import type { Match, SearchOptions, SearchScope } from '../lib/edit/search'
 import {
   addComment,
   applyFormat,
+  blockLength,
   cloneDoc,
   containerLength,
   findBlock,
@@ -54,7 +55,7 @@ import {
   removeComment as removeCommentOp,
   replyComment as replyCommentOp,
   replaceRange,
-  setBlockKind as setBlockKindOp,
+  setContainerKind as setContainerKindOp,
   sliceStrict,
   splitBlock,
   updateComment as updateCommentOp,
@@ -63,14 +64,20 @@ import type { EditorSelection } from '../lib/edit/model'
 import {
   bodyInsertIndex,
   bodyRowIndexes,
+  findCell,
   findTable,
   insertBodyRow,
   insertColumn,
   removeBodyRow,
   removeColumn,
+  removeTable as removeTableOp,
+  setCellAlign,
   setMinLines,
   setRoleRow,
+  stepCell,
+  verticalCell,
 } from '../lib/edit/table'
+import type { CellStep } from '../lib/edit/table'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
 import {
@@ -85,9 +92,17 @@ import type { MeasureCache } from '../lib/render/measure'
 import { paginate } from '../lib/render/paginate'
 import type { BreakKind, MeasuredItem, PageFragment, PageLayout } from '../lib/render/paginate'
 import { contentBoxPx, resolveSpec } from '../lib/spec'
-import type { BlockKind, DeepPartial, Spec } from '../lib/spec'
-import { allInlineHolders, cellId, commentScopes, nextBlockId, parseCellId, sliceInlines } from '../lib/types'
-import type { DocModel, Inline, RevMark, TableBlock, TextBlock, TextInline } from '../lib/types'
+import type { Align, BlockKind, DeepPartial, Spec } from '../lib/spec'
+import {
+  allInlineHolders,
+  cellId,
+  commentScopes,
+  defaultCellAlignH,
+  nextBlockId,
+  parseCellId,
+  sliceInlines,
+} from '../lib/types'
+import type { CellVerticalAlign, DocModel, Inline, RevMark, TableBlock, TextBlock, TextInline } from '../lib/types'
 
 const props = withDefaults(
   defineProps<{
@@ -623,9 +638,9 @@ function emitSelection(): void {
     emit('selection-change', null)
     return
   }
-  // 格子没有 BlockKind（单元格文字复用「列表段落」样式，所以回显它最接近事实）
+  // 格子的样式回真实值（缺省 listItem）；段落回它自己的 kind
   const block = findBlock(doc.value, range.start.blockId)
-  const kind: BlockKind = block ? block.kind : 'listItem'
+  const kind: BlockKind = block ? block.kind : (findCell(doc.value, range.start.blockId)?.kind ?? 'listItem')
   const p = prefixLength(range.start.blockId)
   const from = Math.max(0, range.start.offset - p)
   const to = Math.max(from, range.end.offset - p)
@@ -640,23 +655,33 @@ function emitSelection(): void {
     collapsed: to === from,
     bold: to > from ? rangeIsBold(container, from, to) : false,
     color: to > from ? rangeColor(container, from, to) : undefined,
-    ...(cell && table
-      ? {
-          table: {
-            tableId: cell.tableId,
-            row: cell.row,
-            col: cell.col,
-            role: table.rows[cell.row]?.role ?? 'body',
-            rows: table.rows.length,
-            columns: table.columns,
-            bodyRows: table.rows.filter((row) => row.role === 'body').length,
-            minLines: table.minLines,
-            hasUnit: table.rows.some((row) => row.role === 'unit'),
-            hasNote: table.rows.some((row) => row.role === 'note'),
-          },
-        }
-      : {}),
+    ...(cell && table ? { table: tableContextOf(table, cell.row, cell.col) } : {}),
   })
+}
+
+/** 表格上下文（工具条回显与禁用用）：行列下标、role、以及**已解析默认值**的两组对齐 */
+function tableContextOf(
+  table: TableBlock,
+  row: number,
+  col: number,
+): NonNullable<EditorSelection['table']> {
+  const cellModel = findCell(doc.value, cellId(table.id, row, col))
+  const role = table.rows[row]?.role ?? 'body'
+  const styleAlign = resolved.value.styles[cellModel?.kind ?? 'listItem'].align
+  return {
+    tableId: table.id,
+    row,
+    col,
+    role,
+    rows: table.rows.length,
+    columns: table.columns,
+    bodyRows: table.rows.filter((r) => r.role === 'body').length,
+    minLines: table.minLines,
+    hasUnit: table.rows.some((r) => r.role === 'unit'),
+    hasNote: table.rows.some((r) => r.role === 'note'),
+    alignH: cellModel?.align?.h ?? defaultCellAlignH(role, styleAlign),
+    alignV: cellModel?.align?.v ?? 'top',
+  }
 }
 
 function onSelectionChange(): void {
@@ -792,8 +817,16 @@ function onKeydown(event: KeyboardEvent): void {
     return
   }
   if (event.key === 'Tab') {
-    // 编辑公文时 Tab 不该把焦点跳出去
+    // 编辑公文时 Tab 不该把焦点跳出去；在格内则行优先跨格
     event.preventDefault()
+    const point = caretPoint()
+    const cell = point ? parseCellId(point.blockId) : null
+    const table = cell ? findTable(doc.value, cell.tableId) : undefined
+    if (!cell || !table) return
+    // 已经是最后一格（Shift+Tab 是第一格）时 stepCell 返回 null → 不作任何响应
+    // （用户拍板：不换行、不自动加行、不跳出焦点）
+    const step = stepCell(table, cell.row, cell.col, event.shiftKey ? 'prev' : 'next')
+    if (step) moveCaretToCell(cell.tableId, step)
     return
   }
   if (event.key === 'Enter') {
@@ -855,6 +888,143 @@ function onKeydown(event: KeyboardEvent): void {
       event.preventDefault()
     }
     return
+  }
+  /*
+   * ← / → 跨格：只在键盘事件不带任何修饰键、且落点在格内时才考虑。
+   * 判据是「落点已在格内偏移 0」（←）或「落点已到该格文字末尾」（→），
+   * 满足才接管；其余一律 return 走原路，别影响段落里的左右移动。
+   */
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    if (mod || event.altKey || event.shiftKey) return
+    const sel = document.getSelection()
+    if (!sel || !sel.isCollapsed) return
+    const point = caretPoint()
+    const cell = point ? parseCellId(point.blockId) : null
+    const table = cell ? findTable(doc.value, cell.tableId) : undefined
+    if (!point || !cell || !table) return
+    const container = findContainer(doc.value, point.blockId)
+    if (!container) return
+    const start = prefixLength(point.blockId)
+    const atStart = point.offset <= start
+    const atEnd = point.offset >= start + containerLength(container)
+    const dir = event.key === 'ArrowLeft' ? 'prev' : 'next'
+    if (dir === 'prev' ? !atStart : !atEnd) return
+    const step = stepCell(table, cell.row, cell.col, dir)
+    if (!step) return
+    event.preventDefault()
+    moveCaretToCell(cell.tableId, step)
+    return
+  }
+  /*
+   * ↑ / ↓ 跨格：只有插入符位于该格的首 / 末**视觉行**时才接管，靠 DOM 量测判定。
+   * 判不准就 fail-open（不 preventDefault），宁可少管，也不能把普通的上下移动吃掉。
+   */
+  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    if (mod || event.altKey || event.shiftKey) return
+    const sel = document.getSelection()
+    if (!sel || !sel.isCollapsed) return
+    const point = caretPoint()
+    const cell = point ? parseCellId(point.blockId) : null
+    const table = cell ? findTable(doc.value, cell.tableId) : undefined
+    if (!point || !cell || !table) return
+    const step = visualLineStep(table, cell.row, cell.col, event.key === 'ArrowUp' ? 'up' : 'down')
+    if (!step) return
+    event.preventDefault()
+    moveCaretToCell(cell.tableId, step)
+  }
+}
+
+/**
+ * 把插入符落到目标格。跨格**只挪原生选区、不改模型、不 refreshLayout**（DOM 没重建）。
+ * 落点偏移按显示坐标算（格子的自动编号前缀恒为 0，仍按既有写法扣一次更稳），
+ * 落完补一次 emitSelection，让工具条的落点提示跟上。
+ */
+function moveCaretToCell(tableId: string, step: CellStep): void {
+  const rootEl = root.value
+  if (!rootEl) return
+  const id = cellId(tableId, step.row, step.col)
+  const container = findContainer(doc.value, id)
+  if (!container) return
+  const offset = prefixLength(id) + (step.at === 'end' ? containerLength(container) : 0)
+  placeCaret(rootEl, { blockId: id, offset })
+  emitSelection()
+}
+
+/** 插入符的 rect top；拿不到（选区不在、rect 退化成长宽都为 0）返回 null —— 调用方据此 fail-open */
+function caretRectTop(): number | null {
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0) return null
+  const range = sel.getRangeAt(0)
+  if (!range.collapsed) return null
+  // 复制一份 range，setStart/setEnd 都设在同一 (node, offset) 上再取 rect；
+  // 不往 DOM 里插临时 span（那会动 DOM）。
+  const probe = document.createRange()
+  probe.setStart(range.startContainer, range.startOffset)
+  probe.setEnd(range.startContainer, range.startOffset)
+  const rect = probe.getBoundingClientRect()
+  if (rect.width === 0 && rect.height === 0) return null
+  return rect.top
+}
+
+/** 格内首 / 末字符的 rect top；格内没有文字或 rect 退化时返回 null */
+function charRectTop(frag: HTMLElement, which: 'first' | 'last'): number | null {
+  const walker = document.createTreeWalker(frag, NodeFilter.SHOW_TEXT)
+  let first: Text | null = null
+  let last: Text | null = null
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node as Text
+    if (text.data === '' || text.parentElement?.closest('.wtp-num')) continue
+    if (!first) first = text
+    last = text
+  }
+  const target = which === 'first' ? first : last
+  if (!target) return null
+  const range = document.createRange()
+  if (which === 'first') {
+    range.setStart(target, 0)
+    range.setEnd(target, 1)
+  } else {
+    const n = target.data.length
+    range.setStart(target, n - 1)
+    range.setEnd(target, n)
+  }
+  const rect = range.getClientRects()[0] ?? range.getBoundingClientRect()
+  if (!rect || (rect.width === 0 && rect.height === 0)) return null
+  return rect.top
+}
+
+/**
+ * ↑ / ↓ 的落点判定：插入符 top ≈ 格内首字符 top → 已在首视觉行（↑ 接管、↓ 不接管）；
+ * ≈ 末字符 top → 已在末视觉行（↓ 接管、↑ 不接管）；中间视觉行一律不接管。
+ * 任何一处取不到（rect 退化、首末字符缺失）或抛异常 → 返回 null（fail-open）。
+ */
+function visualLineStep(
+  table: TableBlock,
+  row: number,
+  col: number,
+  dir: 'up' | 'down',
+): CellStep | null {
+  try {
+    const rootEl = root.value
+    if (!rootEl) return null
+    const frag = rootEl.querySelector<HTMLElement>(
+      `[data-block-id="${CSS.escape(cellId(table.id, row, col))}"]`,
+    )
+    if (!frag) return null
+    const caretTop = caretRectTop()
+    const firstTop = charRectTop(frag, 'first')
+    const lastTop = charRectTop(frag, 'last')
+    if (caretTop === null || firstTop === null || lastTop === null) return null
+    const tol = 1
+    if (dir === 'up' && Math.abs(caretTop - firstTop) <= tol) {
+      return verticalCell(table, row, col, 'up')
+    }
+    if (dir === 'down' && Math.abs(caretTop - lastTop) <= tol) {
+      return verticalCell(table, row, col, 'down')
+    }
+    return null
+  } catch {
+    return null
   }
 }
 
@@ -985,8 +1155,10 @@ function setBlockKind(kind: BlockKind): void {
   const ids = new Set(selectedRanges(rootEl).map((r) => r.blockId))
   if (ids.size === 0) ids.add(range.start.blockId)
   pushHistory()
-  for (const id of ids) setBlockKindOp(doc.value, id, kind)
+  // 跨段落 + 跨格的选区都要生效：走 setContainerKind（格子设格子的 kind，段落设段落的 kind）
+  for (const id of ids) setContainerKindOp(doc.value, id, kind)
   refreshLayout({ anchor: range.start, anchorEnd: range.end, force: true })
+  void nextTick(emitSelection)
 }
 
 function toggleBold(): void {
@@ -1448,6 +1620,75 @@ function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 表格：删除整表与两组对齐（W4b-2）                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 删除光标所在的整张表。**不二次确认**（与全仓库一致：不可逆操作靠 pushHistory 的撤销兜底）。
+ * 锚点必须落到一个还存在的地方：优先被删块之前的第一个段落末尾，没有就取之后的第一个段落开头；
+ * 两边都没有可落点的块时传 undefined —— 这条分支靠 refreshLayout 的兜底。
+ */
+function removeTable(): void {
+  const target = tableTarget()
+  if (!target) return
+  const index = doc.value.blocks.findIndex((block) => block.id === target.tableId)
+  if (index < 0) return
+  pushHistory(target.point)
+  if (!removeTableOp(doc.value, target.tableId)) return
+  refreshLayout({ anchor: tableAnchorAfterRemoval(index), force: true })
+  // 点按钮会把焦点从正文拿走，selectionchange 未必再触发；补这一下工具条才会随光标离开表格而收起
+  void nextTick(emitSelection)
+}
+
+/** 删表后的落点：之前的第一个段落末尾 → 之后的第一个段落开头 → null（交给 refreshLayout 兜底） */
+function tableAnchorAfterRemoval(index: number): DisplayPoint | null {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const block = doc.value.blocks[i]
+    if (block?.t === 'textBlock') {
+      return { blockId: block.id, offset: prefixLength(block.id) + blockLength(block) }
+    }
+  }
+  for (let i = index; i < doc.value.blocks.length; i += 1) {
+    const block = doc.value.blocks[i]
+    if (block?.t === 'textBlock') return { blockId: block.id, offset: 0 }
+  }
+  return null
+}
+
+/**
+ * 水平对齐三档（只有左 / 居中 / 右，不做两端对齐）。
+ * 与当前**实际生效值**相同 → 清除该维覆盖（回默认：unit 右 / note 左 / body 跟该格样式）。
+ */
+function setTableCellAlignH(value: Align): void {
+  const target = tableTarget()
+  if (!target) return
+  const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
+  if (!cell) return
+  const role = target.table.rows[target.row]?.role ?? 'body'
+  const styleAlign = resolved.value.styles[cell.kind ?? 'listItem'].align
+  const effective = cell.align?.h ?? defaultCellAlignH(role, styleAlign)
+  const next = effective === value ? null : value
+  if ((cell.align?.h ?? null) === next) return
+  pushHistory(target.point)
+  setCellAlign(cell, 'h', next)
+  finishTableOp(target, target.row, target.col, target.offset)
+}
+
+/** 垂直对齐三档；同样「点当前值 = 回默认 top」 */
+function setTableCellAlignV(value: CellVerticalAlign): void {
+  const target = tableTarget()
+  if (!target) return
+  const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
+  if (!cell) return
+  const effective = cell.align?.v ?? 'top'
+  const next = effective === value ? null : value
+  if ((cell.align?.v ?? null) === next) return
+  pushHistory(target.point)
+  setCellAlign(cell, 'v', next)
+  finishTableOp(target, target.row, target.col, target.offset)
+}
+
+/* -------------------------------------------------------------------------- */
 /* 选区保持                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -1846,6 +2087,10 @@ defineExpose({
   removeTableColumn,
   setTableMinLines,
   setTableRoleRow,
+  // 表格：删除整表与两组对齐（W4b-2）
+  removeTable,
+  setTableCellAlignH,
+  setTableCellAlignV,
   deleteBreak,
   keepSelection,
   dropKeptSelection,

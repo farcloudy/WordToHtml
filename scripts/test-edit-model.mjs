@@ -28,6 +28,7 @@ import {
   containerLength,
   deleteRange,
   findBlock,
+  findCell,
   findContainer,
   findMatches,
   findTable,
@@ -50,20 +51,26 @@ import {
   removeBreak,
   removeColumn,
   removeComment,
+  removeTable,
   renderTableFragment,
   replyComment,
   replaceMatches,
   replaceRange,
   resolveSpec,
   setBlockKind,
+  setCellAlign,
+  setCellKind,
+  setContainerKind,
   setMinLines,
   setRoleRow,
   sliceInlines,
   splitBlock,
+  stepCell,
   toBase64,
   toMd,
   updateComment,
   validateQuery,
+  verticalCell,
 } from '../dist-lib/wordtohtml.mjs'
 
 let failed = 0
@@ -1232,6 +1239,236 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     eq('不存在的 id → undefined', findTable(model, 'tbX'), undefined)
     eq('段落 id → undefined（它不是表）', findTable(model, 't0'), undefined)
     eq('cellId 指向的表格不存在 → undefined', findTable(model, cellId('tbX', 0, 0)), undefined)
+  }
+}
+
+console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两组对齐 / 格首指令 ===')
+{
+  const makeTable = (rows, columns = 1, minLines = 1) => ({
+    t: 'table',
+    id: 'tb1',
+    rows,
+    columns,
+    minLines,
+    cantSplit: true,
+  })
+  const bodyRow = (...texts) => ({
+    role: 'body',
+    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
+  })
+  const roleRow = (role, text = '') => ({
+    role,
+    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
+  })
+  const cellText = (cell) =>
+    cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join('')
+  const step = (atom) => JSON.stringify(atom)
+
+  // ---- A1. stepCell：行优先、unit/note 整行一格、边界 ----
+  {
+    const table = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a', 'b'), bodyRow('c', 'd'), roleRow('note', 'n')],
+      2,
+    )
+    eq('unit 行的下一格 = 第 1 个 body 行的第 0 格', step(stepCell(table, 0, 0, 'next')), step({ row: 1, col: 0, at: 'start' }))
+    eq('body 行内向右跨', step(stepCell(table, 1, 0, 'next')), step({ row: 1, col: 1, at: 'start' }))
+    eq('body 行末格跨到下一行首格', step(stepCell(table, 1, 1, 'next')), step({ row: 2, col: 0, at: 'start' }))
+    eq('note 行整行算一格（倒数第二格的下一格）', step(stepCell(table, 2, 1, 'next')), step({ row: 3, col: 0, at: 'start' }))
+    eq('最后一格没有下一格', stepCell(table, 3, 0, 'next'), null)
+    eq('Shift+Tab：从第一个 body 格回到 unit（落格尾）', step(stepCell(table, 1, 0, 'prev')), step({ row: 0, col: 0, at: 'end' }))
+    eq('第一格没有上一格', stepCell(table, 0, 0, 'prev'), null)
+  }
+
+  // ---- A2. stepCell：幻影格被跳过 ----
+  {
+    // body 行格数少于 columns：渲染时会补空，但模型里没有这些格（findContainer 找不到）
+    const ragged = makeTable([roleRow('unit', 'u'), bodyRow('a'), bodyRow('b', 'c')], 2)
+    eq('幻影列（模型里没有这一格）→ null', stepCell(ragged, 1, 1, 'next'), null)
+    eq('从真实末格跨到下一行首格（跳过幻影）', step(stepCell(ragged, 1, 0, 'next')), step({ row: 2, col: 0, at: 'start' }))
+    eq('倒退也落在真实格上', step(stepCell(ragged, 2, 0, 'prev')), step({ row: 1, col: 0, at: 'end' }))
+  }
+
+  // ---- A3. verticalCell：同列 / 边界 / unit|note 列归 0 ----
+  {
+    const table = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a', 'b'), bodyRow('c', 'd'), roleRow('note', 'n')],
+      2,
+    )
+    eq('同列向下', step(verticalCell(table, 1, 1, 'down')), step({ row: 2, col: 1, at: 'start' }))
+    eq('同列向上', step(verticalCell(table, 2, 1, 'up')), step({ row: 1, col: 1, at: 'start' }))
+    eq('向上打到 unit 行 → 列取 0', step(verticalCell(table, 1, 1, 'up')), step({ row: 0, col: 0, at: 'start' }))
+    eq('向下打到 note 行 → 列取 0', step(verticalCell(table, 2, 1, 'down')), step({ row: 3, col: 0, at: 'start' }))
+    eq('首行再往上没有', verticalCell(table, 0, 0, 'up'), null)
+    eq('末行再往下没有', verticalCell(table, 3, 0, 'down'), null)
+
+    const narrow = makeTable([bodyRow('a'), bodyRow('b', 'c')], 2)
+    eq('目标格是幻影列 → null（fail-open）', verticalCell(narrow, 1, 1, 'up'), null)
+    const short = makeTable([bodyRow('a', 'b'), bodyRow('c')], 2)
+    eq('向下打到缺列的 body 行 → null', verticalCell(short, 0, 1, 'down'), null)
+  }
+
+  // ---- B. removeTable / removeBreak 收紧 ----
+  {
+    const docOf = () => ({
+      blocks: [
+        { t: 'table', id: 'tbA', rows: [bodyRow('a')], columns: 1, minLines: 1, cantSplit: true },
+        { t: 'textBlock', id: 't0', kind: 'body', inlines: [] },
+        { t: 'table', id: 'tbB', rows: [bodyRow('b')], columns: 1, minLines: 1, cantSplit: true },
+        { t: 'textBlock', id: 't1', kind: 'body', inlines: [] },
+        { t: 'table', id: 'tbC', rows: [bodyRow('c')], columns: 1, minLines: 1, cantSplit: true },
+      ],
+      comments: [],
+    })
+    const first = docOf()
+    eq('删首表', removeTable(first, 'tbA'), true)
+    eq('删首表后剩下的块', first.blocks.map((b) => b.id).join(','), 't0,tbB,t1,tbC')
+    const middle = docOf()
+    eq('删中表', removeTable(middle, 'tbB'), true)
+    eq('删中表后剩下的块', middle.blocks.map((b) => b.id).join(','), 'tbA,t0,t1,tbC')
+    const last = docOf()
+    eq('删尾表', removeTable(last, 'tbC'), true)
+    eq('删尾表后剩下的块', last.blocks.map((b) => b.id).join(','), 'tbA,t0,tbB,t1')
+    const byCell = docOf()
+    eq('按 cellId 也能删（复用 findTable）', removeTable(byCell, cellId('tbB', 0, 0)), true)
+    eq('按 cellId 删后剩下的块', byCell.blocks.map((b) => b.id).join(','), 'tbA,t0,t1,tbC')
+
+    const noop = docOf()
+    const before = JSON.stringify(noop)
+    eq('不存在的 id 是空操作', removeTable(noop, 'tbX'), false)
+    eq('空操作时 doc 一个字节不变', JSON.stringify(noop), before)
+
+    // removeBreak 收紧：拿表格 id 调它不许再删表（旧行为是个陷阱）
+    const guarded = docOf()
+    const guardedBefore = JSON.stringify(guarded)
+    eq('removeBreak 拿表格 id 返回 false', removeBreak(guarded, 'tbB'), false)
+    eq('removeBreak 拿表格 id 时表格还在且 doc 不变', JSON.stringify(guarded), guardedBefore)
+    eq('removeBreak 拿段落 id 返回 false', removeBreak(guarded, 't0'), false)
+
+    const breaks = {
+      blocks: [
+        { t: 'pageBreak', id: 'pg1' },
+        { t: 'sectionBreak', id: 's1', restartNumbering: true },
+        { t: 'textBlock', id: 't0', kind: 'body', inlines: [] },
+      ],
+      comments: [],
+    }
+    eq('分页符仍能删', removeBreak(breaks, 'pg1'), true)
+    eq('分节符仍能删', removeBreak(breaks, 's1'), true)
+    eq('删完只剩段落', breaks.blocks.map((b) => b.id).join(','), 't0')
+  }
+
+  // ---- C. setCellKind / setContainerKind / 渲染钩子 / md 往返 ----
+  {
+    const cell = { inlines: [{ t: 'text', text: '甲' }] }
+    setCellKind(cell, 'h2')
+    eq('setCellKind 设值', cell.kind, 'h2')
+    setCellKind(cell, 'listItem')
+    eq('回到 listItem 时删掉字段（模型不存冗余值）', 'kind' in cell, false)
+
+    const model = parseMd('正文一段\n\n:::table\n| 甲 | 乙 |\n:::')
+    const table = model.blocks.find((b) => b.t === 'table')
+    setContainerKind(model, model.blocks[0].id, 'h1')
+    eq('setContainerKind 改段落', findBlock(model, model.blocks[0].id).kind, 'h1')
+    setContainerKind(model, cellId(table.id, 0, 0), 'h3')
+    eq('setContainerKind 改格子', findCell(model, cellId(table.id, 0, 0)).kind, 'h3')
+
+    const html = renderTableFragment(table, 0, table.rows.length)
+    eq('格内 div 带稳定钩子 wtp-cell + 该格样式 wtp-h3', html.includes('class="wtp-cell wtp-h3"'), true)
+    eq('没改过的格子仍是 wtp-cell wtp-listItem', html.includes('class="wtp-cell wtp-listItem"'), true)
+
+    const md = toMd(model)
+    eq('格内样式写进格首指令', md.includes('{@h3|甲}'), true)
+    eq('格内样式往返字节稳定', toMd(parseMd(md)), md)
+    eq(
+      '格内样式往返结构一致',
+      JSON.stringify(normalizeBlocks(parseMd(md))),
+      JSON.stringify(normalizeBlocks(model)),
+    )
+    eq(
+      'listItem 不写格首指令（老样本不变）',
+      toMd({ blocks: [makeTable([bodyRow('甲')])], comments: [] }),
+      ':::table\n| 甲 |\n:::',
+    )
+  }
+
+  // ---- D. setCellAlign ----
+  {
+    const cell = { inlines: [] }
+    setCellAlign(cell, 'h', 'center')
+    eq('单维：水平', JSON.stringify(cell.align), JSON.stringify({ h: 'center' }))
+    setCellAlign(cell, 'v', 'middle')
+    eq('双维', JSON.stringify(cell.align), JSON.stringify({ h: 'center', v: 'middle' }))
+    setCellAlign(cell, 'h', null)
+    eq('清一维后另一维还在', JSON.stringify(cell.align), JSON.stringify({ v: 'middle' }))
+    setCellAlign(cell, 'v', null)
+    eq('两维都清掉后 align 字段消失', 'align' in cell, false)
+    setCellAlign(cell, 'h', null)
+    eq('本来就没有 align 时再清是空操作', 'align' in cell, false)
+
+    const model = parseMd(':::table\n| 甲 |\n:::')
+    const table = model.blocks[0]
+    const mc = findCell(model, cellId(table.id, 0, 0))
+    setCellAlign(mc, 'h', 'right')
+    setCellAlign(mc, 'v', 'bottom')
+    const md = toMd(model)
+    eq('两组对齐都写进格首指令', md.includes('{@right,bottom|甲}'), true)
+    eq('对齐往返字节稳定', toMd(parseMd(md)), md)
+    eq(
+      '对齐往返结构一致',
+      JSON.stringify(normalizeBlocks(parseMd(md))),
+      JSON.stringify(normalizeBlocks(model)),
+    )
+  }
+
+  // ---- md：样式 + 水平 + 垂直 的综合往返；非法 token；未闭合 ----
+  {
+    const src = [
+      ':::table minLines=2',
+      '> {@h2,right|单位：元}',
+      '| {@h2,center|项目} | {@center|金额} |',
+      '| 甲 | {@left,bottom|1,234.00} |',
+      '< {@listTitle,center|注：以上金额不含税}',
+      ':::',
+    ].join('\n')
+    const model = parseMd(src)
+    const md1 = toMd(model)
+    const md2 = toMd(parseMd(md1))
+    eq('综合往返：两段 md 逐字节相同', md1, md2)
+    eq(
+      '综合往返：结构一致',
+      JSON.stringify(normalizeBlocks(parseMd(md1))),
+      JSON.stringify(normalizeBlocks(model)),
+    )
+    eq('token 顺序固定 kind→h→v', md1.includes('{@h2,right|单位：元}'), true)
+    eq('只写非默认值（纯水平）', md1.includes('{@center|金额}'), true)
+    eq('两组都写', md1.includes('{@left,bottom|1,234.00}'), true)
+    const t = model.blocks[0]
+    eq('unit 行的 kind 读出来', t.rows[0].cells[0].kind, 'h2')
+    eq('note 行的 kind 读出来', t.rows[3].cells[0].kind, 'listTitle')
+
+    const bogus = parseMd(':::table\n| {@bogus,xx|甲} |\n:::').blocks[0]
+    eq('非法 token 被忽略（文字保留）', cellText(bogus.rows[0].cells[0]), '甲')
+    eq('非法 token 不产生 kind', bogus.rows[0].cells[0].kind, undefined)
+    eq('非法 token 不产生 align', bogus.rows[0].cells[0].align, undefined)
+
+    // `{@` 找不到闭合的 `}`：当普通内容，不许吞掉后面的内容
+    const noClose = parseMd(':::table\n> {@h2|甲 尾\n< 注\n:::').blocks[0]
+    eq('未闭合 {@：文字原样保留（不吞）', cellText(noClose.rows[0].cells[0]), '{@h2|甲 尾')
+    eq('未闭合 {@：后面的行还是独立的一行', noClose.rows.length, 2)
+    const noBar = parseMd(':::table\n> {@h2}甲\n:::').blocks[0]
+    eq('有闭合但没分隔符 |：当普通内容，后缀不丢', cellText(noBar.rows[0].cells[0]).endsWith('甲'), true)
+
+    // 显式写出默认样式 {@listItem|…}：解析归一化掉（模型不留冗余值，与 setCellKind 一致），
+    // 序列化也不写默认值 —— 与围栏 minLines=1 / cantSplit 的写法是同一个约定
+    const defModel = parseMd(':::table\n> {@listItem|甲}\n:::')
+    const defCell = defModel.blocks[0].rows[0].cells[0]
+    eq('显式默认样式：不落冗余 kind 字段', defCell.kind, undefined)
+    eq('显式默认样式：文字保留', cellText(defCell), '甲')
+    eq(
+      '显式默认样式：模型→md→模型 结构一致',
+      JSON.stringify(normalizeBlocks(parseMd(toMd(defModel)))),
+      JSON.stringify(normalizeBlocks(defModel)),
+    )
   }
 }
 

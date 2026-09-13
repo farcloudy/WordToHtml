@@ -5,7 +5,8 @@ import type { Ref } from 'vue'
 import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
 import { BLOCK_KINDS, DOC_TEMPLATES, ptToPx, resolveSpec } from './lib/spec'
-import type { BlockKind, DeepPartial, Spec } from './lib/spec'
+import type { Align, BlockKind, DeepPartial, Spec } from './lib/spec'
+import type { CellVerticalAlign } from './lib/types'
 import type { EditorSelection } from './lib/edit/model'
 import type { OutlineEntry } from './lib/edit/outline'
 import type { SearchScope } from './lib/edit/search'
@@ -95,6 +96,21 @@ const SPACES = [
   { kind: 'en', label: '半宽空格（U+2002）' },
   { kind: 'quarterEm', label: '四分之一宽空格（U+2005）' },
 ] as const
+
+/**
+ * 表格格内的两组对齐按钮。水平只做左 / 居中 / 右三档（不提供两端对齐），
+ * 垂直三档，缺省是顶端 —— 按钮的 active 态吃 selection.table 里已解析默认值的 alignH / alignV。
+ */
+const TABLE_H_ALIGNS: { value: Align; label: string; title: string }[] = [
+  { value: 'left', label: '左', title: '格内水平左对齐' },
+  { value: 'center', label: '居中', title: '格内水平居中' },
+  { value: 'right', label: '右', title: '格内水平右对齐' },
+]
+const TABLE_V_ALIGNS: { value: CellVerticalAlign; label: string; title: string }[] = [
+  { value: 'top', label: '顶端', title: '格内顶端对齐' },
+  { value: 'middle', label: '居中', title: '格内垂直居中' },
+  { value: 'bottom', label: '底端', title: '格内底端对齐' },
+]
 
 /** edit = 直接在 A4 版面上写（面向用户）；source = 类 md 源码（给开发/排错用） */
 const mode = ref<'edit' | 'source'>('edit')
@@ -767,6 +783,50 @@ onBeforeUnmount(() => {
           无
         </label>
       </span>
+
+      <span class="tk-group">
+        <span class="tk-label">水平</span>
+        <button
+          v-for="a in TABLE_H_ALIGNS"
+          :key="a.value"
+          type="button"
+          class="tool"
+          :class="{ 'is-on': tableCtx.alignH === a.value }"
+          :title="a.title"
+          @mousedown.prevent
+          @click="paper?.setTableCellAlignH(a.value)"
+        >
+          {{ a.label }}
+        </button>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">垂直</span>
+        <button
+          v-for="a in TABLE_V_ALIGNS"
+          :key="a.value"
+          type="button"
+          class="tool"
+          :class="{ 'is-on': tableCtx.alignV === a.value }"
+          :title="a.title"
+          @mousedown.prevent
+          @click="paper?.setTableCellAlignV(a.value)"
+        >
+          {{ a.label }}
+        </button>
+      </span>
+
+      <span class="tk-group tk-right">
+        <button
+          type="button"
+          class="tool tk-danger"
+          title="删除整张表格（不二次确认，可 Ctrl+Z 撤销）"
+          @mousedown.prevent
+          @click="paper?.removeTable()"
+        >
+          删除表格
+        </button>
+      </span>
     </div>
 
     <main class="panes" :class="{ single: mode === 'edit' }">
@@ -1151,6 +1211,18 @@ button.primary:disabled {
   align-items: center;
   gap: 4px;
   color: #5a5f66;
+  /* 换行只发生在组与组之间：组自身不收缩、不拆开（窄窗口下也不许错位） */
+  flex: none;
+}
+
+/* 「删除表格」贴到最右，与行/列按钮拉开距离 */
+.tk-right {
+  margin-left: auto;
+}
+
+.tk-danger {
+  border-color: #d8b4b0;
+  color: #b3261e;
 }
 
 .tk-label {

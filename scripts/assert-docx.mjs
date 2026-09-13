@@ -54,8 +54,11 @@ const WD_REVISION_INSERT = 1
 const WD_REVISION_DELETE = 2
 // WdRowHeightRule.wdRowHeightAtLeast —— 行高「最小值」规则
 const ROW_HEIGHT_AT_LEAST = 1
-// WdCellVerticalAlignment.wdCellAlignVerticalTop
+// WdCellVerticalAlignment.wdCellAlignVerticalTop / Center / Bottom
+// （OOXML 的 w:vAlign 把「垂直居中」写作 center，Word 的枚举值是 1）
 const CELL_ALIGN_VERTICAL_TOP = 0
+const CELL_ALIGN_VERTICAL_CENTER = 1
+const CELL_ALIGN_VERTICAL_BOTTOM = 3
 // WdLineStyle.wdLineStyleNone / wdLineStyleSingle
 const LINE_STYLE_NONE = 0
 const LINE_STYLE_SINGLE = 1
@@ -240,6 +243,8 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
   const modelTables = model.blocks.filter((b) => b.t === 'table')
   const dumpTables = dump.tables ?? []
   const before = failures.length
+  /** 真读到过几个格的样式名 —— 一个都没读到说明这一项等于没验（check-docx.ps1 那侧没读到） */
+  let cellStyleChecks = 0
   eq('表格数', dumpTables.length, modelTables.length)
 
   /*
@@ -266,6 +271,33 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
       console.log(`ok   软换行：${wordSoft} 个格子的文字里读到了 chr(11)`)
     }
   }
+
+  /*
+   * 逐格期望值的口径与 docx/export.ts 同源：
+   *   水平 = cell.align.h ?? 角色默认（unit 右 / note 左 / body 跟该格样式）
+   *   垂直 = cell.align.v ?? top（middle 在 OOXML 里写 center，Word 报枚举 1）
+   *   样式 = 该格 kind ?? listItem；kind === 'body' 时不挂样式 → Word 报 Normal 的本地名「正文」
+   *   行高 = minLines × 该行各格样式 linePt 的最大值（渲染后的 0..columns-1，缺格按 listItem）
+   */
+  const renderedCells = (t, row) =>
+    row.role === 'body'
+      ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? { inlines: [] })
+      : [row.cells[0] ?? { inlines: [] }]
+  const alignOf = (role, cell) =>
+    ALIGN[
+      cell.align?.h ??
+        (role === 'unit' ? 'right' : role === 'note' ? 'left' : spec.styles[cell.kind ?? 'listItem'].align)
+    ]
+  const vAlignOf = (cell) =>
+    ({
+      top: CELL_ALIGN_VERTICAL_TOP,
+      middle: CELL_ALIGN_VERTICAL_CENTER,
+      bottom: CELL_ALIGN_VERTICAL_BOTTOM,
+    })[cell.align?.v ?? 'top']
+  const styleNameOf = (cell) =>
+    (cell.kind ?? 'listItem') === 'body'
+      ? spec.styles.body.name
+      : spec.styles[cell.kind ?? 'listItem'].name
 
   // 版心宽（磅）= 页面宽 − 左右页边距
   const contentWidthPt =
@@ -303,28 +335,26 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
       eq(`${tag}·格数`, dr.cellCount, expectedCells)
       eq(`${tag}·禁止跨页断行`, dr.cantSplit, t.cantSplit ? 1 : 0)
       eq(`${tag}·行高规则`, dr.heightRule, ROW_HEIGHT_AT_LEAST)
-      near(`${tag}·行高(磅)`, dr.height, t.minLines * spec.styles.listItem.linePt, 0.1)
-
-      const expectedTexts = merged
-        ? [cellText(row.cells[0] ?? { inlines: [] })]
-        : Array.from({ length: t.columns }, (_, c) => cellText(row.cells[c] ?? { inlines: [] }))
-      const expectedAlign = merged
-        ? row.role === 'unit'
-          ? ALIGN.right
-          : ALIGN.left
-        : ALIGN[spec.styles.listItem.align]
+      const cells = renderedCells(t, row)
+      // 行高 = minLines × 该行各格样式 linePt 的最大值（与导出侧同一条规则）
+      const rowMaxLinePt = Math.max(...cells.map((c) => spec.styles[c.kind ?? 'listItem'].linePt))
+      near(`${tag}·行高(磅)`, dr.height, t.minLines * rowMaxLinePt, 0.1)
 
       for (let c = 0; c < expectedCells; c += 1) {
         const cell = dr.cells?.[c]
+        const model = cells[c] ?? { inlines: [] }
         if (!cell) {
           failures.push(`${tag} 第${c}格在 Word 里不存在`)
           continue
         }
-        eq(`${tag}·格${c}文字`, cell.text, expectedTexts[c])
-        eq(`${tag}·格${c}对齐`, cell.alignment, expectedAlign)
+        eq(`${tag}·格${c}文字`, cell.text, cellText(model))
+        eq(`${tag}·格${c}对齐`, cell.alignment, alignOf(row.role, model))
         eq(`${tag}·格${c}合并跨度`, cell.columnSpan, merged ? t.columns : 1)
-        if (row.role === 'note') {
-          eq(`${tag}·格${c}顶端对齐`, cell.verticalAlignment, CELL_ALIGN_VERTICAL_TOP)
+        eq(`${tag}·格${c}垂直对齐`, cell.verticalAlignment, vAlignOf(model))
+        // 格内段落样式：能读就读（check-docx.ps1 读不到时留空字符串，不误报）
+        if (typeof cell.style === 'string' && cell.style !== '') {
+          cellStyleChecks += 1
+          eq(`${tag}·格${c}样式`, cell.style, styleNameOf(model))
         }
         const wantStyle = merged ? LINE_STYLE_NONE : LINE_STYLE_SINGLE
         for (const side of ['top', 'left', 'bottom', 'right']) {
@@ -333,15 +363,21 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
       }
       console.log(
         `ok   ${tag} 格数${dr.cellCount} 禁断行${dr.cantSplit} 行高${dr.heightRule}/${round2(dr.height)}磅 ` +
-          `对齐[${(dr.cells ?? []).map((x) => x.alignment).join(',')}]`,
+          `对齐[${(dr.cells ?? []).map((x) => x.alignment).join(',')}] ` +
+          `垂直[${(dr.cells ?? []).map((x) => x.verticalAlignment).join(',')}]`,
       )
     })
   })
 
+  if (modelTables.length > 0 && cellStyleChecks === 0) {
+    failures.push('Word 侧一个格内样式名都没读到 —— 格内样式（w:pStyle）对账等于没验')
+  }
+
   if (failures.length === before) {
     console.log(
       `ok   表格对账：${modelTables.length} 张表全部与模型/规格表吻合` +
-        `（总宽≈${round2(contentWidthPt)}磅，行高=${round2(spec.styles.listItem.linePt)}磅 × minLines）`,
+        `（总宽≈${round2(contentWidthPt)}磅；逐行行高 = minLines × 该行各格样式 linePt 的最大值；` +
+        `逐格样式（${cellStyleChecks} 格）/水平对齐/垂直对齐逐项对上）`,
     )
   }
 }

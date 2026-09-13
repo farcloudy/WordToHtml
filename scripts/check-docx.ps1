@@ -184,6 +184,10 @@ try {
         foreach ($cell in $row.Cells) {
           $cellAlign = -1
           try { $cellAlign = [int]$cell.Range.ParagraphFormat.Alignment } catch { $cellAlign = -1 }
+          # Paragraph style name of the cell's first paragraph (W4b-2: cells may use a
+          # style other than the list-item one). Empty when unavailable.
+          $cellStyle = ''
+          try { $cellStyle = $cell.Range.Paragraphs.Item(1).Style.NameLocal } catch { $cellStyle = '' }
           $vAlign = -1
           try { $vAlign = [int]$cell.VerticalAlignment } catch { $vAlign = -1 }
           $span = -1
@@ -200,6 +204,7 @@ try {
           }
           $cells += [ordered]@{
             text              = $cell.Range.Text.TrimEnd([char]13, [char]7, [char]10)
+            style             = $cellStyle
             alignment         = $cellAlign
             verticalAlignment = $vAlign
             columnSpan        = $span

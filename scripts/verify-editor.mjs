@@ -1196,6 +1196,21 @@ try {
   eq('后续每张纸都在新的一页开始', printEdit.secondBreak, 'page')
   eq('打印时纸张不带屏幕上的阴影', printEdit.boxShadow, 'none')
   eq('打印时版面页数不变', printEdit.pages, await page.evaluate(() => document.querySelectorAll('.wtp-page').length))
+  // W4b-2 新增的三组按钮都在 .sub-toolbar 里：打印时它们随外壳一起消失（逐个按 offsetParent 验，
+  // 只看 .sub-toolbar 自己的 display 证明不了子按钮真被盖住）
+  ok(
+    '打印时上下文工具条里的新增按钮也不显示（水平 / 垂直 / 删除表格）',
+    await page.evaluate(() => {
+      const groups = Array.from(document.querySelectorAll('.sub-toolbar .tk-group'))
+      const names = ['水平', '垂直', '删除表格']
+      return names.every((name) => {
+        const group = groups.find((g) => (g.textContent ?? '').includes(name))
+        if (!group) return false
+        const btns = Array.from(group.querySelectorAll('button'))
+        return btns.length > 0 && btns.every((b) => b.offsetParent === null)
+      })
+    }),
+  )
 
   const rules = await pageRules()
   ok('打印样式里有 @page', rules.length > 0, JSON.stringify(rules))
@@ -1531,8 +1546,8 @@ try {
             el.querySelectorAll(':scope > table > tbody > tr').length ===
             Number(el.dataset.rowTo) - Number(el.dataset.rowFrom),
         ),
-        cells: document.querySelectorAll('.wtp-table .wtp-listItem[data-block-id]').length,
-        firstCellText: document.querySelector('.wtp-table .wtp-listItem[data-block-id]')
+        cells: document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]').length,
+        firstCellText: document.querySelector('.wtp-table .wtp-cell[data-block-id]')
           ?.textContent,
       }
     })
@@ -1816,14 +1831,14 @@ try {
   // 换行之后敲字：必须落在新的一行（模型里排在 break 之后），而不是回到上一行末尾
   await page.keyboard.insertText('X')
   await page.waitForTimeout(300)
-  const typed = await modelTable()
-  const typedInlines = cellInlines(typed, shiftRow, 0)
+  const typedV4 = await modelTable()
+  const typedInlines = cellInlines(typedV4, shiftRow, 0)
   const breakIdx = typedInlines.findIndex((i) => i.t === 'break')
   const typedIdx = typedInlines.findIndex((i) => i.t === 'text' && i.text.includes('X'))
   ok('Shift+Enter 后插入符落在换行之后（敲的字排在 break 之后）', breakIdx >= 0 && typedIdx > breakIdx)
-  eq('换行后敲的字没打回上一行', cellText(typed, shiftRow, 0), '检测仪器X')
+  eq('换行后敲的字没打回上一行', cellText(typedV4, shiftRow, 0), '检测仪器X')
   const v4Caret = await page.evaluate(() => window.__wtpTest.caretInfo())
-  eq('插入符仍在同一格', v4Caret?.blockId, `${typed?.id ?? ''}.r${shiftRow}c0`)
+  eq('插入符仍在同一格', v4Caret?.blockId, `${typedV4?.id ?? ''}.r${shiftRow}c0`)
   await checkNoOverflow('V4 Shift+Enter 后')
 
   // ---- V5. 边界护栏：格首 Backspace、格尾 Delete 都不许动模型/DOM ----
@@ -1844,15 +1859,226 @@ try {
   await page.waitForTimeout(200)
   await page.keyboard.press('Delete')
   await page.waitForTimeout(300)
-  const afterDelete = await modelTable()
-  eq('格尾 Delete：行数不变', afterDelete?.rows.length, guardTable?.rows.length)
-  eq('格尾 Delete：格内文字不变', cellText(afterDelete, 4, 0), '检测仪器')
+  const afterDeleteV5 = await modelTable()
+  eq('格尾 Delete：行数不变', afterDeleteV5?.rows.length, guardTable?.rows.length)
+  eq('格尾 Delete：格内文字不变', cellText(afterDeleteV5, 4, 0), '检测仪器')
   eq(
     '格尾 Delete：<td> 数没变',
     (await tableDom()).tds,
     guardDom.tds,
   )
   await checkNoOverflow('V5 边界护栏后')
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== W. 表格收尾（W4b-2）：Tab/Shift+Tab 跨格、格首格尾方向键、删整表、格内换样式、两组对齐 ===',
+  )
+  const cellAlign = (t, r, c) => t?.rows?.[r]?.cells?.[c]?.align
+  const groupButtons = (group) => subToolbar.locator('.tk-group', { hasText: group })
+  const alignButton = (group, name) => groupButtons(group).getByRole('button', { name, exact: true })
+  /** 上下文工具条某个组里处于高亮的按钮文字 */
+  const activeLabels = (group) =>
+    page.evaluate((g) => {
+      const box = Array.from(document.querySelectorAll('.sub-toolbar .tk-group')).find((el) =>
+        (el.textContent ?? '').includes(g),
+      )
+      return box ? Array.from(box.querySelectorAll('button.is-on')).map((b) => b.textContent?.trim()) : []
+    }, group)
+
+  // ---- W1. Tab / Shift+Tab 行优先跨格；最后一格 Tab 无响应 ----
+  await openApp()
+  const wTable = await modelTable()
+  const wId = wTable?.id ?? ''
+  eq('样本表 id 可用', wId !== '', wId)
+  await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 0))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Tab')
+  await page.waitForTimeout(200)
+  const tab1 = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('Tab 从 r2c0 跨到 r2c1', tab1?.blockId, `${wId}.r2c1`)
+  eq('Tab 跨格落点是格首', tab1?.offset, 0)
+  eq('跨格不改模型（只挪选区）', JSON.stringify(await modelTable()), JSON.stringify(wTable))
+  await page.keyboard.press('Tab')
+  await page.waitForTimeout(200)
+  const tab2 = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('再 Tab 到 r2c2 格首', tab2?.blockId, `${wId}.r2c2`)
+  eq('落点仍是格首', tab2?.offset, 0)
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('账面原值'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Shift+Tab')
+  await page.waitForTimeout(200)
+  const backTab = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('Shift+Tab 从 r1c2 回到 r1c1', backTab?.blockId, `${wId}.r1c1`)
+  eq('Shift+Tab 落点是格尾', backTab?.offset, '数量'.length)
+
+  // 最后一格（附注行）：Tab 之后选区与模型都不许变
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('未经审计'))
+  await page.waitForTimeout(200)
+  const lastBefore = await page.evaluate(() => window.__wtpTest.caretInfo())
+  const modelBeforeLast = JSON.stringify(await modelTable())
+  await page.keyboard.press('Tab')
+  await page.waitForTimeout(200)
+  const lastAfter = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('最后一格 Tab：落点没动', lastAfter?.blockId, lastBefore?.blockId)
+  eq('最后一格 Tab：偏移没动', lastAfter?.offset, lastBefore?.offset)
+  eq('最后一格 Tab：模型没动', JSON.stringify(await modelTable()), modelBeforeLast)
+  await checkNoOverflow('W1 Tab 跨格后')
+
+  // ---- W2. ← / → 在格首 / 格尾跨格；格内中间不接管 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 0))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('ArrowLeft')
+  await page.waitForTimeout(200)
+  const goLeft = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('格首 ← 跨到上一格（r1c2）', goLeft?.blockId, `${wId}.r1c2`)
+  eq('← 落在上一格末尾', goLeft?.offset, '账面原值'.length)
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('ArrowRight')
+  await page.waitForTimeout(200)
+  const goRight = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('格尾 → 跨到下一格（r2c1）', goRight?.blockId, `${wId}.r2c1`)
+  eq('→ 落在下一格开头', goRight?.offset, 0)
+
+  await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 2))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('ArrowLeft')
+  await page.waitForTimeout(200)
+  const midLeft = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('格内中间 ← 不跨格（仍在本格）', midLeft?.blockId, `${wId}.r2c0`)
+  eq('格内中间 ← 只左移一位（浏览器接管）', midLeft?.offset, 1)
+  await checkNoOverflow('W2 方向键后')
+
+  // ---- W3. 删除整张表（不二次确认）----
+  await openApp()
+  const delBefore = await getModel()
+  const delIndex = delBefore.blocks.findIndex((b) => b.t === 'table')
+  const prevBlock = delBefore.blocks[delIndex - 1]
+  const prevText = textOfBlock(prevBlock)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  ok('「删除表格」按钮在格内可用', (await subButton('删除表格').isDisabled()) === false)
+  await subButton('删除表格').click()
+  await page.waitForTimeout(300)
+  const delAfter = await getModel()
+  eq(
+    '模型少一个 table 块',
+    delAfter.blocks.filter((b) => b.t === 'table').length,
+    delBefore.blocks.filter((b) => b.t === 'table').length - 1,
+  )
+  eq('DOM 里不再有 .wtp-tableFrag', await page.evaluate(() => document.querySelectorAll('.wtp-tableFrag').length), 0)
+  eq('工具条随光标离开表格而收起', await subToolbar.count(), 0)
+  const delCaret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符落在上一块（块 id）', delCaret?.blockId, prevBlock.id)
+  eq('插入符落在上一块末尾（偏移 = 该块文字长度）', delCaret?.offset, prevText.length)
+  await checkNoOverflow('W3 删除表格后')
+
+  // ---- W4. 光标在格内点样式 chip → 只有该格换样式 ----
+  await openApp()
+  const chipBefore = await modelTable()
+  const kindsBefore = chipBefore.rows.map((r) => r.cells.map((c) => c.kind ?? null))
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.locator('.styles .style-chip', { hasText: '二级标题' }).click()
+  await page.waitForTimeout(300)
+  const chipAfter = await modelTable()
+  eq('那一格换了样式（kind = h2）', chipAfter.rows[2].cells[0].kind, 'h2')
+  const changedCells = []
+  chipAfter.rows.forEach((r, ri) =>
+    r.cells.forEach((c, ci) => {
+      if ((kindsBefore[ri]?.[ci] ?? null) !== (c.kind ?? null)) changedCells.push(`${ri},${ci}`)
+    }),
+  )
+  eq('只有那一格变（其余格一个都没动）', changedCells.join('|'), '2,0')
+  // 类名从 wtp-listItem 换成 wtp-h2；按文本定位那一格（片段可能分页）
+  const chipDom = await page.evaluate(() => {
+    const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+    const target = cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))
+    return {
+      target: target ? target.className : 'missing',
+      h2: document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2').length,
+      h2Text: Array.from(document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2'))
+        .map((el) => el.textContent)
+        .join(','),
+    }
+  })
+  ok(
+    'DOM 里那一格的类名从 wtp-listItem 变成 wtp-h2',
+    chipDom.target.split(' ').includes('wtp-cell') && chipDom.target.split(' ').includes('wtp-h2'),
+    JSON.stringify(chipDom),
+  )
+  ok(
+    '那一格不再是 wtp-listItem',
+    !chipDom.target.split(' ').includes('wtp-listItem'),
+    JSON.stringify(chipDom),
+  )
+  eq('整张表只有这一格是 wtp-h2', chipDom.h2, 1)
+  eq('wtp-h2 那一格就是被点的那格', chipDom.h2Text, '数控加工中心')
+  await checkNoOverflow('W4 格内换样式后')
+
+  // ---- W5. 两组对齐：active 态、写进 DOM 的行内样式、只作用于该格 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('单位：元'))
+  await page.waitForTimeout(200)
+  eq('unit 行默认右对齐 → 水平组高亮「右」', (await activeLabels('水平')).join(','), '右')
+  eq('垂直默认顶端 → 垂直组高亮「顶端」', (await activeLabels('垂直')).join(','), '顶端')
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  eq('body 格默认是该样式的两端对齐 → 水平三档都不高亮', (await activeLabels('水平')).join(','), '')
+  eq('body 格垂直默认顶端 → 垂直组高亮「顶端」', (await activeLabels('垂直')).join(','), '顶端')
+
+  const alignModelBefore = await modelTable()
+  const pagesBeforeAlign = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  await alignButton('水平', '居中').click()
+  await page.waitForTimeout(300)
+  eq('点「居中」写进模型（align.h=center）', cellAlign(await modelTable(), 2, 0)?.h, 'center')
+  eq('点「居中」后该按钮高亮', (await activeLabels('水平')).join(','), '居中')
+  eq(
+    '水平对齐写进格内 div 的行内 text-align',
+    await page.evaluate(() => {
+      const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+      return cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))?.style.textAlign ?? 'missing'
+    }),
+    'center',
+  )
+  await alignButton('水平', '居中').click()
+  await page.waitForTimeout(300)
+  eq('再点同一个值 → 清除覆盖（字段消失）', cellAlign(await modelTable(), 2, 0)?.h, undefined)
+  eq('清除后水平组不再高亮', (await activeLabels('水平')).join(','), '')
+
+  await alignButton('垂直', '底端').click()
+  await page.waitForTimeout(300)
+  eq('点「底端」写进模型（align.v=bottom）', cellAlign(await modelTable(), 2, 0)?.v, 'bottom')
+  eq('点「底端」后该按钮高亮', (await activeLabels('垂直')).join(','), '底端')
+  eq(
+    '垂直对齐写进 <td> 的行内 vertical-align（写在格内 div 上无效）',
+    await page.evaluate(() => {
+      const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+      const target = cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))
+      return target?.closest('td')?.style.verticalAlign ?? 'missing'
+    }),
+    'bottom',
+  )
+  await alignButton('垂直', '底端').click()
+  await page.waitForTimeout(300)
+  eq('再点同一个值 → 清除覆盖', cellAlign(await modelTable(), 2, 0)?.v, undefined)
+  // 生效范围：只有那一格被改过（其它格的 align 一个都没动）
+  const alignModelAfter = await modelTable()
+  const ownAlign = (t) =>
+    t.rows.flatMap((r, ri) => r.cells.map((c, ci) => `${ri},${ci}:${JSON.stringify(c.align ?? null)}`)).join('|')
+  eq('两组对齐只作用于光标那一格', ownAlign(alignModelAfter), ownAlign(alignModelBefore))
+  eq('（过程中的中间态已回到默认）那一格 align 字段消失', 'align' in alignModelAfter.rows[2].cells[0], false)
+  // 两组对齐不改行高、不改换行点 → 页数必须不变（格内换样式会改行高、页数可以变，那是预期）
+  eq(
+    '两组对齐来回点完页数不变',
+    await page.evaluate(() => document.querySelectorAll('.wtp-page').length),
+    pagesBeforeAlign,
+  )
+  await checkNoOverflow('W5 两组对齐后')
 } finally {
   await browser?.close()
   await server.close()
@@ -1866,8 +2092,10 @@ if (failures.length > 0) {
 }
 console.log(
   '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
-    '金额格式、特殊空格、切文件模板、打印、查找替换（面板/高亮/范围/替换一处与全部）、' +
+    '金额格式、特殊空格、切文件模板、打印（含新增对齐/删表按钮的隐藏）、查找替换（面板/高亮/范围/替换一处与全部）、' +
     '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）、' +
     '表格编辑交互（上下文工具条与落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
-    '格首 Backspace 与格尾 Delete 护栏）均落到模型。',
+    '格首 Backspace 与格尾 Delete 护栏）、表格收尾（Tab/Shift+Tab 与 ←/→ 跨格、最后一格 Tab 无响应、' +
+    '删除整表后插入符落上一块末尾、格内点样式 chip 只改那一格、两组对齐的 active 态与行内样式、对齐不改页数）' +
+    '均落到模型。',
 )

@@ -5,7 +5,7 @@
  * 不在彼此之间直接对穿。这样修订、批注这类需要额外元信息的东西才有地方安放。
  */
 
-import type { BlockKind } from './spec'
+import type { Align, BlockKind } from './spec'
 
 /** 修订标记。Word 的 w:ins / w:del 需要 id + author + date 三个属性，缺一会显示异常。 */
 export interface RevMark {
@@ -84,9 +84,29 @@ export interface TextBlock {
  */
 export type TableRowRole = 'unit' | 'body' | 'note'
 
-/** 单元格内容：单段落；软换行（Shift+Enter 的 <w:br/>）作为零宽 inline 存在 inlines 里 */
+/** 垂直对齐三档（逐格覆盖用；Word 的 w:vAlign） */
+export type CellVerticalAlign = 'top' | 'middle' | 'bottom'
+
+/**
+ * 单元格的对齐覆盖。只有被用户显式改过的维度才存字段 ——
+ * 缺省值由 render/html.ts、docx/export.ts 与 emitSelection 三处按同一条规则现算
+ * （见 defaultCellAlignH；垂直缺省一律 top）。
+ */
+export interface TableCellAlign {
+  h?: Align
+  v?: CellVerticalAlign
+}
+
+/**
+ * 单元格内容：单段落；软换行（Shift+Enter 的 <w:br/>）作为零宽 inline 存在 inlines 里。
+ *
+ * `kind` 缺省是 `listItem`（列表段落）—— 老样本与老 docx 因此一个字节都不用变；
+ * 显式设成 `listItem` 时 `setCellKind` 会把字段删掉（模型里不存冗余值）。
+ */
 export interface TableCellModel {
   inlines: Inline[]
+  kind?: BlockKind
+  align?: TableCellAlign
 }
 
 export interface TableRowModel {
@@ -127,6 +147,19 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
   const tableId = m?.[1]
   if (m === null || !tableId) return null
   return { tableId, row: Number(m[2]), col: Number(m[3]) }
+}
+
+/**
+ * 逐格水平对齐的默认值（没有 `cell.align.h` 覆盖时用它）。
+ *
+ * unit 行恒右对齐、note 行恒左对齐（这是两个 role 的既有语义，见 6.1）；
+ * body 格跟着自己那条样式走 —— 调用方要把样式的 align 传进来
+ * （render/html.ts 里 body 格靠类名吃到样式对齐，不需要这个函数，所以它传什么都不会被用到）。
+ */
+export function defaultCellAlignH(role: TableRowRole, styleAlign: Align): Align {
+  if (role === 'unit') return 'right'
+  if (role === 'note') return 'left'
+  return styleAlign
 }
 
 export interface CommentDef {

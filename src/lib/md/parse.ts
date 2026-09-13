@@ -42,14 +42,17 @@
  * 行内标记可以互相嵌套，例如 {红|**重点**}、{+**新增且加粗**}。
  */
 
-import type { BlockKind } from '../spec'
+import { BLOCK_KINDS } from '../spec'
+import type { Align, BlockKind } from '../spec'
 import type {
   Block,
+  CellVerticalAlign,
   CommentDef,
   DocModel,
   Inline,
   RevMark,
   TableBlock,
+  TableCellAlign,
   TableCellModel,
   TableRowModel,
 } from '../types'
@@ -409,6 +412,57 @@ function splitTableCells(line: string): string[] {
   })
 }
 
+const CELL_H_ALIGNS: readonly string[] = ['left', 'center', 'right']
+const CELL_V_ALIGNS: readonly string[] = ['top', 'middle', 'bottom']
+
+/**
+ * 单元格开头的可选指令：`{@<token>[,<token>]…|<格内正文>}`（本波唯一的新语法）。
+ *
+ * 只在表格解析里认 —— **不并进通用的 parseDirective**，否则普通段落里也会长出这套语义。
+ * 三类 token 互不冲突：BlockKind 名 → 该格样式；left/center/right → 水平对齐；
+ * top/middle/bottom → 垂直对齐。不认识的 token 一律忽略、不报错；
+ * 显式写出默认样式 `listItem` 同样不落字段（见函数末尾的注释）。
+ *
+ * 转义可逆：正文里真写 `{@x|y}` 会被 serialize.ts 的 escapeText 转成 `\{@x|y\}`，
+ * 解析时反斜杠吃掉 `{`，就还原成字面量。
+ * `{@` 之后找不到闭合的 `}`（或没有分隔 token 与正文的 `|`）时**当普通内容处理**，
+ * 绝不吞掉后面的内容。
+ */
+function parseCellAttrs(text: string, ctx: InlineContext): TableCellModel {
+  if (!text.startsWith('{@')) return { inlines: parseInline(text, ctx) }
+
+  const close = findMatchingBrace(text, 0)
+  if (close < 0) return { inlines: parseInline(text, ctx) }
+  const inner = text.slice(2, close)
+  const bar = findTopLevelBar(inner)
+  if (bar < 0) return { inlines: parseInline(text, ctx) }
+
+  let kind: BlockKind | undefined
+  let align: TableCellAlign | undefined
+  for (const raw of inner.slice(0, bar).split(',')) {
+    const token = raw.trim()
+    if (BLOCK_KINDS.includes(token as BlockKind)) {
+      kind = token as BlockKind
+    } else if (CELL_H_ALIGNS.includes(token)) {
+      align = { ...(align ?? {}), h: token as Align }
+    } else if (CELL_V_ALIGNS.includes(token)) {
+      align = { ...(align ?? {}), v: token as CellVerticalAlign }
+    }
+  }
+
+  // 闭合 `}` 之后若还有内容，一并当正文（正常写法不会有，但不许静默丢掉）
+  const inlines = [
+    ...parseInline(inner.slice(bar + 1), ctx),
+    ...parseInline(text.slice(close + 1), ctx),
+  ]
+  const cell: TableCellModel = { inlines }
+  // 'listItem' 就是默认样式：认出它也不落字段。setCellKind 在设回默认时会删字段、序列化也会省略它，
+  // 这里跟这两处对齐（模型里不留冗余值）—— 围栏的 minLines=1 / cantSplit 早就是这个约定。
+  if (kind !== undefined && kind !== 'listItem') cell.kind = kind
+  if (align !== undefined) cell.align = align
+  return cell
+}
+
 /**
  * 解析一个 `:::table` 围栏块（含结束行），返回模型块与结束行的下标。
  *
@@ -438,18 +492,14 @@ function parseTableBlock(
       // 整行一格：文字就是标记之后的内容（再剥一个空格，与序列化写的 "> xxx" 互逆）。
       // 这一支**不能 trimEnd** —— 行尾空格属于内容；body 行不同，它的内容后面还有
       // 一枚外框 `|`，所以对 body 行 trimEnd 只会削掉框外的空白。
-      const cells: TableCellModel[] = [
-        { inlines: parseInline(stripOneSpace(line.slice(1)), ctx) },
-      ]
+      const cells: TableCellModel[] = [parseCellAttrs(stripOneSpace(line.slice(1)), ctx)]
       rows.push({ role: line.startsWith('>') ? 'unit' : 'note', cells })
       continue
     }
     if (line.startsWith('|')) {
       rows.push({
         role: 'body',
-        cells: splitTableCells(line.trimEnd()).map((text) => ({
-          inlines: parseInline(text, ctx),
-        })),
+        cells: splitTableCells(line.trimEnd()).map((text) => parseCellAttrs(text, ctx)),
       })
       continue
     }

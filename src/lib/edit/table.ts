@@ -13,7 +13,8 @@
  * 整体位移 —— 这是 W4a 定的坐标方案的必然结果，不是缺陷；调用方必须按新下标重算锚点。
  */
 
-import type { DocModel, TableBlock, TableRowModel } from '../types'
+import type { BlockKind } from '../spec'
+import type { CellVerticalAlign, DocModel, TableBlock, TableCellModel, TableRowModel } from '../types'
 import { parseCellId } from '../types'
 
 /** 按 id 找表格块。id 既可以是表格自己的 id，也可以是格子的 cellId（tableId.rNcM） */
@@ -24,6 +25,106 @@ export function findTable(doc: DocModel, id: string): TableBlock | undefined {
     if (block.t === 'table' && block.id === tableId) return block
   }
   return undefined
+}
+
+/**
+ * 删除整张表。id 既可以是表格 id 也可以是格子的 cellId（复用 findTable）。
+ *
+ * 专表专用：`edit/model.ts` 的 removeBreak 只管分页符 / 分节符，
+ * 段落与表格都不归它管（这条收紧见 model.ts 的注释）。
+ */
+export function removeTable(doc: DocModel, id: string): boolean {
+  const table = findTable(doc, id)
+  if (!table) return false
+  const index = doc.blocks.indexOf(table)
+  if (index < 0) return false
+  doc.blocks.splice(index, 1)
+  return true
+}
+
+/** 按 cellId 找格子（纯函数，便于 emitSelection / 单测） */
+export function findCell(doc: DocModel, cellIdValue: string): TableCellModel | undefined {
+  const cell = parseCellId(cellIdValue)
+  if (!cell) return undefined
+  const table = findTable(doc, cell.tableId)
+  return table?.rows[cell.row]?.cells[cell.col]
+}
+
+/** 设格子的样式；kind === 'listItem'（缺省语义）时删除字段，保持模型不存冗余值 */
+export function setCellKind(cell: TableCellModel, kind: BlockKind): void {
+  if (kind === 'listItem') delete cell.kind
+  else cell.kind = kind
+}
+
+/** 设 / 清某一维的对齐覆盖；value === null 表示删掉这一维；两维都没了就删掉 align 字段 */
+export function setCellAlign(
+  cell: TableCellModel,
+  part: 'h' | 'v',
+  value: string | null,
+): void {
+  const align = { ...(cell.align ?? {}) }
+  if (value === null) {
+    if (part === 'h') delete align.h
+    else delete align.v
+  } else if (part === 'h') {
+    align.h = value as NonNullable<typeof align.h>
+  } else {
+    align.v = value as CellVerticalAlign
+  }
+  if (align.h === undefined && align.v === undefined) delete cell.align
+  else cell.align = align
+}
+
+/** 落点：目标格 + 落在格首还是格尾 */
+export interface CellStep {
+  row: number
+  col: number
+  at: 'start' | 'end'
+}
+
+/** 一行在跨格遍历里的「真实格」：body 行按 cells.length 数，unit/note 行整行算一格（col 恒为 0） */
+function rowSlots(table: TableBlock): { row: number; col: number }[] {
+  const out: { row: number; col: number }[] = []
+  table.rows.forEach((row, r) => {
+    if (row.role !== 'body') {
+      out.push({ row: r, col: 0 })
+      return
+    }
+    // 只数模型里真实存在的格：渲染时凑矩形补出来的幻影格没有模型容器
+    // （findContainer 返回 undefined），打进去是死路 —— 见 PLAN 8 第 8 条②。
+    for (let c = 0; c < row.cells.length; c += 1) out.push({ row: r, col: c })
+  })
+  return out
+}
+
+/** 行优先的下一格 / 上一格（遍历 rows 数组顺序：unit → body… → note）。没有下一格返回 null */
+export function stepCell(
+  table: TableBlock,
+  row: number,
+  col: number,
+  dir: 'next' | 'prev',
+): CellStep | null {
+  const slots = rowSlots(table)
+  const at = slots.findIndex((s) => s.row === row && s.col === col)
+  if (at < 0) return null
+  const next = slots[at + (dir === 'next' ? 1 : -1)]
+  if (!next) return null
+  return { row: next.row, col: next.col, at: dir === 'next' ? 'start' : 'end' }
+}
+
+/** 上 / 下的相邻格：同列；目标是 unit/note 行时列取 0；越界（含打到幻影格）返回 null */
+export function verticalCell(
+  table: TableBlock,
+  row: number,
+  col: number,
+  dir: 'up' | 'down',
+): CellStep | null {
+  const r = row + (dir === 'up' ? -1 : 1)
+  const target = table.rows[r]
+  if (!target) return null
+  if (target.role !== 'body') return { row: r, col: 0, at: 'start' }
+  if (!target.cells[col]) return null
+  return { row: r, col, at: 'start' }
 }
 
 function clampIndex(index: number, length: number): number {

@@ -95,7 +95,9 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    * CELL_MARGIN_TWIPS），两侧不同，格内文字相对 Word 就会偏 —— 这不是巧合，是一个共用的数。
    *
    * 行高最小值**不能**靠 <tr> 的 min-height（表格行不吃这个属性），所以给格内那层 div 设
-   * min-height：值取「列表段落」的行距 × minLines，与导出侧的 w:trHeight 同源。
+   * min-height。格内文字可以换成别的样式（`TableCellModel.kind`），所以这里按 STYLE_KEYS
+   * 逐条样式生成 —— 一行里各格取自己样式的那条，实际行高天然是各格的最大值
+   * （docx 侧的 w:trHeight 用同一条规则算，两侧同源）。
    * ⚠️ 本机无法用浏览器验证这一点（Edge 的程序化启动坏了、不跑 playwright），留给人工核对。
    *
    * 另有一处已知偏差（PLAN 6.8）：列表段落样式的 CSS line-height 是固定值 12pt，
@@ -108,8 +110,14 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
       `overflow-wrap: break-word; }`,
     // unit / note 行整行一格且无边框（与导出侧的 NO_BORDERS 对应）
     `.${ns}-table td.${ns}-td-plain { border: 0; }`,
-    `.${ns}-table .${ns}-listItem { min-height: ${spec.styles.listItem.linePt}pt; }`,
-    `.${ns}-table-min2 .${ns}-listItem { min-height: ${spec.styles.listItem.linePt * 2}pt; }`,
+  )
+  for (const kind of STYLE_KEYS) {
+    out.push(
+      `.${ns}-table .${ns}-${kind} { min-height: ${spec.styles[kind].linePt}pt; }`,
+      `.${ns}-table-min2 .${ns}-${kind} { min-height: ${spec.styles[kind].linePt * 2}pt; }`,
+    )
+  }
+  out.push(
     // 表格片段自己是普通块（内容宽 = 版心宽），刻意外层不挂 data-block-id（见 render/html.ts）
     `.${ns}-tableFrag { width: 100%; }`,
   )

@@ -46,6 +46,7 @@ export {
   cellId,
   collectRevisions,
   commentScopes,
+  defaultCellAlignH,
   emptyDoc,
   inlinesText,
   nextBlockId,
@@ -56,6 +57,7 @@ export {
 export type {
   Block,
   BreakInline,
+  CellVerticalAlign,
   CommentDef,
   CommentEndInline,
   CommentStartInline,
@@ -66,6 +68,7 @@ export type {
   RevMark,
   SectionBreakBlock,
   TableBlock,
+  TableCellAlign,
   TableCellModel,
   TableRowModel,
   TableRowRole,
@@ -97,6 +100,7 @@ export {
   replyComment,
   replaceRange,
   setBlockKind,
+  setContainerKind,
   sliceStrict,
   splitBlock,
   updateComment,
@@ -106,15 +110,22 @@ export type { BlockPoint, EditorSelection, InlineContainer, TableSelectionContex
 export {
   bodyInsertIndex,
   bodyRowIndexes,
+  findCell,
   findTable,
   insertBodyRow,
   insertColumn,
   normalizeTable,
   removeBodyRow,
   removeColumn,
+  removeTable,
+  setCellAlign,
+  setCellKind,
   setMinLines,
   setRoleRow,
+  stepCell,
+  verticalCell,
 } from './edit/table'
+export type { CellStep } from './edit/table'
 
 export { formatAmount } from './edit/amount'
 

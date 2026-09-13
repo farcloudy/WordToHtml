@@ -11,9 +11,10 @@
  * 预览 DOM 用的是「显示坐标」（含前缀），换算只在 dom.ts 里做。
  */
 
-import type { BlockKind } from '../spec'
+import type { Align, BlockKind } from '../spec'
 import type {
   Block,
+  CellVerticalAlign,
   CommentDef,
   DocModel,
   Inline,
@@ -23,6 +24,7 @@ import type {
   TextBlock,
 } from '../types'
 import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
+import { findCell, setCellKind } from './table'
 
 export interface BlockPoint {
   blockId: string
@@ -51,6 +53,10 @@ export interface TableSelectionContext {
   minLines: 1 | 2
   hasUnit: boolean
   hasNote: boolean
+  /** 已按角色默认值解析过的实际水平对齐；按钮高亮要按它，不按有没有覆盖 */
+  alignH: Align
+  /** 已解析默认值（缺省 top）的实际垂直对齐 */
+  alignV: CellVerticalAlign
 }
 
 /** 工具栏要的选区信息（模型文字坐标，不含自动编号前缀） */
@@ -296,6 +302,21 @@ export function setBlockKind(doc: DocModel, blockId: string, kind: BlockKind): v
   if (block) block.kind = kind
 }
 
+/**
+ * 给「任意可编辑容器」设样式：cellId 命中格子就设格子的 kind，否则设段落。
+ *
+ * 与只认 textBlock 的 setBlockKind 并存：那个的既有行为不许动
+ * （单测与接口都在用），跨段落 + 跨格的工具栏操作走这一条。
+ */
+export function setContainerKind(doc: DocModel, containerId: string, kind: BlockKind): void {
+  const cell = findCell(doc, containerId)
+  if (cell) {
+    setCellKind(cell, kind)
+    return
+  }
+  setBlockKind(doc, containerId, kind)
+}
+
 /** 判断 [from,to) 内的文字是否全部加粗（空区间返回 false） */
 export function rangeIsBold(container: InlineContainer, from: number, to: number): boolean {
   if (to <= from) return false
@@ -458,11 +479,18 @@ export function insertBreakAfter(
   return block.id
 }
 
-/** 删掉一个分页符/分节符。文字块不归它管（那条路是 removeBlock / 退格合并）。 */
+/**
+ * 删掉一个换页标记。**只认分页符 / 分节符** —— 段落不归它管（那是 removeBlock / 退格合并），
+ * 表格更不归它管（删整表走 edit/table.ts 的 removeTable）。
+ *
+ * 早先这里只拒 textBlock，于是拿一张表的 id 调进来会把整张表静默删掉 —— 是个陷阱，
+ * 现已收紧：其余块一律返回 false 且一个字节都不改。
+ */
 export function removeBreak(doc: DocModel, blockId: string): boolean {
   const index = doc.blocks.findIndex((b) => b.id === blockId)
   const block = doc.blocks[index]
-  if (index < 0 || !block || block.t === 'textBlock') return false
+  if (index < 0 || !block) return false
+  if (block.t !== 'pageBreak' && block.t !== 'sectionBreak') return false
   doc.blocks.splice(index, 1)
   return true
 }
@@ -506,6 +534,9 @@ export function cloneDoc(doc: DocModel): DocModel {
             role: row.role,
             cells: row.cells.map((cell) => ({
               inlines: cell.inlines.map((inline): Inline => ({ ...inline })),
+              // kind / align 也要逐格拷：少拷一个字段，撤销与渲染快照就会「回到默认样式 / 默认对齐」
+              ...(cell.kind !== undefined ? { kind: cell.kind } : {}),
+              ...(cell.align !== undefined ? { align: { ...cell.align } } : {}),
             })),
           })),
         }

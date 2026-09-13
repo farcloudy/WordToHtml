@@ -81,6 +81,21 @@ const SAMPLE = [
   '< 注：以上金额不含税',
   ':::',
   '',
+  // 两张表之间必须隔一个段落：OOXML 里相邻的两个 <w:tbl> 会被 Word 合并成一张表
+  // （2026-09-13 实测：不隔开时 Word 报「表数 1、行数 12」），分隔段不是表格对账的一部分。
+  '下表用于核对格内换样式与两组对齐。',
+  '',
+  // W4b-2：第二张表专验「格内换样式 + 逐格水平/垂直对齐覆盖」——
+  // unit / body / note 三种角色都覆盖到，且至少一个格用非 listItem 的样式。
+  // 文本刻意保持干净（不下划线、不修订、不批注），免得撞上上面写死的计数。
+  ':::table',
+  '> {@h2,right|单位：元（另行核算）}',
+  '| {@center|项目} | {@center|金额} |',
+  '| {@h2,left|甲资产} | {@right,middle|1,234.00} |',
+  '| {@body,left,bottom|乙资产} | 5,678.90 |',
+  '< {@left,bottom|注：本表用于格内属性对账}',
+  ':::',
+  '',
   '{-该笔债务已经清偿}',
   '',
   '相关日期以{红|通知书}记载为准[[通知书原件|日期需与通知书原件核对]]。',
@@ -258,6 +273,17 @@ writeFileSync(outPath, buffer)
     if (tables.some((t) => t.rows.filter((r) => r.role === 'body').length < 2)) {
       problems.push('内置样本的表格 body 行少于 2 行 —— 多行 body 的形状没被验到')
     }
+    // 格内属性（换样式 / 两组对齐）也要真出现在样本里，否则下面那三组对账等于没验
+    const cellsOf = (t) => t.rows.flatMap((r) => r.cells)
+    if (!tables.some((t) => cellsOf(t).some((c) => c.kind !== undefined && c.kind !== 'listItem'))) {
+      problems.push('内置样本里没有换过样式的格 —— 格内样式对账等于没验')
+    }
+    if (!tables.some((t) => cellsOf(t).some((c) => c.align?.h !== undefined))) {
+      problems.push('内置样本里没有逐格水平对齐覆盖 —— 等于没验')
+    }
+    if (!tables.some((t) => cellsOf(t).some((c) => c.align?.v !== undefined))) {
+      problems.push('内置样本里没有逐格垂直对齐覆盖 —— 等于没验')
+    }
   }
   if (tables.length > 0) {
     // 版心宽（缇）：1in = 1440twips = 96px，即 px × 15
@@ -267,7 +293,6 @@ writeFileSync(outPath, buffer)
         lengthToPx(spec.page.margin.right)) *
         15,
     )
-    const rowHeightPerLine = Math.round(spec.styles.listItem.linePt * 20)
     const tblXmls = [...docXml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((m) => m[0])
     if (tblXmls.length !== tables.length) {
       problems.push(`表格数不符：document.xml 里 ${tblXmls.length} 张，模型里 ${tables.length} 张`)
@@ -276,12 +301,28 @@ writeFileSync(outPath, buffer)
       problems.push('出现了 w:tblW w:type="auto"（表格宽度没显式写死成 dxa）')
     }
 
+    /*
+     * 逐格期望值的口径与 docx/export.ts 同源：水平 = 覆盖 ?? 角色默认
+     * （unit 右 / note 左 / body 跟该格样式）；垂直 = 覆盖 ?? top；样式 = 该格 kind ?? listItem。
+     * 渲染后的格按 0..columns-1 走（缺格补空按 listItem）。
+     */
+    const styleIdOf = (cell) => spec.styles[cell.kind ?? 'listItem'].id
+    const linePtOf = (cell) => spec.styles[cell.kind ?? 'listItem'].linePt
+    const alignNameOf = (role, cell) =>
+      cell.align?.h ??
+      (role === 'unit' ? 'right' : role === 'note' ? 'left' : spec.styles[cell.kind ?? 'listItem'].align)
+    // OOXML 的 w:vAlign 没有 middle，垂直居中写作 center
+    const vertNameOf = (cell) => (cell.align?.v === 'middle' ? 'center' : (cell.align?.v ?? 'top'))
+    const renderedCells = (t, row) =>
+      row.role === 'body'
+        ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? { inlines: [] })
+        : [row.cells[0] ?? { inlines: [] }]
+
     tables.forEach((t, ti) => {
       const xml = tblXmls[ti] ?? ''
       const countIn = (re) => [...xml.matchAll(re)].length
       const rows = t.rows.length
       const mergedRows = t.rows.filter((r) => r.role !== 'body').length
-      const noteRows = t.rows.filter((r) => r.role === 'note').length
 
       const widthTag = `<w:tblW w:type="dxa" w:w="${contentTwips}"/>`
       if (countIn(new RegExp(widthTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) !== 1) {
@@ -297,24 +338,67 @@ writeFileSync(outPath, buffer)
       if (countIn(cantSplitTag) !== rows) {
         problems.push(`表${ti}的 w:cantSplit 与模型不符（${rows} 行，模型 cantSplit=${t.cantSplit}）`)
       }
-      const heightTag = new RegExp(
-        `<w:trHeight w:val="${rowHeightPerLine * t.minLines}" w:hRule="atLeast"/>`,
-        'g',
+
+      // 逐行行高 = minLines × 该行各格样式 linePt 的最大值（与导出侧同一条规则）
+      const wantHeights = t.rows.map((row) => {
+        const maxPt = Math.max(...renderedCells(t, row).map(linePtOf))
+        return Math.round(t.minLines * maxPt * 20)
+      })
+      const gotHeights = [...xml.matchAll(/<w:trHeight w:val="(\d+)" w:hRule="atLeast"\/>/g)].map(
+        (m) => Number(m[1]),
       )
-      if (countIn(heightTag) !== rows) {
+      if (JSON.stringify(gotHeights) !== JSON.stringify(wantHeights)) {
         problems.push(
-          `表${ti}的行高不是 ${rowHeightPerLine * t.minLines} 缇（minLines=${t.minLines}）× ${rows} 行`,
+          `表${ti}的逐行行高不符：期望 ${JSON.stringify(wantHeights)}，实际 ${JSON.stringify(gotHeights)}`,
         )
       }
+
       const spans = [...xml.matchAll(/<w:gridSpan w:val="(\d+)"\/>/g)].map((m) => Number(m[1]))
       if (spans.length !== mergedRows || spans.some((n) => n !== t.columns)) {
         problems.push(
           `表${ti}的整行合并不符：期望 ${mergedRows} 处 gridSpan=${t.columns}，实际 ${JSON.stringify(spans)}`,
         )
       }
-      if (countIn(/<w:vAlign w:val="top"\/>/g) !== noteRows) {
-        problems.push(`表${ti}的附注格顶端对齐不符（期望 ${noteRows} 处）`)
+
+      // 逐格 pStyle / w:jc / w:vAlign 的处数对账（整张表摊平计数；能读就断言，读不到就是缺元素）
+      const tally = (list) => {
+        const m = new Map()
+        for (const v of list) m.set(v, (m.get(v) ?? 0) + 1)
+        return m
       }
+      const cells = t.rows.flatMap((row) =>
+        renderedCells(t, row).map((cell) => ({ role: row.role, cell })),
+      )
+      const diffCounts = (label, want, got) => {
+        for (const key of new Set([...want.keys(), ...got.keys()])) {
+          if ((want.get(key) ?? 0) !== (got.get(key) ?? 0)) {
+            problems.push(
+              `表${ti}的${label} ${key} 处数不符：期望 ${want.get(key) ?? 0}，实际 ${got.get(key) ?? 0}`,
+            )
+          }
+        }
+      }
+      diffCounts(
+        '格内样式（w:pStyle）',
+        // kind === 'body' 的格不挂样式（正文就是 Word 的 Normal，styles.xml 里没有 WT-Body），
+        // 所以它们不产出 <w:pStyle>
+        tally(
+          cells
+            .filter(({ cell }) => (cell.kind ?? 'listItem') !== 'body')
+            .map(({ cell }) => styleIdOf(cell)),
+        ),
+        tally([...xml.matchAll(/<w:pStyle w:val="([^"]+)"\/>/g)].map((m) => m[1])),
+      )
+      diffCounts(
+        '水平对齐（w:jc）',
+        tally(cells.map(({ role, cell }) => alignNameOf(role, cell))),
+        tally([...xml.matchAll(/<w:jc w:val="([^"]+)"\/>/g)].map((m) => m[1])),
+      )
+      diffCounts(
+        '垂直对齐（w:vAlign）',
+        tally(cells.map(({ cell }) => vertNameOf(cell))),
+        tally([...xml.matchAll(/<w:vAlign w:val="([^"]+)"\/>/g)].map((m) => m[1])),
+      )
     })
   }
 
@@ -330,7 +414,9 @@ writeFileSync(outPath, buffer)
   console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
   console.log(`[ok] 软换行：${softBreakTags} 处 <w:br/>（模型里 ${modelSoftBreaks} 枚）`)
   if (tables.length > 0) {
-    console.log(`[ok] 表格：${tables.length} 张，总宽/固定布局/行高/禁断行/整行合并/顶端对齐均在字节层核对`)
+    console.log(
+      `[ok] 表格：${tables.length} 张，总宽/固定布局/禁断行/整行合并/逐行行高/逐格样式/逐格两组对齐均在字节层核对`,
+    )
   }
 }
 

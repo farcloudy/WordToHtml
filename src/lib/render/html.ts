@@ -9,8 +9,9 @@
  * 所以它们的形态是接口的一部分，改类名、去掉 data-* 或改标签名会同时打断编辑与量测。
  */
 
-import type { Inline, TableBlock, TableRowModel } from '../types'
-import { cellId, inlinesText } from '../types'
+import type { Align } from '../spec'
+import type { Inline, TableBlock, TableCellModel, TableRowModel } from '../types'
+import { cellId, defaultCellAlignH, inlinesText } from '../types'
 
 export function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -99,12 +100,13 @@ export function renderInlinesHtml(
  *     `fragmentOf` 向上取最近的 `data-block-id`，而 `retagFragments` / `syncPlain`
  *     用 `querySelectorAll('[data-block-id]')` 找片段；外层挂了就会被当成一个片段，
  *     整张表会被当成一段文字读回模型。外层改用 `data-table-id` + `data-row-from/to`。
- *   · 格内那层 div 复用 `wtp-listItem`（列表段落样式；W1 已把它的首行缩进改成 0，
- *     正是为了让格内文字不用再加缩进豁免），并挂
- *     `data-block-id = cellId(...)` + `data-from="0"` / `data-to="<格内文字长度>"`。
+ *   · 格内那层 div 挂 `wtp-cell wtp-<kind>` + `data-block-id = cellId(...)` +
+ *     `data-from="0"` / `data-to="<格内文字长度>"`。`wtp-cell` 是给验收脚本与 CSS 用的
+ *     稳定钩子，`wtp-<kind>` 才是那条样式（缺省 `listItem`，与 W4a 起的默认一致）。
  *     这样 `edit/dom.ts` 的坐标换算一行都不用改：格内光标自然落到这一层上。
- *   · `unit` / `note` 行天然整行一格（`colspan = columns`、无边框）。本项目的段落对齐
- *     是样式级的、没有逐段覆盖，所以这两行的对齐只能写在格内 div 的行内 style 上。
+ *   · `unit` / `note` 行天然整行一格（`colspan = columns`、无边框）。它们的角色默认对齐
+ *     （unit 右、note 左）写在格内 div 的行内 style 上；逐格覆盖也走同一条路。
+ *     垂直对齐只能写在 `<td>` 上（格内 div 上的 vertical-align 无效）。
  */
 export function renderTableFragment(block: TableBlock, rowFrom: number, rowTo: number): string {
   const columns = Math.max(1, block.columns)
@@ -120,19 +122,25 @@ export function renderTableFragment(block: TableBlock, rowFrom: number, rowTo: n
   return `<table class="wtp-table ${minClass}"><tbody>${rows.join('')}</tbody></table>`
 }
 
-/** 格内那一层 div：复用列表段落样式 + 格内坐标（`r` 是 rows 数组下标，与 cellId 同一套） */
+/** 对齐值 → CSS 的 text-align（规格表里的 both 在 CSS 里叫 justify） */
+function cssTextAlign(a: Align): string {
+  return a === 'both' ? 'justify' : a
+}
+
+/** 格内那一层 div：`r` 是 rows 数组下标，与 cellId 同一套 */
 function tableCellHtml(
   tableId: string,
   r: number,
   c: number,
-  inlines: readonly Inline[],
-  inlineStyle = '',
+  cell: TableCellModel,
+  divStyle = '',
 ): string {
-  const length = inlinesText(inlines).length
-  const style = inlineStyle === '' ? '' : ` style="${inlineStyle}"`
+  const length = inlinesText(cell.inlines).length
+  const kind = cell.kind ?? 'listItem'
+  const style = divStyle === '' ? '' : ` style="${divStyle}"`
   return (
-    `<div class="wtp-listItem" data-block-id="${cellId(tableId, r, c)}" ` +
-    `data-from="0" data-to="${length}"${style}>${renderInlinesHtml(inlines)}</div>`
+    `<div class="wtp-cell wtp-${kind}" data-block-id="${cellId(tableId, r, c)}" ` +
+    `data-from="0" data-to="${length}"${style}>${renderInlinesHtml(cell.inlines)}</div>`
   )
 }
 
@@ -146,7 +154,11 @@ function tableBodyRow(
   for (let c = 0; c < columns; c += 1) {
     // 缺格补空：Word 的表格必须是矩形；模型仍按 md 原样存（少一格的书写方式不该被解析改写）
     const cell = row.cells[c] ?? { inlines: [] }
-    cells.push(`<td>${tableCellHtml(block.id, r, c, cell.inlines)}</td>`)
+    // 水平默认值来自 `wtp-<kind>` 那条样式（body 格跟着自己的样式），只有覆盖才写行内；
+    // 垂直对齐的默认是 top（全局 CSS 已是 top），只有覆盖才写 <td> 的行内样式。
+    const divStyle = cell.align?.h ? `text-align: ${cssTextAlign(cell.align.h)}` : ''
+    const tdStyle = cell.align?.v ? ` style="vertical-align:${cell.align.v}"` : ''
+    cells.push(`<td${tdStyle}>${tableCellHtml(block.id, r, c, cell, divStyle)}</td>`)
   }
   return `<tr>${cells.join('')}</tr>`
 }
@@ -158,12 +170,13 @@ function tablePlainRow(
   columns: number,
 ): string {
   const cell = row.cells[0] ?? { inlines: [] }
-  const unit = row.role === 'unit'
-  // unit 右对齐、note 左对齐且顶端对齐（与 docx 导出侧一致；附注行的对齐靠 renderTableFragment 的行内 style）
-  const tdStyle = unit ? '' : ' style="vertical-align:top"'
-  const divStyle = unit ? 'text-align: right' : 'text-align: left'
+  // unit 右对齐、note 左对齐是角色默认（不是覆盖），所以这里也照写行内 ——
+  // 格内的 `wtp-listItem` 类把它默认成 justify，不写就丢了对齐。
+  const h = cell.align?.h ?? defaultCellAlignH(row.role, 'both')
+  const v = cell.align?.v ?? 'top'
+  const divStyle = `text-align: ${cssTextAlign(h)}`
   return (
-    `<tr class="wtp-tr-plain"><td class="wtp-td-plain" colspan="${columns}"${tdStyle}>` +
-    `${tableCellHtml(block.id, r, 0, cell.inlines, divStyle)}</td></tr>`
+    `<tr class="wtp-tr-plain"><td class="wtp-td-plain" colspan="${columns}" ` +
+    `style="vertical-align:${v}">${tableCellHtml(block.id, r, 0, cell, divStyle)}</td></tr>`
   )
 }

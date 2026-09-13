@@ -10,7 +10,7 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { Block, CommentDef, DocModel, Inline, TableBlock } from '../types'
+import type { Block, CommentDef, DocModel, Inline, TableBlock, TableCellModel } from '../types'
 
 const PREFIX: Record<BlockKind, string> = {
   title: '# ',
@@ -70,6 +70,20 @@ function serializeInlines(
 }
 
 /**
+ * 单元格内容 → md。格内样式与两组对齐写成格首指令 `{@<kind>,<h>,<v>|正文}`，
+ * **token 顺序固定 kind → h → v**、只写非默认值，这样「模型 → md → 模型 → md」字节稳定；
+ * 三个都没值时整条指令都不写（老样本因此一个字节不变）。
+ */
+function cellText(cell: TableCellModel, comments: Map<number, CommentDef>): string {
+  const inner = serializeInlines(cell.inlines, comments)
+  const tokens: string[] = []
+  if (cell.kind !== undefined && cell.kind !== 'listItem') tokens.push(cell.kind)
+  if (cell.align?.h) tokens.push(cell.align.h)
+  if (cell.align?.v) tokens.push(cell.align.v)
+  return tokens.length === 0 ? inner : `{@${tokens.join(',')}|${inner}}`
+}
+
+/**
  * 表格块 → md 围栏。kwarg 只写非默认值（minLines 默认 1、cantSplit 默认 true），
  * 顺序固定 minLines 在前、cantSplit 在后 —— 这样「模型 → md → 模型 → md」字节稳定。
  */
@@ -81,15 +95,11 @@ function tableLines(block: TableBlock, comments: Map<number, CommentDef>): strin
   const out = [fence]
   for (const row of block.rows) {
     if (row.role === 'body') {
-      out.push(
-        '| ' +
-          row.cells.map((cell) => serializeInlines(cell.inlines, comments)).join(' | ') +
-          ' |',
-      )
+      out.push('| ' + row.cells.map((cell) => cellText(cell, comments)).join(' | ') + ' |')
       continue
     }
     const first = row.cells[0]
-    const text = first ? serializeInlines(first.inlines, comments) : ''
+    const text = first ? cellText(first, comments) : ''
     out.push(row.role === 'unit' ? `> ${text}` : `< ${text}`)
   }
   out.push(':::')
@@ -134,7 +144,11 @@ export function normalizeBlocks(doc: DocModel): unknown[] {
         cantSplit: block.cantSplit,
         rows: block.rows.map((row) => ({
           role: row.role,
-          cells: row.cells.map((cell) => ({ inlines: cell.inlines })),
+          cells: row.cells.map((cell) => ({
+            inlines: cell.inlines,
+            ...(cell.kind !== undefined ? { kind: cell.kind } : {}),
+            ...(cell.align !== undefined ? { align: cell.align } : {}),
+          })),
         })),
       }
     }

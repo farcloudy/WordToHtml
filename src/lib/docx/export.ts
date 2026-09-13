@@ -52,13 +52,17 @@ import { STYLE_KEYS, lengthToPx, lineSpacePt, ptToHalfPoints, ptToTwips } from '
 import type { Align, LineRule, Spec, TextStyleSpec } from '../spec'
 import type {
   Block,
+  CellVerticalAlign,
   DocModel,
   Inline,
   PageBreakBlock,
   TableBlock,
   TableCellModel,
+  TableRowModel,
+  TableRowRole,
   TextBlock,
 } from '../types'
+import { defaultCellAlignH } from '../types'
 import { computeNumbering } from '../numbering'
 import { lineUnitPlan, patchStylesXml } from './lineUnits'
 
@@ -295,11 +299,46 @@ function cellParagraph(
   spec: Spec,
   alignment?: (typeof AlignmentType)[keyof typeof AlignmentType],
 ): Paragraph {
+  // 格内文字可以换成别的样式（TableCellModel.kind），缺省仍是「列表段落」。
+  // kind === 'body' 时**不挂样式**：正文就是 Word 的 Normal，styles.xml 里没有
+  // WT-Body 这条（paragraphStyles 刻意不定义它），挂了就是一条指向不存在样式的
+  // 悬空引用 —— 与 textBlockParagraph 对正文的处理保持一致。
+  const kind = cell.kind ?? 'listItem'
   return new Paragraph({
-    style: spec.styles.listItem.id,
+    ...(kind === 'body' ? {} : { style: spec.styles[kind].id }),
     ...(alignment ? { alignment } : {}),
     children: inlineChildren(cell.inlines),
   })
+}
+
+/** 垂直对齐三档 → docx 的枚举（缺省值一律 top，与预览侧同源） */
+const VERTICAL_ALIGN: Record<CellVerticalAlign, (typeof VerticalAlignTable)[keyof typeof VerticalAlignTable]> = {
+  top: VerticalAlignTable.TOP,
+  middle: VerticalAlignTable.CENTER,
+  bottom: VerticalAlignTable.BOTTOM,
+}
+
+/** 逐格的实际水平对齐：有覆盖用覆盖，否则 unit 右 / note 左 / body 跟该格样式 */
+function cellAlignH(role: TableRowRole, cell: TableCellModel, spec: Spec): Align {
+  return cell.align?.h ?? defaultCellAlignH(role, spec.styles[cell.kind ?? 'listItem'].align)
+}
+
+/**
+ * 一行的最小行高基准（磅）= 该行各格样式的最大 linePt。
+ *
+ * 必须按**渲染后的 0..columns-1** 走：缺格补空的那些格在 Word 里也是实打实的一格，
+ * 它们的样式是 listItem（预览侧也一样），不数进来两侧的最大值就会分家。
+ * unit / note 行整行一格，只看第 0 格。
+ */
+function rowLinePt(row: TableRowModel, columns: number, spec: Spec): number {
+  if (row.role !== 'body') {
+    return spec.styles[row.cells[0]?.kind ?? 'listItem'].linePt
+  }
+  let max = 0
+  for (let c = 0; c < columns; c += 1) {
+    max = Math.max(max, spec.styles[row.cells[c]?.kind ?? 'listItem'].linePt)
+  }
+  return max
 }
 
 /**
@@ -313,9 +352,10 @@ function cellParagraph(
  */
 function tableBlock(block: TableBlock, spec: Spec): Table {
   const total = contentWidthTwips(spec)
-  const rowHeight = ptToTwips(block.minLines * spec.styles.listItem.linePt)
 
   const rows = block.rows.map((row) => {
+    // 行高按该行各格样式的最大 linePt（缺格按 listItem），与预览侧同一条规则
+    const rowHeight = ptToTwips(block.minLines * rowLinePt(row, block.columns, spec))
     let cells: TableCell[]
     if (row.role === 'body') {
       cells = []
@@ -323,7 +363,13 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
         // 缺格补空：Word 的表格必须是矩形，补齐只发生在导出这一侧，
         // 模型仍按 md 原样存（少一格的书写方式不该被解析改写）。
         const cell = row.cells[c] ?? { inlines: [] }
-        cells.push(new TableCell({ borders: BODY_BORDERS, children: [cellParagraph(cell, spec)] }))
+        cells.push(
+          new TableCell({
+            borders: BODY_BORDERS,
+            verticalAlign: VERTICAL_ALIGN[cell.align?.v ?? 'top'],
+            children: [cellParagraph(cell, spec, alignmentOf(cellAlignH('body', cell, spec)))],
+          }),
+        )
       }
     } else {
       // unit / note 天然整行一格 → 展开成 columnSpan = columns
@@ -332,14 +378,8 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
         new TableCell({
           columnSpan: block.columns,
           borders: NO_BORDERS,
-          ...(row.role === 'note' ? { verticalAlign: VerticalAlignTable.TOP } : {}),
-          children: [
-            cellParagraph(
-              cell,
-              spec,
-              row.role === 'unit' ? AlignmentType.RIGHT : AlignmentType.LEFT,
-            ),
-          ],
+          verticalAlign: VERTICAL_ALIGN[cell.align?.v ?? 'top'],
+          children: [cellParagraph(cell, spec, alignmentOf(cellAlignH(row.role, cell, spec)))],
         }),
       ]
     }
