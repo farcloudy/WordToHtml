@@ -14,6 +14,7 @@
 
 import {
   AlignmentType,
+  BorderStyle,
   CommentRangeEnd,
   CommentRangeStart,
   CommentReference,
@@ -21,16 +22,25 @@ import {
   Document,
   DocumentGridType,
   Footer,
+  HeightRule,
   InsertedTextRun,
   LineRuleType,
   PageBreak,
   PageNumber,
   Packer,
   Paragraph,
+  Table,
+  TableCell,
+  TableLayoutType,
+  TableRow,
   TextRun,
   UnderlineType,
+  VerticalAlignTable,
+  WidthType,
 } from 'docx'
 import type {
+  FileChild,
+  IBorderOptions,
   ICommentOptions,
   IParagraphStyleOptions,
   ISectionOptions,
@@ -38,9 +48,17 @@ import type {
 } from 'docx'
 import JSZip from 'jszip'
 
-import { STYLE_KEYS, lineSpacePt, ptToHalfPoints, ptToTwips } from '../spec'
+import { STYLE_KEYS, lengthToPx, lineSpacePt, ptToHalfPoints, ptToTwips } from '../spec'
 import type { Align, LineRule, Spec, TextStyleSpec } from '../spec'
-import type { Block, DocModel, PageBreakBlock, TextBlock } from '../types'
+import type {
+  Block,
+  DocModel,
+  Inline,
+  PageBreakBlock,
+  TableBlock,
+  TableCellModel,
+  TextBlock,
+} from '../types'
 import { computeNumbering } from '../numbering'
 import { lineUnitPlan, patchStylesXml } from './lineUnits'
 
@@ -151,21 +169,18 @@ function pageNumberParagraph(spec: Spec): Paragraph {
   })
 }
 
-function textBlockParagraph(
-  block: TextBlock,
-  spec: Spec,
-  numbering: Map<string, string>,
-  pageBreakBefore = false,
-): Paragraph {
+/**
+ * 行内模型 → docx 子元素。普通段落与单元格共用这一个（不要各抄一份）：
+ * 批注锚点、加粗、下划线、颜色、修订在表格内外必须是同一套语义。
+ */
+function inlineChildren(inlines: readonly Inline[], prefix = ''): ParagraphChild[] {
   const children: ParagraphChild[] = []
-
-  const prefix = numbering.get(block.id)
   if (prefix) {
     // 编号按需求写成正文文字，与预览完全一致
     children.push(new TextRun({ text: prefix }))
   }
 
-  for (const inline of block.inlines) {
+  for (const inline of inlines) {
     if (inline.t === 'commentStart') {
       children.push(new CommentRangeStart(inline.commentId))
       continue
@@ -200,6 +215,16 @@ function textBlockParagraph(
       children.push(new TextRun(base))
     }
   }
+  return children
+}
+
+function textBlockParagraph(
+  block: TextBlock,
+  spec: Spec,
+  numbering: Map<string, string>,
+  pageBreakBefore = false,
+): Paragraph {
+  const children = inlineChildren(block.inlines, numbering.get(block.id) ?? '')
 
   // 正文不挂样式：它就是 Word 的 Normal（内置「正文」），
   // 格式定义在 buildDocument 的 styles.default.document 上。
@@ -211,10 +236,137 @@ function textBlockParagraph(
   })
 }
 
+/* -------------------------------------------------------------------------- */
+/* 表格                                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 单元格左右内边距：Word 默认的 108 缇（0.19cm / 5.4pt），上下 0。
+ * 预览侧（W4a-2）必须取同一个值，否则格内文字会相对 Word 偏移；
+ * 这里显式写出、不吃库的默认值，就是为了让两侧有唯一一个数可对。
+ */
+const CELL_MARGIN_TWIPS = 108
+
+/** 正文格的框：单线 0.5pt（w:sz=4） */
+const BODY_BORDER: IBorderOptions = { style: BorderStyle.SINGLE, size: 4, color: 'auto' }
+/** 整行合并的 unit / note 行：四边无框 */
+const NO_BORDER: IBorderOptions = { style: BorderStyle.NONE, size: 0, color: 'auto' }
+const NO_BORDERS = {
+  top: NO_BORDER,
+  left: NO_BORDER,
+  bottom: NO_BORDER,
+  right: NO_BORDER,
+}
+const BODY_BORDERS = {
+  top: BODY_BORDER,
+  left: BODY_BORDER,
+  bottom: BODY_BORDER,
+  right: BODY_BORDER,
+}
+
+/**
+ * 表格总宽（twips）= 版心宽 = 页面宽 − 左右页边距。
+ * 1in = 1440twips = 96px，所以 px * 15（四舍五入）就是缇；换算只在这里做一次。
+ */
+function contentWidthTwips(spec: Spec): number {
+  const px =
+    lengthToPx(spec.page.size.width) -
+    lengthToPx(spec.page.margin.left) -
+    lengthToPx(spec.page.margin.right)
+  return Math.round(px * 15)
+}
+
+/** 等分列宽；除不尽的余数给最后一列，保证总和恰好等于版心宽 */
+function columnWidthsTwips(total: number, columns: number): number[] {
+  const base = Math.floor(total / columns)
+  const widths = new Array<number>(columns).fill(base)
+  widths[columns - 1] = (widths[columns - 1] ?? 0) + (total - base * columns)
+  return widths
+}
+
+function cellParagraph(
+  cell: TableCellModel,
+  spec: Spec,
+  alignment?: (typeof AlignmentType)[keyof typeof AlignmentType],
+): Paragraph {
+  return new Paragraph({
+    style: spec.styles.listItem.id,
+    ...(alignment ? { alignment } : {}),
+    children: inlineChildren(cell.inlines),
+  })
+}
+
+/**
+ * 表格块 → docx 表格。
+ *
+ * 边框刻意分两层：**表格级不画框，正文格各自画四边**。
+ * 反过来的写法（表格级画框、unit/note 格覆盖成 none）在 Word 里压不住共享边 ——
+ * 一条边归相邻两格共有，只有一侧写 none、另一侧缺省时 Word 仍会把框画出来
+ *（2026-09-13 用 Word COM 实测）。表格级不画就不存在这种「一侧压不住」的边，
+ * unit/note 行的四边（含与正文行相邻的那边）自然全无框。
+ */
+function tableBlock(block: TableBlock, spec: Spec): Table {
+  const total = contentWidthTwips(spec)
+  const rowHeight = ptToTwips(block.minLines * spec.styles.listItem.linePt)
+
+  const rows = block.rows.map((row) => {
+    let cells: TableCell[]
+    if (row.role === 'body') {
+      cells = []
+      for (let c = 0; c < block.columns; c += 1) {
+        // 缺格补空：Word 的表格必须是矩形，补齐只发生在导出这一侧，
+        // 模型仍按 md 原样存（少一格的书写方式不该被解析改写）。
+        const cell = row.cells[c] ?? { inlines: [] }
+        cells.push(new TableCell({ borders: BODY_BORDERS, children: [cellParagraph(cell, spec)] }))
+      }
+    } else {
+      // unit / note 天然整行一格 → 展开成 columnSpan = columns
+      const cell = row.cells[0] ?? { inlines: [] }
+      cells = [
+        new TableCell({
+          columnSpan: block.columns,
+          borders: NO_BORDERS,
+          ...(row.role === 'note' ? { verticalAlign: VerticalAlignTable.TOP } : {}),
+          children: [
+            cellParagraph(
+              cell,
+              spec,
+              row.role === 'unit' ? AlignmentType.RIGHT : AlignmentType.LEFT,
+            ),
+          ],
+        }),
+      ]
+    }
+
+    return new TableRow({
+      cantSplit: block.cantSplit,
+      height: { value: rowHeight, rule: HeightRule.ATLEAST },
+      children: cells,
+    })
+  })
+
+  return new Table({
+    rows,
+    // width.type 必须显式写 DXA：库的默认是 AUTO，不写就落到 w:tblW w:type="auto"
+    width: { size: total, type: WidthType.DXA },
+    columnWidths: columnWidthsTwips(total, block.columns),
+    layout: TableLayoutType.FIXED,
+    margins: { top: 0, bottom: 0, left: CELL_MARGIN_TWIPS, right: CELL_MARGIN_TWIPS },
+    borders: {
+      top: NO_BORDER,
+      left: NO_BORDER,
+      bottom: NO_BORDER,
+      right: NO_BORDER,
+      insideHorizontal: NO_BORDER,
+      insideVertical: NO_BORDER,
+    },
+  })
+}
+
 interface SectionGroup {
   restartNumbering: boolean
   /** 本节里的块，含分页符（分节符本身不进组，它只负责切组） */
-  blocks: (TextBlock | PageBreakBlock)[]
+  blocks: (TextBlock | PageBreakBlock | TableBlock)[]
 }
 
 /** 按分节符把内容切成若干节。分节符在 Word 里意味着新起一页 + 独立的页码序列。 */
@@ -231,7 +383,7 @@ function groupSections(doc: DocModel): SectionGroup[] {
 }
 
 /**
- * 把一节里的块变成段落。
+ * 把一节里的块变成段落 / 表格。
  *
  * 分页符优先写成「段前分页」挂在它后面那一段上（`w:pageBreakBefore`）——
  * 这样不会像插一个空段落那样在页顶多留一个空行。
@@ -239,17 +391,27 @@ function groupSections(doc: DocModel): SectionGroup[] {
  * 后面没有段落可挂时（紧跟分节符，或者干脆在节末/文末）必须退回到独立段落里
  * 写一个 `w:br w:type="page"`：**换页这件事不能丢**。否则「分页符 + 分节符」
  * 连在一起时，只剩分节符的换页生效，看上去就是「只分了一次页」。
+ *
+ * `Table` 上没有 `pageBreakBefore` 这种字段，所以分页符后面紧跟表格时也只能
+ * 走上面那条退路，否则换页会被静默丢掉。
  */
 function sectionParagraphs(
   group: SectionGroup,
   spec: Spec,
   numbering: Map<string, string>,
-): Paragraph[] {
-  const children: Paragraph[] = []
+): FileChild[] {
+  const children: FileChild[] = []
   let breakBefore = false
   for (const block of group.blocks) {
     if (block.t === 'pageBreak') {
       breakBefore = true
+      continue
+    }
+    if (block.t === 'table') {
+      // Table 上没有 pageBreakBefore，分页符只能退回到独立段落里写 <w:br type="page">
+      if (breakBefore) children.push(new Paragraph({ children: [new PageBreak()] }))
+      breakBefore = false
+      children.push(tableBlock(block, spec))
       continue
     }
     children.push(textBlockParagraph(block, spec, numbering, breakBefore))
@@ -268,7 +430,7 @@ export function buildDocument(
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
   const sections: ISectionOptions[] = groupSections(doc).map((group) => {
-    const children: Paragraph[] = sectionParagraphs(group, spec, numbering)
+    const children = sectionParagraphs(group, spec, numbering)
     if (children.length === 0) children.push(new Paragraph({}))
 
     return {

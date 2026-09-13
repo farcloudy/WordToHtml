@@ -42,10 +42,12 @@ export type {
 } from './spec'
 
 export {
+  cellId,
   collectRevisions,
   commentScopes,
   emptyDoc,
   nextBlockId,
+  parseCellId,
   plainText,
   sliceInlines,
 } from './types'
@@ -59,6 +61,10 @@ export type {
   PageBreakBlock,
   RevMark,
   SectionBreakBlock,
+  TableBlock,
+  TableCellModel,
+  TableRowModel,
+  TableRowRole,
   TextBlock,
   TextInline,
 } from './types'

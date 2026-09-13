@@ -20,6 +20,7 @@ import {
   applyFormat,
   blockLength,
   buildOutline,
+  cellId,
   cloneDoc,
   commentScopes,
   deleteRange,
@@ -31,6 +32,7 @@ import {
   mergeIntoPrevious,
   normalizeBlocks,
   outlineSignature,
+  parseCellId,
   parseMd,
   plainText,
   rangeColor,
@@ -725,5 +727,151 @@ console.log('\n=== 16. buildOutline / outlineSignature ===')
   )
 }
 
+console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
+{
+  const cellText = (cell) =>
+    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+
+  const src = [
+    ':::table minLines=2',
+    '> 单位：元',
+    '| **项目** | **金额** |',
+    '| 甲 | 1,234.00 |',
+    '| 备注\\|说明 | 含\\\\反斜杠 |',
+    '< 注：以上金额不含税',
+    ':::',
+  ].join('\n')
+
+  const model = parseMd(src)
+  const table = model.blocks[0]
+  eq('表格只产出一个块', model.blocks.length, 1)
+  eq('块类型', table.t, 'table')
+  eq('行数', table.rows.length, 5)
+  eq('角色顺序', table.rows.map((r) => r.role).join(','), 'unit,body,body,body,note')
+  eq('列数 = body 行最大格数', table.columns, 2)
+  eq('minLines 从围栏读出', table.minLines, 2)
+  eq('cantSplit 默认 true', table.cantSplit, true)
+  eq('unit 行整行一格', table.rows[0].cells.length, 1)
+  eq('note 行整行一格', table.rows[4].cells.length, 1)
+  eq('unit 行文字', cellText(table.rows[0].cells[0]), '单位：元')
+  eq('note 行文字', cellText(table.rows[4].cells[0]), '注：以上金额不含税')
+  eq('列标题加粗', table.rows[1].cells[0].inlines[0].bold, true)
+  eq('格里的竖线没被当分隔符', cellText(table.rows[3].cells[0]), '备注|说明')
+  eq('格里的反斜杠原样还原', cellText(table.rows[3].cells[1]), '含\\反斜杠')
+
+  const md2 = toMd(model)
+  eq('kwarg 只写非默认值', md2.split('\n')[0], ':::table minLines=2')
+  eq('序列化字节稳定（两次往返一致）', toMd(parseMd(md2)), md2)
+  eq(
+    '往返结构一致',
+    JSON.stringify(normalizeBlocks(parseMd(md2))),
+    JSON.stringify(normalizeBlocks(model)),
+  )
+
+  eq('默认 kwarg 不写出来', toMd(parseMd(':::table\n| a |\n:::')), ':::table\n| a |\n:::')
+  const noSplit = parseMd(':::table cantSplit=no\n| a |\n:::')
+  eq('cantSplit=no 读出来', noSplit.blocks[0].cantSplit, false)
+  eq('cantSplit=no 写回去', toMd(noSplit).split('\n')[0], ':::table cantSplit=no')
+
+  const empty = parseMd(':::table\n:::').blocks[0]
+  eq('空表规范化成 1 行', empty.rows.length, 1)
+  eq('空表规范化成 1 格', empty.rows[0].cells.length, 1)
+  eq('空表规范化成 1 列', empty.columns, 1)
+
+  eq('cellId', cellId('tb1', 2, 3), 'tb1.r2c3')
+  eq(
+    'parseCellId 往返',
+    JSON.stringify(parseCellId('tb1.r2c3')),
+    JSON.stringify({ tableId: 'tb1', row: 2, col: 3 }),
+  )
+  eq('parseCellId 拒绝非单元格 id', parseCellId('b1'), null)
+
+  // cloneDoc 必须逐层新建：撤销栈与渲染快照都靠它，共享引用会被后续编辑改到
+  const copy = cloneDoc(model)
+  copy.blocks[0].rows[1].cells[0].inlines[0].text = '改过了'
+  copy.blocks[0].rows.push({ role: 'body', cells: [{ inlines: [] }] })
+  eq('副本的行数变了', copy.blocks[0].rows.length, 6)
+  eq('原件行数没变', model.blocks[0].rows.length, 5)
+  eq('原件格文字没变', cellText(model.blocks[0].rows[1].cells[0]), '项目')
+  eq('不共享 rows 数组', copy.blocks[0].rows === model.blocks[0].rows, false)
+  eq('不共享 cells 数组', copy.blocks[0].rows[1].cells === model.blocks[0].rows[1].cells, false)
+  eq(
+    '不共享 inlines 数组',
+    copy.blocks[0].rows[1].cells[0].inlines === model.blocks[0].rows[1].cells[0].inlines,
+    false,
+  )
+}
+
+console.log('\n=== 17b. 表格：格内行内语法 / 首尾空格 / 未闭合围栏 ===')
+{
+  // 这些用例是独立验收方补的：初版 splitTableCells 只看反斜杠，不跳 {} 与 [[]]，
+  // 于是格内 {红|甲}、[[甲|核对原件]] 里的竖线被当成列分隔符 —— 一格拆多格、颜色与批注静默丢失。
+  const cellText = (cell) =>
+    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+  const asDoc = (block) => ({ blocks: [block], comments: [] })
+  const sameShape = (a, b) =>
+    JSON.stringify(normalizeBlocks(a)) === JSON.stringify(normalizeBlocks(b))
+
+  const colored = parseMd(':::table\n| {红|甲} | b |\n:::')
+  eq('彩色格只算一格', colored.blocks[0].rows[0].cells.length, 2)
+  eq('彩色格列数', colored.blocks[0].columns, 2)
+  eq('彩色格文字', cellText(colored.blocks[0].rows[0].cells[0]), '甲')
+  eq('彩色格颜色读出来', colored.blocks[0].rows[0].cells[0].inlines[0].color, 'FF0000')
+  eq('彩色格往返一致', sameShape(parseMd(toMd(colored)), colored), true)
+
+  const hex = parseMd(':::table\n| {#00FF00|乙} | c |\n:::')
+  eq('十六进制色号格也只算一格', hex.blocks[0].rows[0].cells.length, 2)
+  eq('十六进制色号读出来', hex.blocks[0].rows[0].cells[0].inlines[0].color, '00FF00')
+
+  const commented = parseMd(':::table\n| [[甲|核对原件]] | d |\n:::')
+  eq('批注格只算一格', commented.blocks[0].rows[0].cells.length, 2)
+  eq('批注条数', commented.comments.length, 1)
+  eq('批注锚定文字', cellText(commented.blocks[0].rows[0].cells[0]), '甲')
+  eq('批注往返一致', sameShape(parseMd(toMd(commented)), commented), true)
+
+  // 行内格数不齐：模型按 md 原样存，列数取 body 行的最大格数
+  const ragged = parseMd(':::table\n| a | b | c |\n| d |\n:::').blocks[0]
+  eq('ragged 行数', ragged.rows.length, 2)
+  eq('ragged 第二行只留 1 格', ragged.rows[1].cells.length, 1)
+  eq('ragged 列数 = 最大格数', ragged.columns, 3)
+  eq('ragged 往返一致', sameShape(parseMd(toMd(asDoc(ragged))), asDoc(ragged)), true)
+
+  // unit / note 行的首尾空格属于内容：不能像 body 行那样 trimEnd
+  const spaced = parseMd(':::table\n>  甲 \n<  乙 \n| a |\n:::').blocks[0]
+  eq('unit 行首尾空格保留', cellText(spaced.rows[0].cells[0]), ' 甲 ')
+  eq('note 行首尾空格保留', cellText(spaced.rows[1].cells[0]), ' 乙 ')
+  eq('空格行写回去形态一致', toMd(asDoc(spaced)).split('\n')[1], '>  甲 ')
+  eq('空格往返一致', sameShape(parseMd(toMd(asDoc(spaced))), asDoc(spaced)), true)
+
+  // 未闭合围栏：退回按普通行解，绝不把后文整篇吞掉
+  const unterminated = parseMd(':::table minLines=2\n| a | b |\n\n普通一段')
+  eq('未闭合围栏不吞后文', unterminated.blocks.length, 3)
+  eq(
+    '未闭合围栏不当表格',
+    unterminated.blocks.every((b) => b.t === 'textBlock'),
+    true,
+  )
+  eq('未闭合围栏的后文还在', cellText(unterminated.blocks[2]), '普通一段')
+}
+
+console.log('\n=== 17c. md 往返：批注内容里的 \\ 与 | 必须还原（不是越滚越多）===')
+{
+  // 批注内容是原样存模型、原样进 docx 的，不逐字符走 inline 解析；序列化时它会被 escapeText
+  // 逃逸，解析时必须还原回来 —— 否则 `\|`、`\\` 每往返一次就多一层反斜杠（不收敛）。
+  const src = '相关日期以{红|通知书}为准[[通知书原件|含\\|竖线与\\\\反斜杠]]。'
+  const once = parseMd(src)
+  eq('批注内容原样还原', once.comments[0].text, '含|竖线与\\反斜杠')
+  const md1 = toMd(once)
+  eq('写回去是逃逸形态', md1.includes('[[通知书原件|含\\|竖线与\\\\反斜杠]]'), true)
+  eq('批注内容往返一次仍不变', parseMd(md1).comments[0].text, '含|竖线与\\反斜杠')
+  eq('再往返一次字节仍稳定', toMd(parseMd(md1)), md1)
+  const anchorText = once.blocks[0].inlines
+    .filter((i) => i.t === 'text')
+    .map((i) => i.text)
+    .join('')
+  eq('整段文字（含被锚定的那段）往返不变', anchorText, '相关日期以通知书为准通知书原件。')
+}
+
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
 process.exit(failed === 0 ? 0 : 1)
+

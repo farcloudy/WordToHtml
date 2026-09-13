@@ -388,6 +388,8 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 
 ### 6.6 W4a / W4b 拆分
 
+> **2026-09-13 更新：W4a 又拆成 W4a-1（已完成并提交）/ W4a-2（待做）—— 结论与新的验收形态见 6.7；下面这段保留原始拆分理由。**
+
 - **W4a（先做）**：模型 + 渲染 + 量测 + 分页 + docx 导出 + md 语法。
   目标：**表格排得出来、导得出去、Word 对账通过**。此阶段可编辑性最小化。
   验收：`scripts/verify-docx.mjs` 加含表格的样本；`check-docx.ps1` 用 Word COM 读回表格结构
@@ -399,6 +401,34 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 
 **理由**：表格最大的风险在「导出的 docx 与预览版式对不上」，这部分能独立验收；交互是纯前端增量，
 放第二步不会拖累第一步的验收。
+
+---
+
+### 6.7 W4a-1 结论（2026-09-13，已提交）
+
+**W4a 又拆成两小步**：**W4a-1 = 表格的模型 + md 围栏语法 + docx 导出 + Word 读回对账**（不碰预览/编辑/demo）；
+**W4a-2 = 预览渲染 + 量测 + 分页 + 编辑读回收口 + demo 样本放表 + 工具栏「插入表格」按钮 + 软换行**
+（`Inline` 的 `br` 标记、md 的 `\n` 写法、`<w:br/>` 归 W4a-2 —— 它的编译波及面全在编辑侧）。
+用户同日拍板：W4a 就带「插入表格」按钮，且**格内可以直接打字**（靠 `edit/model.ts` 的 `findBlock` → `findContainer`）。
+
+**实际改动 11 个文件**：`types.ts`（`TableBlock`/`TableRowRole`/`cellId`/`parseCellId`）、
+`edit/model.ts`（**只有** `cloneDoc` 一处深拷贝）、`md/parse.ts` + `md/serialize.ts`（`:::table` 围栏与往返）、
+`docx/export.ts`（表格映射）、`index.ts`（导出）、`scripts/{verify-docx,assert-docx,check-docx.ps1,test-edit-model}.mjs`、`README.md`。
+
+**验收走了两轮**：第一轮独立验收判**不可接受** —— `splitTableCells` 只看反斜杠、不跳 `{}` / `[[]]`，
+格内 `{红|甲}`、`[[甲|核对原件]]` 的竖线被当成列分隔符（一格拆多格、颜色与批注静默丢失）；另有未闭合围栏吞掉后文、
+unit/note 行尾空格丢失。修完后聚焦复核判**可接受**，且复核方用**变异测试**证明新用例真能抓到这个缺陷
+（把切格算法回退成旧版 → 9 项变红）。顺带修了一处**与表格无关的既有缺陷**：`[[锚|内容]]` 的**批注内容**里含 `|` 或 `\` 时，
+序列化会逃逸、解析却不还原，每往返一次就多一层反斜杠（不收敛）。
+最终：`type-check` 0 错、`test-edit-model` 239/239、`test-paginate` 67/67、`verify:docx` 全绿、
+`verify:p1` 的 Word 逐项对账 `[PASS]`（含新增的表格节：行数 / 格数 / 整行合并 / 行高规则 / 边框 / 对齐 / 总宽）。
+
+**W4a-2 的验收形态必须改（2026-09-13 决定）**：本机 Edge 的程序化启动坏了（见 9.7），用户要求
+**不跑 playwright、只做代码级验证** —— 所以「预览页数 = Word 页数」这类机器对账做不了。
+机器只验能得到确定答案的部分（分页器单测、md 往返、docx 字节层），版式一致性改成**人工核对**
+（开 dev server 看页面 + Word 打开导出的 docx 对比页数与表格外观）。
+
+**列标题行居中仍做不到**（见 8.2），本轮样本的列标题行只套了 `**加粗**`。
 
 ---
 
@@ -486,6 +516,13 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    复现探针（只读、**临时件未提交**、产物在 `.qwen/tmp/`）：`probe-pagination.mjs`（逐步快照）、
    `probe-pagination2.mjs`（`beforeinput`/`input`/mutation 事件时序）、`probe-pagination3.mjs`（dump 片段
    DOM 文字，给出 919/918 的铁证）。更完整的机制说明见项目记忆 `pagination-boundary-duplication.md`。
+7. **W4a-1 验收发现的三处非阻断项**（记在这里免得只躺在验收结论里）：
+   ① **`columns` 只能由 body 行回推**：手搓模型里 `columns` 大于所有 body 行的格数时，md 往返会把它收窄
+   （md 语法没有表达「总列数」的地方）。真实路径（手写 md、将来的 UI）不受影响；真要修就给围栏加个 `columns=` kwarg。
+   ② **表格里的批注锚点**在模型 / md / docx 三层都已支持，但**样本与 Word 对账没覆盖**（为避开 `assert-docx`
+   里「批注 1 条」那条既有断言）。需要时再补一条样本。
+   ③ 半截 `[[`（未闭合的批注括号）会把其后的 `| b |` 一起吞进同一格 —— 内容不丢、往返稳定，
+   只是格数比旧算法少一个，记录备查。
 
 ---
 
@@ -495,7 +532,14 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    `C:\Users\18082\.qwen\debug\<session-id>.txt` 里有 `[STARTUP] [UNCAUGHT_EXCEPTION] React error #185`，
    栈全在 React 的提交/状态更新路径（`getRootForUpdatedFiber` → `dispatchSetState` → `commitRoot`），
    即终端 UI 层崩，**与内存无关**（32 GB 机器还剩 12 GB 时照样崩）。
-   2026-09-13 一天之内崩了三次，每次都紧贴「代理回报一份极长报告」或「长输出灌进 TUI」，所以**触发路径是大块输出渲进 TUI**。
+   2026-09-13 一天之内崩了三次，每次都紧贴「代理回报一份极长报告」或「长输出灌进 TUI」。
+   ⚠️ **当天傍晚又崩两次（W4a 会话），触发了对上面这句的订正**：那两次都落在**后台任务落地那一刻**，
+   而当时子进程的 stdout 早已 `> .qwen/tmp/*.log 2>&1` 全量重定向（有一次主 session 手上一块大文本都没有），
+   所以触发面比「大块输出」更宽 —— **「后台任务完成 → 自动续跑/刷新界面」这条状态更新路径本身也不稳**。
+   由此多两条硬纪律：① 主 session 读取一律**有界**（只 `git status --short` / `git diff --stat` / 定向小段 /
+   用 node 过滤后打印 ≤25 行；完整 diff、长日志、结论的长证据段只看文件路径），子进程报告**不整段转述**，
+   **主 session 自己的回复也必须短**（它不受任何截断保护）；② 想彻底绕开那条路径，可让子进程用 `start /b`
+   完全脱离（不注册成 harness 的后台任务）再由主 session 轮询结果文件，代价是失败只能靠轮询发现。
    完整的排查与可用的规避开关（`ui.shellOutputMaxLines`、`tools.truncateToolOutput*`、别按 `Ctrl+O` 等）
    记在 `C:\Users\18082\.qwen\qwen-tui-large-output-crash.md`（用户 2026-09-13 选择暂不改设置）。
    对策：让命令输出重定向到文件、代理报告限长（见第 0 节）；**长任务做完后另开新 session**，
@@ -514,6 +558,12 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 6. **`docx` 库打包后再改 `styles.xml` 时必须 `createFolders: false`**（见 `lib/docx/lineUnits.ts`），
    否则会多出目录条目，Word 打开这种 docx 会**卡死在 `Documents.Open` 不返回**。
    （历史教训：`w:beforeLines` / `w:afterLines` 只能靠这种方式补写，库不暴露这对属性。）
+7. **本机 Edge 的程序化启动从 2026-09-13 13:42 起坏了**（`msedge.exe --version` 零输出；用新建目录做
+   `--headless=new --dump-dom about:blank` 也零输出；playwright 无头/有头一律报 `browser has been closed`；
+   **窗口模式正常**，所以「Edge 能开」不等于能跑验收）。此时 `verify:p2` / `verify:p3` 的浏览器半场
+   与 `verify:pages`（依赖 verify-browser 产出的预览页数）**都跑不了**；**用户要求不跑 playwright、只做代码级验证**。
+   复检一条命令：`msedge.exe --version` 应打印版本号。详见项目记忆 `project/edge-headless-broken.md`。
+   ⚠️ 与第 3 条一起看：第 3 条里「`verify:p2/p3` 会真的用系统 Edge 起无头浏览器」这句，现在跑不动。
 
 ---
 
@@ -524,8 +574,9 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 | W1 | 快捷键组（ctrl+U / ctrl+shift+E / alt+4 / ctrl+P）+ 三种特殊空格；顺带把「列表段落」首行缩进改成 0 | **已完成**（2026-09-13，提交 `4ca96c8`；独立验收结论「可接受」，两处次要项见第 8 节第 4 条） |
 | W2 | 样式与页边距绑定（两套模板）+ 双页并排 | **已完成**（2026-09-13，提交 `734dc48`；独立验收结论「可接受」，次要项见第 8 节第 5 条） |
 | W3 | 查找替换 + 导航窗格 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——替换后插入符锚点缺失，修完聚焦复核「可接受」，结论见第 5.3 节） |
-| W4a | 表格：模型 + 渲染 + 量测 + 分页 + 导出 + md 语法 | 模型设计已过用户闸门（第 6 节），未开工 |
-| W4b | 表格：编辑交互 | 同上，未开工 |
+| W4a-1 | 表格：模型 + md 围栏语法 + docx 导出 + Word 读回对账 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——格内 `{红|…}` / `[[]]` 里的竖线被当列分隔符，修完聚焦复核「可接受」且做了变异测试；结论见第 6.7 节） |
+| W4a-2 | 表格：预览渲染 + 量测 + 分页 + 编辑读回收口 + demo 样本放表 + 「插入表格」按钮 + 软换行 | 未开工；**验收形态要改**（本机 Edge 的程序化启动坏了、不跑 playwright，版式一致性改人工核对，见 6.7 与 9.7） |
+| W4b | 表格：编辑交互（Tab / 方向键跨格、增删行列、unit/note 行开关、行高两档、格内 Shift+Enter） | 未开工 |
 | W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |
 
 **收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。

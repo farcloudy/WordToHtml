@@ -20,6 +20,7 @@ import JSZip from 'jszip'
 
 import {
   DOC_TEMPLATES,
+  lengthToPx,
   normalizeBlocks,
   parseMd,
   resolveSpec,
@@ -61,6 +62,22 @@ const SAMPLE = [
   '- 位于吴中区的办公用房一处',
   '',
   '! 上述资产均已办理抵押登记',
+  '',
+  // 表格：覆盖全部形状 —— unit 行（右对齐、整行合并、无框）、加粗的列标题行、
+  // 若干数据行、note 行（左对齐 + 顶端对齐、整行合并、无框），以及带 `|` 与 `\`
+  // 的格（验转义往返）。表格里刻意不放修订与批注：assert-docx 的「修订 2 条 /
+  // 批注 1 条」是写死的，没必要为了表格去扩大战线。
+  ':::table minLines=2',
+  '> 单位：元',
+  '| **项目** | **金额** |',
+  '| 甲资产 | 1,234.00 |',
+  '| 乙资产 | 5,678.90 |',
+  // 格内 `{红|…}` 的那枚竖线是内容、不是列分隔符：切格必须跳 `{}` 指令（只数反斜杠会把它切开）
+  '| {红|丙资产} | 9,999.00 |',
+  // `\|` 是内容里的竖线、`\\` 是内容里的反斜杠：切格必须数反斜杠，否则会被切开
+  '| 备注\\|说明 | 含\\\\反斜杠 |',
+  '< 注：以上金额不含税',
+  ':::',
   '',
   '{-该笔债务已经清偿}',
   '',
@@ -196,6 +213,74 @@ writeFileSync(outPath, buffer)
   const notSingle = underlineTags.filter((tag) => !/w:val="single"/.test(tag))
   if (notSingle.length > 0) problems.push(`这些 w:u 不是 single：${notSingle.join('、')}`)
 
+  /*
+   * 表格：总宽/布局/行高/禁断行/整行合并/顶端对齐都必须在字节层面看得见。
+   * 期望值全部从模型与规格表推导（总宽 = 版心宽、行高 = minLines × 列表段落行距），
+   * 不从 Word 读回来的数推。
+   */
+  const tables = model.blocks.filter((b) => b.t === 'table')
+  if (usedBuiltinSample && tables.length === 0) {
+    problems.push('内置样本里没有表格 —— 这一项等于没验')
+  }
+  if (tables.length > 0) {
+    // 版心宽（缇）：1in = 1440twips = 96px，即 px × 15
+    const contentTwips = Math.round(
+      (lengthToPx(spec.page.size.width) -
+        lengthToPx(spec.page.margin.left) -
+        lengthToPx(spec.page.margin.right)) *
+        15,
+    )
+    const rowHeightPerLine = Math.round(spec.styles.listItem.linePt * 20)
+    const tblXmls = [...docXml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((m) => m[0])
+    if (tblXmls.length !== tables.length) {
+      problems.push(`表格数不符：document.xml 里 ${tblXmls.length} 张，模型里 ${tables.length} 张`)
+    }
+    if (/<w:tblW w:type="auto"/.test(docXml)) {
+      problems.push('出现了 w:tblW w:type="auto"（表格宽度没显式写死成 dxa）')
+    }
+
+    tables.forEach((t, ti) => {
+      const xml = tblXmls[ti] ?? ''
+      const countIn = (re) => [...xml.matchAll(re)].length
+      const rows = t.rows.length
+      const mergedRows = t.rows.filter((r) => r.role !== 'body').length
+      const noteRows = t.rows.filter((r) => r.role === 'note').length
+
+      const widthTag = `<w:tblW w:type="dxa" w:w="${contentTwips}"/>`
+      if (countIn(new RegExp(widthTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) !== 1) {
+        problems.push(`表${ti}的总宽不是版心宽（缺 ${widthTag}）`)
+      }
+      if (countIn(/<w:tblLayout w:type="fixed"\/>/g) !== 1) {
+        problems.push(`表${ti}不是固定布局（缺 w:tblLayout w:type="fixed"）`)
+      }
+      if (countIn(/<w:left w:type="dxa" w:w="108"\/>/g) !== 1 || countIn(/<w:right w:type="dxa" w:w="108"\/>/g) !== 1) {
+        problems.push(`表${ti}的单元格左右内边距不是 108 缇`)
+      }
+      const cantSplitTag = t.cantSplit ? /<w:cantSplit\/>/g : /<w:cantSplit w:val="false"\/>/g
+      if (countIn(cantSplitTag) !== rows) {
+        problems.push(`表${ti}的 w:cantSplit 与模型不符（${rows} 行，模型 cantSplit=${t.cantSplit}）`)
+      }
+      const heightTag = new RegExp(
+        `<w:trHeight w:val="${rowHeightPerLine * t.minLines}" w:hRule="atLeast"/>`,
+        'g',
+      )
+      if (countIn(heightTag) !== rows) {
+        problems.push(
+          `表${ti}的行高不是 ${rowHeightPerLine * t.minLines} 缇（minLines=${t.minLines}）× ${rows} 行`,
+        )
+      }
+      const spans = [...xml.matchAll(/<w:gridSpan w:val="(\d+)"\/>/g)].map((m) => Number(m[1]))
+      if (spans.length !== mergedRows || spans.some((n) => n !== t.columns)) {
+        problems.push(
+          `表${ti}的整行合并不符：期望 ${mergedRows} 处 gridSpan=${t.columns}，实际 ${JSON.stringify(spans)}`,
+        )
+      }
+      if (countIn(/<w:vAlign w:val="top"\/>/g) !== noteRows) {
+        problems.push(`表${ti}的附注格顶端对齐不符（期望 ${noteRows} 处）`)
+      }
+    })
+  }
+
   if (problems.length > 0) {
     console.error('[FAIL] docx 的字节与模型/规格表对不上：')
     for (const p of problems) console.error(`  - ${p}`)
@@ -206,6 +291,9 @@ writeFileSync(outPath, buffer)
       `${grids.length} 处 docGrid（${grids[0]}）`,
   )
   console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
+  if (tables.length > 0) {
+    console.log(`[ok] 表格：${tables.length} 张，总宽/固定布局/行高/禁断行/整行合并/顶端对齐均在字节层核对`)
+  }
 }
 
 // 临时副本名带上 pid 与时间戳：Word 退出后会短暂占住文件，用固定名会让下一次运行

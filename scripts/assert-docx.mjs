@@ -52,6 +52,13 @@ const LINE_RULE = { auto: 0, atLeast: 3, exact: 4 }
 const WD_FIELD_PAGE = 33
 const WD_REVISION_INSERT = 1
 const WD_REVISION_DELETE = 2
+// WdRowHeightRule.wdRowHeightAtLeast —— 行高「最小值」规则
+const ROW_HEIGHT_AT_LEAST = 1
+// WdCellVerticalAlignment.wdCellAlignVerticalTop
+const CELL_ALIGN_VERTICAL_TOP = 0
+// WdLineStyle.wdLineStyleNone / wdLineStyleSingle
+const LINE_STYLE_NONE = 0
+const LINE_STYLE_SINGLE = 1
 
 const failures = []
 const round2 = (v) => Math.round(v * 100) / 100
@@ -133,9 +140,12 @@ const expected = model.blocks
 //     <w:br w:type="page"/>（见 docx/export.ts 的 sectionParagraphs）。
 // Word 把这两种都读成「只含换页符（\f）的文字」，从文字上分不出来，只能按模型
 // 算出应该有几个、再和 Word 报的对账。
+//
+// Word 的 Paragraphs 集合会把表格单元格里的段落也走一遍（inTable=1），
+// 正文这一段必须把它们排除，否则段落顺序与文字会被表格内容搅乱。
 const isBreakArtifact = (p) => p.text.length > 0 && p.text.replace(/[\f\u0007]/g, '') === ''
-const artifacts = dump.paragraphs.filter(isBreakArtifact)
-const body = dump.paragraphs.filter((p) => !isBreakArtifact(p))
+const artifacts = dump.paragraphs.filter((p) => p.inTable === 0 && isBreakArtifact(p))
+const body = dump.paragraphs.filter((p) => p.inTable === 0 && !isBreakArtifact(p))
 const sectionBreaks = model.blocks.filter((b) => b.t === 'sectionBreak').length
 
 // 一节里连续的若干分页符只产出 1 个独立段落；只有当这一串后面没有正文段落时才产出
@@ -219,6 +229,97 @@ console.log('\n=== 3b. 下划线（w:u 是否真的生效） ===')
     console.log(
       `ok   下划线：${underlined} 段整段带下划线（Word 报 single）、` +
         `${plain} 段完全不带（Word 报 none）`,
+    )
+  }
+}
+
+/* ------------------------------- 三c、表格 -------------------------------- */
+
+console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 边框 / 对齐 / 总宽） ===')
+{
+  const modelTables = model.blocks.filter((b) => b.t === 'table')
+  const dumpTables = dump.tables ?? []
+  const before = failures.length
+  eq('表格数', dumpTables.length, modelTables.length)
+
+  const cellText = (cell) =>
+    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+
+  // 版心宽（磅）= 页面宽 − 左右页边距
+  const contentWidthPt =
+    ((lengthToPx(spec.page.size.width) -
+      lengthToPx(spec.page.margin.left) -
+      lengthToPx(spec.page.margin.right)) *
+      72) /
+    96
+
+  modelTables.forEach((t, ti) => {
+    const dt = dumpTables[ti]
+    if (!dt) {
+      failures.push(`表${ti} 在 Word 里不存在`)
+      return
+    }
+    eq(`表${ti}·行数`, dt.rowCount, t.rows.length)
+    eq(`表${ti}·列数`, dt.columnCount, t.columns)
+    if (dt.widthPoints >= 0) {
+      // 总宽用「第一行各格宽度之和」：Table.PreferredWidth 一旦遇到横向合并就返回
+      // wdUndefined（9999999），读不出数；合并格自己的宽度报的就是整表宽。
+      near(`表${ti}·总宽(磅)`, dt.widthPoints, contentWidthPt, 0.1)
+    } else {
+      failures.push(`表${ti} 拿不到宽度（widthPoints=-1）`)
+    }
+
+    t.rows.forEach((row, ri) => {
+      const dr = dt.rows?.[ri]
+      if (!dr) {
+        failures.push(`表${ti} 第${ri}行在 Word 里不存在`)
+        return
+      }
+      const merged = row.role !== 'body'
+      const expectedCells = merged ? 1 : t.columns
+      const tag = `表${ti}·行${ri}(${row.role})`
+      eq(`${tag}·格数`, dr.cellCount, expectedCells)
+      eq(`${tag}·禁止跨页断行`, dr.cantSplit, t.cantSplit ? 1 : 0)
+      eq(`${tag}·行高规则`, dr.heightRule, ROW_HEIGHT_AT_LEAST)
+      near(`${tag}·行高(磅)`, dr.height, t.minLines * spec.styles.listItem.linePt, 0.1)
+
+      const expectedTexts = merged
+        ? [cellText(row.cells[0] ?? { inlines: [] })]
+        : Array.from({ length: t.columns }, (_, c) => cellText(row.cells[c] ?? { inlines: [] }))
+      const expectedAlign = merged
+        ? row.role === 'unit'
+          ? ALIGN.right
+          : ALIGN.left
+        : ALIGN[spec.styles.listItem.align]
+
+      for (let c = 0; c < expectedCells; c += 1) {
+        const cell = dr.cells?.[c]
+        if (!cell) {
+          failures.push(`${tag} 第${c}格在 Word 里不存在`)
+          continue
+        }
+        eq(`${tag}·格${c}文字`, cell.text, expectedTexts[c])
+        eq(`${tag}·格${c}对齐`, cell.alignment, expectedAlign)
+        eq(`${tag}·格${c}合并跨度`, cell.columnSpan, merged ? t.columns : 1)
+        if (row.role === 'note') {
+          eq(`${tag}·格${c}顶端对齐`, cell.verticalAlignment, CELL_ALIGN_VERTICAL_TOP)
+        }
+        const wantStyle = merged ? LINE_STYLE_NONE : LINE_STYLE_SINGLE
+        for (const side of ['top', 'left', 'bottom', 'right']) {
+          eq(`${tag}·格${c}${side}线型`, cell.lineStyles?.[side], wantStyle)
+        }
+      }
+      console.log(
+        `ok   ${tag} 格数${dr.cellCount} 禁断行${dr.cantSplit} 行高${dr.heightRule}/${round2(dr.height)}磅 ` +
+          `对齐[${(dr.cells ?? []).map((x) => x.alignment).join(',')}]`,
+      )
+    })
+  })
+
+  if (failures.length === before) {
+    console.log(
+      `ok   表格对账：${modelTables.length} 张表全部与模型/规格表吻合` +
+        `（总宽≈${round2(contentWidthPt)}磅，行高=${round2(spec.styles.listItem.linePt)}磅 × minLines）`,
     )
   }
 }

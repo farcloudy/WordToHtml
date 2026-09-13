@@ -10,7 +10,7 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { Block, CommentDef, DocModel, Inline } from '../types'
+import type { Block, CommentDef, DocModel, Inline, TableBlock } from '../types'
 
 const PREFIX: Record<BlockKind, string> = {
   title: '# ',
@@ -63,6 +63,33 @@ function serializeInlines(
   return out
 }
 
+/**
+ * 表格块 → md 围栏。kwarg 只写非默认值（minLines 默认 1、cantSplit 默认 true），
+ * 顺序固定 minLines 在前、cantSplit 在后 —— 这样「模型 → md → 模型 → md」字节稳定。
+ */
+function tableLines(block: TableBlock, comments: Map<number, CommentDef>): string[] {
+  let fence = ':::table'
+  if (block.minLines !== 1) fence += ` minLines=${block.minLines}`
+  if (!block.cantSplit) fence += ' cantSplit=no'
+
+  const out = [fence]
+  for (const row of block.rows) {
+    if (row.role === 'body') {
+      out.push(
+        '| ' +
+          row.cells.map((cell) => serializeInlines(cell.inlines, comments)).join(' | ') +
+          ' |',
+      )
+      continue
+    }
+    const first = row.cells[0]
+    const text = first ? serializeInlines(first.inlines, comments) : ''
+    out.push(row.role === 'unit' ? `> ${text}` : `< ${text}`)
+  }
+  out.push(':::')
+  return out
+}
+
 export function toMd(doc: DocModel): string {
   const comments = new Map(doc.comments.map((c) => [c.id, c]))
   const lines: string[] = []
@@ -74,6 +101,10 @@ export function toMd(doc: DocModel): string {
     }
     if (block.t === 'pageBreak') {
       lines.push('===')
+      continue
+    }
+    if (block.t === 'table') {
+      lines.push(...tableLines(block, comments))
       continue
     }
     lines.push(PREFIX[block.kind] + serializeInlines(block.inlines, comments))
@@ -89,6 +120,18 @@ export function normalizeBlocks(doc: DocModel): unknown[] {
       return { t: 'sectionBreak', restartNumbering: block.restartNumbering }
     }
     if (block.t === 'pageBreak') return { t: 'pageBreak' }
+    if (block.t === 'table') {
+      return {
+        t: 'table',
+        columns: block.columns,
+        minLines: block.minLines,
+        cantSplit: block.cantSplit,
+        rows: block.rows.map((row) => ({
+          role: row.role,
+          cells: row.cells.map((cell) => ({ inlines: cell.inlines })),
+        })),
+      }
+    }
     return { t: 'textBlock', kind: block.kind, inlines: block.inlines }
   })
 }

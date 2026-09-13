@@ -411,6 +411,23 @@ export function removeComment(doc: DocModel, commentId: number): void {
 export function cloneDoc(doc: DocModel): DocModel {
   return {
     blocks: doc.blocks.map((block): Block => {
+      // 表格块要逐层新建：浅拷贝会让副本与原稿共享 rows/cells/inlines，
+      // 撤销栈与渲染快照复原时会被后续编辑连带改到。
+      if (block.t === 'table') {
+        return {
+          t: 'table',
+          id: block.id,
+          columns: block.columns,
+          minLines: block.minLines,
+          cantSplit: block.cantSplit,
+          rows: block.rows.map((row) => ({
+            role: row.role,
+            cells: row.cells.map((cell) => ({
+              inlines: cell.inlines.map((inline): Inline => ({ ...inline })),
+            })),
+          })),
+        }
+      }
       if (block.t !== 'textBlock') return { ...block }
       return {
         t: 'textBlock',

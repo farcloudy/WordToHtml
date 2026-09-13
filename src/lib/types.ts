@@ -66,7 +66,57 @@ export interface TextBlock {
   inlines: Inline[]
 }
 
-export type Block = TextBlock | SectionBreakBlock | PageBreakBlock
+/**
+ * 表格行的角色。`unit`（表头行上方的「单位：元」）与 `note`（表尾附注）**天然就是整行一格**，
+ * 所以模型里只存 1 个 cell，渲染与导出时再展开成 columnSpan = columns ——「整行合并」
+ * 因此不可能与实际格数不一致，也就没有合并字段需要维护。
+ */
+export type TableRowRole = 'unit' | 'body' | 'note'
+
+/** 单元格内容：单段落（不引入软换行，Shift+Enter 的 <w:br/> 是下一步的事） */
+export interface TableCellModel {
+  inlines: Inline[]
+}
+
+export interface TableRowModel {
+  role: TableRowRole
+  cells: TableCellModel[]
+}
+
+export interface TableBlock {
+  t: 'table'
+  id: string
+  /** 顺序即显示顺序：unit → body… → note；解析时保持 md 里的书写顺序，不强制重排 */
+  rows: TableRowModel[]
+  /** body 行的最大格数；解析时保证 >= 1 */
+  columns: number
+  /** 「最小一行 / 最小两行」，即 HeightRule.ATLEAST 的倍数 */
+  minLines: 1 | 2
+  /** 默认 true（「默认禁止跨页断行」= 行不跨页断开，即 Word 的 w:cantSplit） */
+  cantSplit: boolean
+}
+
+export type Block = TextBlock | SectionBreakBlock | PageBreakBlock | TableBlock
+
+/**
+ * 单元格在编辑层里的「伪块」id。
+ *
+ * 单元格也挂 data-block-id，于是 edit/dom.ts 的坐标换算（fragmentOf 向上取最近的
+ * data-block-id）不用改一行就能把光标落进格子里 —— 代价只是编辑层按 id 找容器。
+ */
+export function cellId(tableId: string, r: number, c: number): string {
+  return `${tableId}.r${r}c${c}`
+}
+
+const CELL_ID_RE = /^(.*)\.r(\d+)c(\d+)$/
+
+/** cellId() 的反向解析；不是单元格 id 时返回 null */
+export function parseCellId(id: string): { tableId: string; row: number; col: number } | null {
+  const m = CELL_ID_RE.exec(id)
+  const tableId = m?.[1]
+  if (m === null || !tableId) return null
+  return { tableId, row: Number(m[2]), col: Number(m[3]) }
+}
 
 export interface CommentDef {
   id: number

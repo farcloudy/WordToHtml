@@ -109,6 +109,11 @@ try {
       $inner = $doc.Range($r.Start, $r.End - 1)
       $underline = [int]$inner.Font.Underline
     }
+    # wdWithInTable = 12. Word's Paragraphs collection also walks the paragraphs
+    # inside table cells; the node side has to exclude them or its "paragraph
+    # order and text" section gets scrambled by table content.
+    $inTable = 0
+    try { if ([int]$r.Information(12) -ne 0) { $inTable = 1 } } catch { $inTable = 0 }
     $paragraphs += [ordered]@{
       index     = $i
       style     = $p.Style.NameLocal
@@ -116,10 +121,135 @@ try {
       bold      = [int]$r.Font.Bold
       underline = $underline
       alignment = [int]$p.Alignment
+      inTable   = $inTable
     }
     $i++
   }
   $dump.paragraphs = $paragraphs
+
+  # Tables. Two object-model facts drive the shape below:
+  #   * Word 16.0 exposes Row.AllowBreakAcrossPages (not Row.CantSplit), so the
+  #     dumped cantSplit is derived as its inverse.
+  #   * Table.PreferredWidth reports wdUndefined (9999999) as soon as a row has a
+  #     horizontally merged cell, so the effective table width is summed from the
+  #     cells of the first row instead (a merged cell reports the full width).
+  $tables = @()
+  $ti = 0
+  foreach ($tbl in $doc.Tables) {
+    $ti++
+    $rowCount = -1
+    try { $rowCount = [int]$tbl.Rows.Count } catch { $rowCount = -1 }
+    $colCount = -1
+    try { $colCount = [int]$tbl.Columns.Count } catch { $colCount = -1 }
+
+    $prefType = -1
+    $prefWidth = -1
+    try { $prefType = [int]$tbl.PreferredWidthType } catch { $prefType = -1 }
+    try { $prefWidth = [math]::Round([double]$tbl.PreferredWidth, 2) } catch { $prefWidth = -1 }
+
+    $widthPoints = -1
+    try {
+      $sum = 0.0
+      foreach ($cell in $tbl.Rows.Item(1).Cells) { $sum += [double]$cell.Width }
+      $widthPoints = [math]::Round($sum, 2)
+    } catch { $widthPoints = -1 }
+
+    $tableBorders = [ordered]@{}
+    foreach ($side in @(@('top', -1), @('left', -2), @('bottom', -3), @('right', -4))) {
+      $lineStyle = -1
+      $lineWidth = -1
+      try {
+        $b = $tbl.Borders.Item([int]$side[1])
+        $lineStyle = [int]$b.LineStyle
+        $lineWidth = [math]::Round([double]$b.LineWidth, 2)
+      } catch {
+        $lineStyle = -1
+        $lineWidth = -1
+      }
+      $tableBorders[$side[0]] = [ordered]@{ lineStyle = $lineStyle; lineWidth = $lineWidth }
+    }
+
+    $rows = @()
+    $ri = 0
+    try {
+      foreach ($row in $tbl.Rows) {
+        $ri++
+        $columnIndices = @()
+        try {
+          $columnIndices = @($row.Cells | ForEach-Object { [int]$_.ColumnIndex })
+        } catch { $columnIndices = @() }
+
+        $cells = @()
+        $ci = 0
+        foreach ($cell in $row.Cells) {
+          $cellAlign = -1
+          try { $cellAlign = [int]$cell.Range.ParagraphFormat.Alignment } catch { $cellAlign = -1 }
+          $vAlign = -1
+          try { $vAlign = [int]$cell.VerticalAlignment } catch { $vAlign = -1 }
+          $span = -1
+          if ($columnIndices.Count -gt $ci) {
+            $next = $colCount + 1
+            if ($ci -lt $columnIndices.Count - 1) { $next = $columnIndices[$ci + 1] }
+            if ($next -gt $columnIndices[$ci]) { $span = $next - $columnIndices[$ci] }
+          }
+          $cellBorders = [ordered]@{}
+          foreach ($side in @(@('top', -1), @('left', -2), @('bottom', -3), @('right', -4))) {
+            $ls = -1
+            try { $ls = [int]$cell.Borders.Item([int]$side[1]).LineStyle } catch { $ls = -1 }
+            $cellBorders[$side[0]] = $ls
+          }
+          $cells += [ordered]@{
+            text              = $cell.Range.Text.TrimEnd([char]13, [char]7, [char]10)
+            alignment         = $cellAlign
+            verticalAlignment = $vAlign
+            columnSpan        = $span
+            lineStyles        = $cellBorders
+          }
+          $ci++
+        }
+
+        $cantSplit = -1
+        try {
+          if ([bool]$row.AllowBreakAcrossPages) { $cantSplit = 0 } else { $cantSplit = 1 }
+        } catch { $cantSplit = -1 }
+        $heightRule = -1
+        try { $heightRule = [int]$row.HeightRule } catch { $heightRule = -1 }
+        $height = -1
+        try { $height = [math]::Round([double]$row.Height, 2) } catch { $height = -1 }
+        $pwt = -1
+        try { $pwt = [int]$row.PreferredWidthType } catch { $pwt = -1 }
+        $pw = -1
+        try { $pw = [math]::Round([double]$row.PreferredWidth, 2) } catch { $pw = -1 }
+
+        $rows += [ordered]@{
+          index              = $ri
+          cellCount          = [int]$row.Cells.Count
+          cantSplit          = $cantSplit
+          heightRule         = $heightRule
+          height             = $height
+          preferredWidthType = $pwt
+          preferredWidth     = $pw
+          cells              = $cells
+        }
+      }
+    } catch {
+      # Rows enumeration can throw when vertical merges are present. The current
+      # design only ever merges horizontally (gridSpan), so this is a guard.
+      $rowCount = -1
+    }
+
+    $tables += [ordered]@{
+      index              = $ti
+      rowCount           = $rowCount
+      columnCount        = $colCount
+      preferredWidthType = $prefType
+      preferredWidth     = $prefWidth
+      widthPoints        = $widthPoints
+      borders            = $tableBorders
+      rows               = $rows
+    }
+  }
+  $dump.tables = $tables
 
   # wdRevisionInsert = 1, wdRevisionDelete = 2
   $revisions = @()
