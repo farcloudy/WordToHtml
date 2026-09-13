@@ -430,6 +430,53 @@ unit/note 行尾空格丢失。修完后聚焦复核判**可接受**，且复核
 
 **列标题行居中仍做不到**（见 8.2），本轮样本的列标题行只套了 `**加粗**`。
 
+### 6.8 W4a-2 开工要点（下个 session 照做）
+
+**范围**（用户 2026-09-13 拍板：带 UI 入口、格内可打字）：预览渲染 + 量测 + 分页 + 编辑读回收口 +
+demo 样本放一张表 + 工具栏「插入表格」按钮 + 软换行。**W4b 只剩** Tab / 方向键跨格、增删行列、unit/note 行开关、
+行高两档、格内 Shift+Enter 键入。
+**模型与 md / docx 侧已就绪**（W4a-1，提交 `d2911f7`）：`TableBlock` / `cellId()` / `parseCellId()`、
+md `:::table` 围栏、docx 映射全在 —— **不要重新设计**（设计源头见 6.1–6.5 与项目记忆 `table-model-design.md`）。
+
+**已知接缝与坑（动手前先看）**：
+
+- `render/html.ts`：新增 `renderTableFragment(block, rowFrom, rowTo)`，**量测与预览必须共用这一个函数**；
+  单元格内层 div 挂 `class="wtp-listItem"` + `data-block-id="cellId(...)"` + `data-from/data-to`
+  （这样 `edit/dom.ts` 的坐标换算一行都不用改）。
+- `render/css.ts`：单元格左右内边距必须与 docx 侧一致 —— **108 缇 = 5.4pt**（导出侧 `CELL_MARGIN_TWIPS` 已定死）。
+  行高最小值**不能靠 `<tr>` 的 `min-height`**（表格行不吃这个属性）：要么给 `<tr>` 写 `height`（表格布局里按最小值处理），
+  要么给格内 div 设 `min-height` —— 必须浏览器实测确认。已知偏差：列表段落样式的 CSS `line-height: 12pt` 是固定值，
+  而 Word 的 `atLeast 12pt` 是「不小于」；单行格两者都是 24pt（`minLines=2`）没问题，**多行格**（内容撑高）
+  可能差零点几磅 —— 页数对不上时先量这里。
+- `render/measure.ts`：`MeasuredItem` 加「表格行」一项（每行 `rows=1`、`lineHeight=行高`），量测缓存条目类型放宽成联合，
+  签名要含整张表的 HTML（任一格改动即失效）；表格**按行**量测（`<tr>` 实测高）。
+- `render/paginate.ts`：表格行带 `atomic` **绕开孤行控制**（否则单行块会被 widow/orphan 判成「不足 2 行」整块挪走）；
+  `PageFragment` 加 `rowFrom/rowTo`；同页相邻同表行合并成一个片段（一页一个 `<table>`）。
+- `components/WordPaper.vue`：片段渲染加表格分支（`blocksById` 之外要有表格查找表）；`fragmentStyle` / `sameLayout`
+  要比 `rowFrom/rowTo`；**v-for 的 key 必须带 `rowFrom/rowTo`**（同一张表各页片段的 `from/to` 都是 0，只按
+  `(blockId, from)` 编键会撞）；编辑读回收口把 `findBlock` 泛化成 `findContainer`
+  （`insertText`/`replaceRange`/`deleteRange`/`applyFormat`/`rangeIsBold`/`rangeColor` 改吃容器），
+  `edit/search.ts` 同步改吃容器，好让查找/替换覆盖格内文字。
+- **软换行**（本波唯一的新数据格式）：给 `Inline` 加零宽标记（Word 的 `<w:br/>`），md 里写成 `\n`（反斜杠 + n，
+  与 `escapeText` 的 `\\` → `\` 可逆），docx 用 `TextRun.break` / `CarriageReturn`；
+  **量测、坐标映射、`replaceRange`、`sliceStrict`、`readInlines`、`sliceInlines` 都要认它**（零宽、不占字符位）；
+  `readInlines` 要能区分「空段落占位用的 `<br>`」与真软换行（只在根节点仅有一个 `<br>` 时算占位）。
+- **demo 样本放表**会动 `verify-browser` / `verify-editor` 里依赖 demo 内容的断言（搜索命中数、打印页数、切模板页数…），
+  要一起改；表格文字别用含下划线 / 修订 / 批注的写法，免得撞上既有计数断言。
+
+**验收形态（用户 2026-09-13 拍板：不跑 playwright，版式改人工核对）**：
+
+- 机器验：`type-check`；`test-paginate.mjs`（表格行按行装箱 + `atomic` 不吃孤行控制）；`test-edit-model.mjs`
+  （软换行 / 容器泛化 / 跨格查找）；`verify:docx`（`<w:br/>` 字节层 + 往返）；`verify:p1`（Word 对账，
+  样本里加一个软换行格）。
+- **人工核对**（用户做，届时给一份清单）：开 dev server 看表格版式（边框、对齐、行高、合并行、列宽、分页处行不拆开），
+  再用 Word 打开导出的 docx 对页数与表格外观。
+
+**派发方式（用户 2026-09-13 拍板：完成通知不要再进对话）**：子进程**完全脱离**，不注册成 harness 的后台任务 ——
+把启动命令写成 `.qwen/tmp/w4a2-run.cmd`（里面 `qwen "Read .qwen/tmp/w4a2-task.md as UTF-8 …" -y > .qwen/tmp/w4a2-impl.log 2>&1`），
+再用 `start /b cmd /c .qwen\tmp\w4a2-run.cmd` 起（省掉 cmd 里嵌套引号的坑）。主 session 用**前台等待循环**
+（每次 ≤9 分钟，轮询结论文件是否出现）取结果，读文件一律有界。代价：失败 / 挂住没有信号，只能靠等待超时 + 读日志尾部发现。
+
 ---
 
 ## 7. W5 —— 节编辑框架
