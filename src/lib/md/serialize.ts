@@ -10,7 +10,15 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { Block, CommentDef, DocModel, Inline, TableBlock, TableCellModel } from '../types'
+import type {
+  Block,
+  CommentDef,
+  DocModel,
+  Inline,
+  SectionSettings,
+  TableBlock,
+  TableCellModel,
+} from '../types'
 
 const PREFIX: Record<BlockKind, string> = {
   title: '# ',
@@ -106,13 +114,38 @@ function tableLines(block: TableBlock, comments: Map<number, CommentDef>): strin
   return out
 }
 
+/**
+ * 一节的设置 → kwargs 串（**只写非默认值**，token 顺序固定 link → numbers → restart → orientation）。
+ *
+ * 顺序固定 + 只写非默认值 ⇒「模型 → md → 模型 → md」字节稳定；
+ * `isFirst` 时首节没有前节，link 一律不写（它恒无意义，写了也解析不回来）。
+ */
+function sectionKwargs(raw: SectionSettings | undefined, isFirst: boolean): string {
+  if (!raw) return ''
+  const tokens: string[] = []
+  if (!isFirst && raw.linkPrevious === false) tokens.push('link=off')
+  if (raw.pageNumbers === false) tokens.push('numbers=off')
+  if (raw.restartAtOne === true) tokens.push('restart=on')
+  if (raw.orientation === 'landscape') tokens.push('orientation=landscape')
+  return tokens.join(' ')
+}
+
 export function toMd(doc: DocModel): string {
   const comments = new Map(doc.comments.map((c) => [c.id, c]))
   const lines: string[] = []
+  const sections = doc.sections ?? []
 
+  // 首节写在文档第一行（只有非默认时才写），其余各节跟着各自的 `---` 走
+  const head = sectionKwargs(sections[0], true)
+  if (head !== '') lines.push(`::section ${head}`)
+
+  // 第 k 个分节符开启第 k+1 节
+  let sectionIndex = 0
   for (const block of doc.blocks) {
     if (block.t === 'sectionBreak') {
-      lines.push('---')
+      sectionIndex += 1
+      const kwargs = sectionKwargs(sections[sectionIndex], false)
+      lines.push(kwargs === '' ? '---' : `--- ${kwargs}`)
       continue
     }
     if (block.t === 'pageBreak') {
@@ -133,7 +166,7 @@ export function toMd(doc: DocModel): string {
 export function normalizeBlocks(doc: DocModel): unknown[] {
   return doc.blocks.map((block: Block) => {
     if (block.t === 'sectionBreak') {
-      return { t: 'sectionBreak', restartNumbering: block.restartNumbering }
+      return { t: 'sectionBreak' }
     }
     if (block.t === 'pageBreak') return { t: 'pageBreak' }
     if (block.t === 'table') {

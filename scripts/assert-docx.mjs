@@ -18,6 +18,7 @@ import {
   lengthToPx,
   lineSpacePt,
   plainText,
+  resolveSections,
   resolveSpec,
 } from '../dist-lib/wordtohtml.mjs'
 
@@ -83,6 +84,13 @@ function near(label, actual, expected, tol = 0.05) {
 function expectOneOf(label, actual, list) {
   if (list.includes(actual)) return true
   failures.push(`${label} → 期望其中之一 ${JSON.stringify(list)}，实际 ${JSON.stringify(actual)}`)
+  return false
+}
+
+/** 布尔式断言（没有「期望值」可写的那些） */
+function ok(label, condition, detail = '') {
+  if (condition) return true
+  failures.push(`${label}${detail ? ` → ${detail}` : ''}`)
   return false
 }
 
@@ -386,28 +394,72 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
 
 console.log('\n=== 4. 纸张 / 页边距 / 页码 / 分节 ===')
 eq('节数', dump.sectionCount, sectionBreaks + 1)
-for (const sec of dump.sections) {
-  const tag = `第${sec.index}节`
-  near(`${tag}·页宽(磅)`, sec.pageWidth, toPt(spec.page.size.width), 0.1)
-  near(`${tag}·页高(磅)`, sec.pageHeight, toPt(spec.page.size.height), 0.1)
-  near(`${tag}·上边距(磅)`, sec.topMargin, toPt(spec.page.margin.top), 0.1)
-  near(`${tag}·下边距(磅)`, sec.bottomMargin, toPt(spec.page.margin.bottom), 0.1)
-  near(`${tag}·左边距(磅)`, sec.leftMargin, toPt(spec.page.margin.left), 0.1)
-  near(`${tag}·右边距(磅)`, sec.rightMargin, toPt(spec.page.margin.right), 0.1)
-  near(`${tag}·页脚距(磅)`, sec.footerDistance, toPt(spec.page.footer), 0.1)
 
-  // 分节编页码用「行为」来验，而不是读属性：
-  // 每一节的第一页，页脚都渲染成 "1"。如果页码没有按节重启，第 2 节会渲染成 "2"。
-  // Word 对象模型的 PageNumbers.StartingNumber / RestartNumberingAtSection 在这里
-  // 都返回 0，是取值怪癖（XML 里确实写了 <w:pgNumType w:start="1"/>），所以不读它。
-  eq(`${tag}·页脚页码`, sec.footerText.trim(), '1')
-  eq(`${tag}·页脚独立（未链接上一节）`, sec.linkedToPrevious, 0)
-  expectOneOf(`${tag}·页脚含 PAGE 域`, WD_FIELD_PAGE, sec.footerFieldTypes)
-  console.log(
-    `ok   ${tag} ${round2(sec.pageWidth)}×${round2(sec.pageHeight)}磅 ` +
-      `边距${round2(sec.topMargin)}/${round2(sec.bottomMargin)}/${round2(sec.leftMargin)}/${round2(sec.rightMargin)} ` +
-      `页脚页码"${sec.footerText.trim()}" 域${JSON.stringify(sec.footerFieldTypes)}`,
-  )
+/*
+ * 逐节对账。期望值全部从 resolveSections(model, spec) 现推 —— 与导出侧、预览侧
+ * 同一个真相源。W5 之前这里对**每一节**都断言「页宽=规格表、页脚文本 1、
+ * linkedToPrevious=0、含 PAGE 域」，那只在「每节都独立设页脚且都重排」时才成立；
+ * 现在每一节可以有各自的页面方向、页脚、页码开关，必须按它的设置算。
+ *
+ * 分节编号的「重排」用**行为**验，不读 PageNumbers.RestartNumberingAtSection ——
+ * 那个属性在这台 Word 上恒返回 0（取值怪癖，XML 里其实写了 <w:pgNumType w:start="1"/>），
+ * 「本节第一页的页脚渲染成 1」才是我们要的语义。
+ */
+{
+  const sections = resolveSections(model, spec)
+  const WD_ORIENT_PORTRAIT = 0
+  const WD_ORIENT_LANDSCAPE = 1
+
+  for (const sec of dump.sections) {
+    const tag = `第${sec.index}节`
+    const live = sections[sec.index - 1]
+    if (!live) {
+      failures.push(`${tag} 在 resolveSections 的结果里不存在（节数对不上）`)
+      continue
+    }
+    // 横排节的纸是宽高互换过的（resolveSections 已经换过，这里不再换）
+    near(`${tag}·页宽(磅)`, sec.pageWidth, toPt(live.page.size.width), 0.1)
+    near(`${tag}·页高(磅)`, sec.pageHeight, toPt(live.page.size.height), 0.1)
+    eq(
+      `${tag}·方向`,
+      sec.orientation,
+      live.settings.orientation === 'landscape' ? WD_ORIENT_LANDSCAPE : WD_ORIENT_PORTRAIT,
+    )
+    // 页边距不随方向换（Word 的 LeftMargin 始终是「左」），四边都从规格表来
+    near(`${tag}·上边距(磅)`, sec.topMargin, toPt(spec.page.margin.top), 0.1)
+    near(`${tag}·下边距(磅)`, sec.bottomMargin, toPt(spec.page.margin.bottom), 0.1)
+    near(`${tag}·左边距(磅)`, sec.leftMargin, toPt(spec.page.margin.left), 0.1)
+    near(`${tag}·右边距(磅)`, sec.rightMargin, toPt(spec.page.margin.right), 0.1)
+    near(`${tag}·页脚距(磅)`, sec.footerDistance, toPt(spec.page.footer), 0.1)
+
+    // 关联前节 = 页脚挂在上一节上（Word 报 LinkToPrevious = 1 = True）；
+    // 独立设页脚 = 0。首节没有前节，resolveSections 已把它强制成 false → 0
+    eq(`${tag}·页脚是否关联前节`, sec.linkedToPrevious, live.settings.linkPrevious ? 1 : 0)
+
+    const text = sec.footerText.trim()
+    if (!live.showPageNumber) {
+      eq(`${tag}·不显示页码（空页脚）`, text, '')
+      eq(`${tag}·不该有 PAGE 域`, sec.footerFieldTypes.includes(WD_FIELD_PAGE), false)
+    } else {
+      ok(
+        `${tag}·页脚渲染出页码`,
+        /^\d+$/.test(text),
+        `页脚文本 ${JSON.stringify(text)} 不是纯数字`,
+      )
+      // 首节恒从 1 开始；声明了「从 1 重排」的节，第一页就该是 1
+      if (live.settings.restartAtOne || sec.index === 1) {
+        eq(`${tag}·第一页页码`, text, '1')
+      }
+      expectOneOf(`${tag}·页脚含 PAGE 域`, WD_FIELD_PAGE, sec.footerFieldTypes)
+    }
+    console.log(
+      `ok   ${tag} ${round2(sec.pageWidth)}×${round2(sec.pageHeight)}磅 ` +
+        `方向${sec.orientation} 边距${round2(sec.topMargin)}/${round2(sec.bottomMargin)}/${round2(sec.leftMargin)}/${round2(sec.rightMargin)} ` +
+        `页脚"${text}" 关联前节${sec.linkedToPrevious} 域${JSON.stringify(sec.footerFieldTypes)} ` +
+        `（${live.settings.linkPrevious ? '继承前一节' : '独立页脚'}，` +
+        `${live.settings.restartAtOne ? '从 1 重排' : '接着往下数'}）`,
+    )
+  }
 }
 
 /* --------------------------------- 结论 --------------------------------- */

@@ -54,7 +54,10 @@ const SAMPLE = [
   '',
   '关于债务人财产的变价方案，管理人已依照《中华人民共和国企业破产法》第一百一十二条的规定拟定初步意见，并提交第一次债权人会议审议。会议召开前，管理人已将变价方案的征求意见稿送达全体已知债权人，其中三名债权人提出了书面异议，异议主要集中在评估基准日的选取以及部分机器设备是否应当与厂房一并处置两个方面。管理人经研究认为，评估基准日以人民法院受理破产申请之日为宜，理由是该日的资产状况有完整的财务凭证与现场盘点记录可供核对；至于机器设备与厂房是否应当一并处置，管理人倾向于分别处置，因为厂房的抵押权人已明确表示愿意单独受让，若将两者合并处置，可能导致抵押权人的优先受偿顺位与其他债权人的利益发生冲突，且不利于财产的及时变价。此外，管理人已就评估机构的选聘事项征询了债权人委员会的意见，拟从人民法院管理人名册中随机确定三家候选机构，再以书面询价的方式确定受托机构，评估费用列入破产费用优先支付；评估报告出具后，管理人将把评估结论与变价方案一并提交债权人会议表决，并根据会议决议另行公告拍卖或者变卖的安排。上述评估与变价工作预计在债权申报期届满后两个月内完成，管理人会按期向你单位书面报告进展；如发现债务人有转移财产或者其他损害债权人利益的行为，管理人将及时提请人民法院处理。',
   '',
-  '---',
+  // 分节符后跟 kwargs 描述**它开启的那一节**：这一节独立设页脚、页码从 1 重排
+  // （= W5 之前 `---` 的旧含义，写全了才是显式的）。不写 kwargs 就是全默认 ——
+  // 新节关联前节，页码接着往下数。
+  '--- link=off restart=on',
   '',
   '## 附件说明',
   '',
@@ -111,6 +114,12 @@ const TABLE_V_ALIGNS: { value: CellVerticalAlign; label: string; title: string }
   { value: 'middle', label: '居中', title: '格内垂直居中' },
   { value: 'bottom', label: '底端', title: '格内底端对齐' },
 ]
+
+/** 「节」工具条上的纸张方向两档（值直接对应 PageOrientation） */
+const PAGE_ORIENTATIONS = [
+  { value: 'portrait', label: '纵向', title: '本节纸张纵向（默认）' },
+  { value: 'landscape', label: '横向', title: '本节纸张横向（宽高互换）' },
+] as const
 
 /** edit = 直接在 A4 版面上写（面向用户）；source = 类 md 源码（给开发/排错用） */
 const mode = ref<'edit' | 'source'>('edit')
@@ -200,6 +209,17 @@ const kind = computed<BlockKind>(() => selection.value?.kind ?? 'body')
 
 /** 光标落在表格格子里时的上下文；其余时候为 null（上下文工具条据此显示/隐藏） */
 const tableCtx = computed(() => selection.value?.table ?? null)
+
+/**
+ * 光标所在节的上下文。编辑模式下**常驻**（光标永远落在某一节里），
+ * 与表格工具条同一条路：App 没有响应式的模型，只能吃 selection-change 带出来的这一次。
+ */
+const sectionCtx = computed(() => selection.value?.section ?? null)
+
+/** 「从 1 开始」在首节与「关联前节」时都无意义（首节恒从 1 开始，关联时由前一节接管） */
+const sectionRestartDisabled = computed(
+  () => (sectionCtx.value?.isFirst ?? false) || (sectionCtx.value?.linkPrevious ?? false),
+)
 
 /** 上下文工具条上的落点提示：正文行显示行列（下标 +1），表头/附注行没有列的概念 */
 const tablePosLabel = computed(() => {
@@ -600,7 +620,7 @@ onBeforeUnmount(() => {
       <button
         type="button"
         class="tool"
-        title="在光标所在段落后插入分节符（新起一页，页码从 1 重排）"
+        title="在光标所在段落后插入分节符（新起一页；页码默认关联前一节、不重排）"
         @mousedown.prevent
         @click="paper?.insertSectionBreak()"
       >
@@ -638,6 +658,115 @@ onBeforeUnmount(() => {
           @keydown.enter.prevent="insertComment"
         />
         <button type="button" @mousedown.prevent @click="insertComment">添加</button>
+      </span>
+    </div>
+
+    <!--
+      节的上下文工具条：编辑模式常驻（光标永远落在某一节里），交互与表格工具条同一套 ——
+      按钮与 radio 一律 @mousedown.prevent，焦点不离开正文，落点与 native 选区才保得住。
+      置灰规则：首节没有前节（关联前节恒置灰）；「关联前节 = 是」时另两项被前一节接管；
+      「从 1 开始」在首节也无意义（恒从 1 开始），一并置灰。
+    -->
+    <div v-if="mode === 'edit' && sectionCtx" class="toolbar sub-toolbar section-toolbar">
+      <span class="tk-hint">第 {{ sectionCtx.index + 1 }} 节 / 共 {{ sectionCtx.total }} 节</span>
+
+      <span class="tk-group">
+        <span class="tk-label">方向</span>
+        <label v-for="o in PAGE_ORIENTATIONS" :key="o.value" class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-orientation"
+            :title="o.title"
+            :checked="sectionCtx.orientation === o.value"
+            @click="paper?.setSectionOrientation(o.value)"
+          />
+          {{ o.label }}
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">页码</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-numbers"
+            title="本节显示页码（关联前节时由前一节决定）"
+            :disabled="sectionCtx.linkPrevious"
+            :checked="sectionCtx.pageNumbers"
+            @click="paper?.setSectionPageNumbers(true)"
+          />
+          开
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-numbers"
+            title="本节不显示页码"
+            :disabled="sectionCtx.linkPrevious"
+            :checked="!sectionCtx.pageNumbers"
+            @click="paper?.setSectionPageNumbers(false)"
+          />
+          关
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">关联前节</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-link"
+            title="页脚与页码沿用前一节（本节不单独设页脚）"
+            :disabled="sectionCtx.isFirst"
+            :checked="sectionCtx.linkPrevious"
+            @click="paper?.setSectionLinkPrevious(true)"
+          />
+          是
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-link"
+            title="本节用自己的页脚与页码（首节没有前节，恒为否）"
+            :disabled="sectionCtx.isFirst"
+            :checked="!sectionCtx.linkPrevious"
+            @click="paper?.setSectionLinkPrevious(false)"
+          />
+          否
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">从 1 开始</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-restart"
+            title="本节页码从 1 重新起算"
+            :disabled="sectionRestartDisabled"
+            :checked="sectionCtx.restartAtOne"
+            @click="paper?.setSectionRestartAtOne(true)"
+          />
+          是
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="sec-restart"
+            title="本节页码接着前面往下数"
+            :disabled="sectionRestartDisabled"
+            :checked="!sectionCtx.restartAtOne"
+            @click="paper?.setSectionRestartAtOne(false)"
+          />
+          否
+        </label>
       </span>
     </div>
 
@@ -1590,6 +1719,7 @@ textarea {
   .styles,
   .toolbar,
   .sub-toolbar,
+  .section-toolbar,
   .pane-head,
   .legend,
   textarea,

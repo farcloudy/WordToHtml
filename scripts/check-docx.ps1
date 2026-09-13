@@ -57,6 +57,7 @@ try {
       footerText            = $foot.Range.Text
       footerFieldTypes      = $types
       linkedToPrevious      = [int]$foot.LinkToPrevious
+      orientation           = [int]$ps.Orientation
       pageWidth             = [math]::Round([double]$ps.PageWidth, 2)
       pageHeight            = [math]::Round([double]$ps.PageHeight, 2)
       topMargin             = [math]::Round([double]$ps.TopMargin, 2)

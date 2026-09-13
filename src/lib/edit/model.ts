@@ -19,12 +19,14 @@ import type {
   DocModel,
   Inline,
   InlineHolder,
+  PageOrientation,
   RevMark,
   TableRowRole,
   TextBlock,
 } from '../types'
 import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
 import { findCell, setCellKind } from './table'
+import { insertSectionBreakAfter, removeSectionBreak } from './section'
 
 export interface BlockPoint {
   blockId: string
@@ -73,6 +75,25 @@ export interface EditorSelection {
   color?: string
   /** 落点在表格格子里时给出表格上下文；不在格子里则没有这个字段 */
   table?: TableSelectionContext
+  /** 光标所在节的上下文；供「节」上下文工具条回显与置灰 */
+  section?: SectionSelectionContext
+}
+
+/**
+ * 光标所在节的上下文。三个开关给的都是**已解析值**（缺省补齐、首节的 linkPrevious
+ * 已强制 false），App 侧据此画 radio 的选中态与禁用态 —— App 手里没有响应式的模型，
+ * 只能吃这一次 emit。
+ */
+export interface SectionSelectionContext {
+  /** 节号（0 = 首节） */
+  index: number
+  /** 总节数 */
+  total: number
+  isFirst: boolean
+  orientation: PageOrientation
+  pageNumbers: boolean
+  linkPrevious: boolean
+  restartAtOne: boolean
 }
 
 /**
@@ -463,18 +484,18 @@ export function updateComment(doc: DocModel, commentId: number, text: string): b
 /**
  * 在 blockId 之后插入一个分页符或分节符，返回新块的 id。
  * blockId 找不到（或没给）时追加到文末。
+ *
+ * 分节符走 edit/section.ts 的封装 —— 它还要同步 `doc.sections`，别在这里另写一份。
  */
 export function insertBreakAfter(
   doc: DocModel,
   blockId: string | undefined,
   kind: 'page' | 'section',
 ): string {
+  if (kind === 'section') return insertSectionBreakAfter(doc, blockId)
   const found = blockId === undefined ? -1 : doc.blocks.findIndex((b) => b.id === blockId)
   const at = found < 0 ? doc.blocks.length : found + 1
-  const block: Block =
-    kind === 'page'
-      ? { t: 'pageBreak', id: nextBlockId('pg') }
-      : { t: 'sectionBreak', id: nextBlockId('s'), restartNumbering: true }
+  const block: Block = { t: 'pageBreak', id: nextBlockId('pg') }
   doc.blocks.splice(at, 0, block)
   return block.id
 }
@@ -485,14 +506,18 @@ export function insertBreakAfter(
  *
  * 早先这里只拒 textBlock，于是拿一张表的 id 调进来会把整张表静默删掉 —— 是个陷阱，
  * 现已收紧：其余块一律返回 false 且一个字节都不改。
+ * 删分节符还要同步摘掉 `doc.sections` 里对应的那一项（转交 edit/section.ts）。
  */
 export function removeBreak(doc: DocModel, blockId: string): boolean {
   const index = doc.blocks.findIndex((b) => b.id === blockId)
   const block = doc.blocks[index]
   if (index < 0 || !block) return false
-  if (block.t !== 'pageBreak' && block.t !== 'sectionBreak') return false
-  doc.blocks.splice(index, 1)
-  return true
+  if (block.t === 'pageBreak') {
+    doc.blocks.splice(index, 1)
+    return true
+  }
+  if (block.t === 'sectionBreak') return removeSectionBreak(doc, blockId)
+  return false
 }
 
 /** 删除整条批注及其锚点（父批注连同回复一起删） */
@@ -550,5 +575,8 @@ export function cloneDoc(doc: DocModel): DocModel {
       }
     }),
     comments: doc.comments.map((c) => ({ ...c })),
+    // sections 是文档级数组，漏拷会让撤销 / 渲染快照与编辑中的模型共享引用，
+    // 于是「切到别的节改方向」会连带改到快照，撤销也回不去
+    ...(doc.sections ? { sections: doc.sections.map((s) => ({ ...s })) } : {}),
   }
 }

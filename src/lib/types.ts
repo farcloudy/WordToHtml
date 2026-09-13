@@ -50,15 +50,36 @@ export interface BreakInline {
 
 export type Inline = TextInline | CommentStartInline | CommentEndInline | BreakInline
 
+/** 纸张方向。landscape 时纸张宽高互换（换算只在 resolveSections 一处做）。 */
+export type PageOrientation = 'portrait' | 'landscape'
+
 /**
- * 分节符。对应 md 里的独立一行 `---`。
- * 分节在 Word 里意味着：新的一页 + 独立的页眉页脚（页码可以重新从 1 开始）。
+ * 一节的设置。字段全部可选：**只存被显式改过的值**，缺省由
+ * resolveSectionSettings() 一处解析（预览 / 分页 / 导出 / 上下文工具条同源）。
+ *
+ * 为什么不把默认值写进模型：默认值是一份真相，写进模型就成了两份；
+ * 而且「只写非默认值」正是 md 往返字节稳定的前提（见 md/serialize.ts）。
+ */
+export interface SectionSettings {
+  /** 本节是否显示页码（默认 true）。linkPrevious 为 true 时无意义 */
+  pageNumbers?: boolean
+  /** 页码与页脚是否沿用前一节（默认 true）。首节没有前节，解析时恒 false */
+  linkPrevious?: boolean
+  /** 本节页码是否从 1 重新起算（默认 false）。linkPrevious 为 true 时无意义 */
+  restartAtOne?: boolean
+  /** 纸张方向（默认 portrait） */
+  orientation?: PageOrientation
+}
+
+/**
+ * 分节符。对应 md 里的独立一行 `---`（可带 kwargs）。
+ *
+ * 它只是**分隔符**：节的具体设置挂在下标对应的 DocModel.sections 上，
+ * 不随分节符走 —— 这样首节（没有分节符承载它）与其余各节在形状上完全对称。
  */
 export interface SectionBreakBlock {
   t: 'sectionBreak'
   id: string
-  /** 本节页码是否从 1 重新开始 */
-  restartNumbering: boolean
 }
 
 /**
@@ -177,6 +198,15 @@ export interface CommentDef {
 export interface DocModel {
   blocks: Block[]
   comments: CommentDef[]
+  /**
+   * 逐节设置，**下标 = 节号**（0 = 首节）。
+   *
+   * 不变式：`sections.length === 分节符数 + 1`；整篇只有一节且全默认时可以不写这个字段。
+   * 只存非默认值：整节全默认时这一项是 `{}`。
+   * 解析侧（resolveSections）必须容忍字段缺失 / 数组偏短（手搓模型、旧 md、旧 docx 读回），
+   * 缺项一律按全默认处理。
+   */
+  sections?: SectionSettings[]
 }
 
 export const emptyDoc = (): DocModel => ({ blocks: [], comments: [] })

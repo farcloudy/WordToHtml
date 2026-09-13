@@ -26,6 +26,7 @@ import {
   cloneDoc,
   commentScopes,
   containerLength,
+  contentBoxPx,
   deleteRange,
   findBlock,
   findCell,
@@ -36,6 +37,7 @@ import {
   insertBodyRow,
   insertBreakAfter,
   insertColumn,
+  insertSectionBreakAfter,
   insertText,
   mergeIntoPrevious,
   normalizeBlocks,
@@ -51,18 +53,25 @@ import {
   removeBreak,
   removeColumn,
   removeComment,
+  removeSectionBreak,
   removeTable,
   renderTableFragment,
   replyComment,
   replaceMatches,
   replaceRange,
+  resolveSectionSettings,
+  resolveSections,
   resolveSpec,
+  sectionCountOf,
+  sectionIndexOf,
   setBlockKind,
   setCellAlign,
   setCellKind,
   setContainerKind,
   setMinLines,
   setRoleRow,
+  setSectionSetting,
+  settingsOf,
   sliceInlines,
   splitBlock,
   stepCell,
@@ -414,7 +423,8 @@ console.log('\n=== 9. 批注改写 / 换页标记 ===')
   const last = model.blocks[model.blocks.length - 1]
   eq('没给落点就追加到文末', last.t, 'sectionBreak')
   eq('返回的是分节符 id', last.id, secId)
-  ok('分节符默认重排页码', last.t === 'sectionBreak' && last.restartNumbering === true)
+  // W5：分节符只是分节符，设置挂在 doc.sections 上；新节全默认（关联前节、不重排）
+  ok('新分节符带出一节全默认的设置', sectionCountOf(model) === 2 && settingsOf(model, 1) === undefined)
 
   eq('分页符删得掉', removeBreak(model, pageId), true)
   eq('分页符没了', model.blocks.some((b) => b.t === 'pageBreak'), false)
@@ -425,7 +435,7 @@ console.log('\n=== 9. 批注改写 / 换页标记 ===')
     blocks: [
       { t: 'textBlock', id: 'a', kind: 'attachment', inlines: [{ t: 'text', text: '附件一' }] },
       { t: 'pageBreak', id: 'p' },
-      { t: 'sectionBreak', id: 's', restartNumbering: true },
+      { t: 'sectionBreak', id: 's' },
     ],
     comments: [],
   }
@@ -1347,7 +1357,7 @@ console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两�
     const breaks = {
       blocks: [
         { t: 'pageBreak', id: 'pg1' },
-        { t: 'sectionBreak', id: 's1', restartNumbering: true },
+        { t: 'sectionBreak', id: 's1' },
         { t: 'textBlock', id: 't0', kind: 'body', inlines: [] },
       ],
       comments: [],
@@ -1470,6 +1480,183 @@ console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两�
       JSON.stringify(normalizeBlocks(defModel)),
     )
   }
+}
+
+console.log('\n=== 21. 节编辑：模型操作 / 不变式 / md 往返（W5）===')
+{
+  /** 「块 + 逐节设置」的完整形状（normalizeBlocks 只管 blocks，W5 起 sections 也算结构） */
+  const shape = (doc) =>
+    JSON.stringify({ blocks: normalizeBlocks(doc), sections: doc.sections ?? null })
+
+  // ---- A. sectionIndexOf：段落 / 格子里 / 分节符上 / 不存在的 id ----
+  const doc = parseMd('甲\n\n---\n\n乙\n\n:::table\n| 丙 |\n:::\n\n---\n\n丁')
+  const [a, s1, b, tb, , d] = doc.blocks
+  eq('sectionCountOf = 分节符数 + 1', sectionCountOf(doc), 3)
+  eq('首节（甲）', sectionIndexOf(doc, a.id), 0)
+  eq('分节符归到它终结的那一节', sectionIndexOf(doc, s1.id), 0)
+  eq('第二节（乙）', sectionIndexOf(doc, b.id), 1)
+  eq('格子里也算所在节（先归到那张表）', sectionIndexOf(doc, cellId(tb.id, 0, 0)), 1)
+  eq('第三节（丁）', sectionIndexOf(doc, d.id), 2)
+  eq('不存在的 id 兜底为首节', sectionIndexOf(doc, 'nope'), 0)
+
+  // ---- B. setSectionSetting：只落非默认值，无意义的组合被归一化 ----
+  const m = parseMd('甲\n\n---\n\n乙\n\n---\n\n丙')
+  // 「关联前节」默认是「是」，此时另两项被它接管 —— 直接设 restartAtOne 是空操作
+  setSectionSetting(m, 1, { restartAtOne: true })
+  eq('关联前节时设 restart 是空操作', settingsOf(m, 1), undefined)
+  setSectionSetting(m, 1, { linkPrevious: false })
+  eq('关联前节=否（非默认）落字段', settingsOf(m, 1)?.linkPrevious, false)
+  setSectionSetting(m, 1, { restartAtOne: true })
+  eq('独立后设 restart 才落字段', settingsOf(m, 1)?.restartAtOne, true)
+  eq(
+    '两项并存',
+    JSON.stringify(settingsOf(m, 1)),
+    JSON.stringify({ linkPrevious: false, restartAtOne: true }),
+  )
+  setSectionSetting(m, 1, { pageNumbers: true })
+  eq('页码=默认值 true 不落字段', 'pageNumbers' in (settingsOf(m, 1) ?? {}), false)
+  setSectionSetting(m, 1, { orientation: 'portrait' })
+  eq('方向=默认值 portrait 不落字段', 'orientation' in (settingsOf(m, 1) ?? {}), false)
+  setSectionSetting(m, 1, { linkPrevious: true })
+  eq('关联前节回默认值 → 字段删掉', settingsOf(m, 1), undefined)
+  eq('全文都回到默认 → sections 整个删掉', m.sections, undefined)
+
+  setSectionSetting(m, 0, { linkPrevious: false })
+  eq('首节的 linkPrevious 无意义 → 不落字段', m.sections, undefined)
+  setSectionSetting(m, 0, { pageNumbers: false })
+  eq('首节可以关掉页码', settingsOf(m, 0)?.pageNumbers, false)
+  setSectionSetting(m, 99, { orientation: 'landscape' })
+  eq('节号越界是空操作（不变式不被撑坏）', m.sections?.length, sectionCountOf(m))
+  eq('越界写入没落进去', 'orientation' in (settingsOf(m, 99) ?? {}), false)
+
+  const clean = parseMd('甲\n\n---\n\n乙')
+  setSectionSetting(clean, 1, { linkPrevious: false })
+  setSectionSetting(clean, 1, { linkPrevious: true })
+  eq('全默认后 sections 整个删掉（不留等价空壳）', clean.sections, undefined)
+  eq('md 也不写 kwargs', toMd(clean), '甲\n---\n乙')
+
+  // ---- C. 增删分节符与 sections 同步（不变式：长度 = 分节符数 + 1）----
+  const ins = parseMd('甲\n\n乙')
+  setSectionSetting(ins, 0, { orientation: 'landscape' })
+  const sId = insertSectionBreakAfter(ins, ins.blocks[0].id)
+  eq('插入后 2 节', sectionCountOf(ins), 2)
+  eq('sections 同步到 2 项', ins.sections?.length, 2)
+  eq('不变式成立', ins.sections?.length, sectionCountOf(ins))
+  eq('首节的设置没被挪走', ins.sections?.[0]?.orientation, 'landscape')
+  eq('新节不沿用前一节的横向（全默认）', JSON.stringify(ins.sections?.[1]), '{}')
+  eq('新分节符就在「甲」之后', ins.blocks[1].id, sId)
+  eq('删分节符返回 true', removeSectionBreak(ins, sId), true)
+  eq('删完 1 节', sectionCountOf(ins), 1)
+  eq('sections 同步回 1 项', ins.sections?.length, 1)
+  eq('删掉的是它开启的那一节（首节设置仍在）', ins.sections?.[0]?.orientation, 'landscape')
+  eq('removeSectionBreak 不吃段落', removeSectionBreak(ins, ins.blocks[0].id), false)
+  eq('拿不存在 id 也返回 false', removeSectionBreak(ins, 'nope'), false)
+
+  // 中间插入：设置项要跟着下标往后挪
+  const mid = parseMd('甲\n\n---\n\n乙\n\n---\n\n丙')
+  setSectionSetting(mid, 2, { linkPrevious: false, restartAtOne: true })
+  const newId = insertSectionBreakAfter(mid, mid.blocks[0].id)
+  eq('插入后 4 节', sectionCountOf(mid), 4)
+  eq('原来的第 3 节设置挪到第 4 节', mid.sections?.[3]?.restartAtOne, true)
+  eq('新插入的是第 2 节（全默认）', JSON.stringify(mid.sections?.[1]), '{}')
+  eq('第 1 节未受影响', JSON.stringify(mid.sections?.[0]), '{}')
+  eq('删掉刚插的那个', removeSectionBreak(mid, newId), true)
+  eq('设置挪回第 3 节', mid.sections?.[2]?.restartAtOne, true)
+  eq('不变式仍成立', mid.sections?.length, sectionCountOf(mid))
+
+  // ---- D. resolveSections：继承 / 方向换算 / 缺项兜底 ----
+  const spec = resolveSpec()
+  const rs0 = resolveSectionSettings(undefined, false)
+  eq(
+    '缺省 = numbers on / link on / restart off / portrait',
+    JSON.stringify([rs0.pageNumbers, rs0.linkPrevious, rs0.restartAtOne, rs0.orientation]),
+    JSON.stringify([true, true, false, 'portrait']),
+  )
+  eq('首节 linkPrevious 被强制 false', resolveSectionSettings({ linkPrevious: true }, true).linkPrevious, false)
+
+  const rd = parseMd('甲\n\n---\n\n乙\n\n---\n\n丙')
+  setSectionSetting(rd, 0, { pageNumbers: false })
+  const rs1 = resolveSections(rd, spec)
+  eq('解析出 3 节', rs1.length, 3)
+  eq('首节显示结果 = 自己关掉了页码', rs1[0].showPageNumber, false)
+  eq('第 1 节默认关联前节', rs1[1].settings.linkPrevious, true)
+  eq('第 1 节继承「不显示页码」', rs1[1].showPageNumber, false)
+  eq('第 2 节继续继承', rs1[2].showPageNumber, false)
+  eq('纵向时纸宽 = 规格表', rs1[1].page.size.width, spec.page.size.width)
+  eq('版心宽与 contentBoxPx 同源', rs1[1].content.width, contentBoxPx(spec).width)
+
+  setSectionSetting(rd, 1, { linkPrevious: false, pageNumbers: true })
+  const rs2 = resolveSections(rd, spec)
+  eq('第 1 节独立后重新显示页码', rs2[1].showPageNumber, true)
+  eq('第 2 节仍关联前节 → 跟着变 true', rs2[2].showPageNumber, true)
+
+  setSectionSetting(rd, 1, { orientation: 'landscape' })
+  const rs3 = resolveSections(rd, spec)
+  eq('横向：纸宽 = 规格表的高', rs3[1].page.size.width, spec.page.size.height)
+  eq('横向：纸高 = 规格表的宽', rs3[1].page.size.height, spec.page.size.width)
+  // 四边 25mm 对称，所以横向版心高恰等于纵向版心宽
+  eq('横向：版心高 = 纵向版心宽', rs3[1].content.height, contentBoxPx(spec).width)
+  eq('其余节不受影响', rs3[0].page.size.width, spec.page.size.width)
+
+  const hand = parseMd('甲\n\n---\n\n乙')
+  eq('手搓模型（无 sections）也解析出 2 节', resolveSections(hand, spec).length, 2)
+  eq('缺项按全默认（显示页码）', resolveSections(hand, spec)[1].showPageNumber, true)
+  const short = {
+    blocks: hand.blocks,
+    comments: [],
+    sections: [{ orientation: 'landscape' }],
+  }
+  const rsShort = resolveSections(short, spec)
+  eq('sections 偏短也解析出 2 节', rsShort.length, 2)
+  eq('偏短的第 1 节按全默认', rsShort[1].settings.restartAtOne, false)
+  eq('已有的第 0 项仍生效', rsShort[0].settings.orientation, 'landscape')
+
+  // ---- E. md 往返：非默认值收敛、字节稳定 ----
+  const src = [
+    '::section numbers=off',
+    '甲',
+    '',
+    '--- link=off restart=on',
+    '',
+    '乙',
+    '',
+    '--- orientation=landscape',
+    '',
+    '丙',
+  ].join('\n')
+  const md = parseMd(src)
+  eq('首节 ::section 读出来', JSON.stringify(settingsOf(md, 0)), JSON.stringify({ pageNumbers: false }))
+  eq(
+    '第 1 节 kwargs 读出来',
+    JSON.stringify(settingsOf(md, 1)),
+    JSON.stringify({ linkPrevious: false, restartAtOne: true }),
+  )
+  eq('第 2 节 kwargs 读出来', JSON.stringify(settingsOf(md, 2)), JSON.stringify({ orientation: 'landscape' }))
+  // toMd 不写空行（本项目 md 的既有约定：空行只起分隔作用，不产出内容）
+  const out = [
+    '::section numbers=off',
+    '甲',
+    '--- link=off restart=on',
+    '乙',
+    '--- orientation=landscape',
+    '丙',
+  ].join('\n')
+  eq('序列化写回 kwargs（token 顺序固定）', toMd(md), out)
+  eq('再往返一次字节仍稳定', toMd(parseMd(out)), out)
+  eq('往返结构一致（含 sections）', shape(parseMd(out)), shape(md))
+
+  // 写出默认值会被归一化掉（与围栏 minLines=1 / 格内 {@listItem|…} 同一个约定）
+  const obvious = parseMd('甲\n\n--- link=on numbers=on restart=off orientation=portrait\n\n乙')
+  eq('显式写出的默认值不落字段', obvious.sections, undefined)
+  eq('也不写回去', toMd(obvious), '甲\n---\n乙')
+  const meaningless = parseMd('甲\n\n--- numbers=off\n\n乙')
+  eq('关联前节时 numbers 无意义 → 不落字段', settingsOf(meaningless, 1), undefined)
+  eq('也不写回去', toMd(meaningless), '甲\n---\n乙')
+
+  // 首节指令只认文档第一处非空行，正文里的 ::section 是普通文字
+  const notFirst = parseMd('甲\n\n::section numbers=off')
+  eq('正文里的 ::section 不当指令', toMd(notFirst), '甲\n::section numbers=off')
+  eq('也不产生 sections', notFirst.sections, undefined)
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

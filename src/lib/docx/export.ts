@@ -27,6 +27,7 @@ import {
   LineRuleType,
   PageBreak,
   PageNumber,
+  PageOrientation,
   Packer,
   Paragraph,
   Table,
@@ -64,6 +65,7 @@ import type {
 } from '../types'
 import { defaultCellAlignH } from '../types'
 import { computeNumbering } from '../numbering'
+import { resolveSections } from '../section'
 import { lineUnitPlan, patchStylesXml } from './lineUnits'
 
 export interface ExportMeta {
@@ -165,11 +167,17 @@ export function paragraphStyles(spec: Spec): IParagraphStyleOptions[] {
   })
 }
 
-/** 页码段落。字体字号对齐全部来自「页脚」样式（Word 内置样式名）。 */
-function pageNumberParagraph(spec: Spec): Paragraph {
+/**
+ * 页码段落。字体字号对齐全部来自「页脚」样式（Word 内置样式名）。
+ *
+ * `showNumbers` 为 false 时给一个**空段落**：这一节不显示页码时不能什么都不写 ——
+ * 不写页脚引用就等于「沿用前一节的页脚」，那前一节的页码会带着跑过来，
+ * 「无页码」这个要求就落空了（见 PLAN 7.2 指出的那个坑）。
+ */
+function pageNumberParagraph(spec: Spec, showNumbers: boolean): Paragraph {
   return new Paragraph({
     style: spec.styles.footer.id,
-    children: [new TextRun({ children: [PageNumber.CURRENT] })],
+    ...(showNumbers ? { children: [new TextRun({ children: [PageNumber.CURRENT] })] } : {}),
   })
 }
 
@@ -410,17 +418,16 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
 }
 
 interface SectionGroup {
-  restartNumbering: boolean
   /** 本节里的块，含分页符（分节符本身不进组，它只负责切组） */
   blocks: (TextBlock | PageBreakBlock | TableBlock)[]
 }
 
 /** 按分节符把内容切成若干节。分节符在 Word 里意味着新起一页 + 独立的页码序列。 */
 function groupSections(doc: DocModel): SectionGroup[] {
-  const groups: SectionGroup[] = [{ restartNumbering: true, blocks: [] }]
+  const groups: SectionGroup[] = [{ blocks: [] }]
   for (const block of doc.blocks) {
     if (block.t === 'sectionBreak') {
-      groups.push({ restartNumbering: block.restartNumbering, blocks: [] })
+      groups.push({ blocks: [] })
       continue
     }
     groups[groups.length - 1]?.blocks.push(block)
@@ -475,14 +482,32 @@ export function buildDocument(
   const numbering = computeNumbering(doc.blocks, (b: Block) =>
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
-  const sections: ISectionOptions[] = groupSections(doc).map((group) => {
+  const liveSections = resolveSections(doc, spec)
+  const sections: ISectionOptions[] = groupSections(doc).map((group, index) => {
     const children = sectionParagraphs(group, spec, numbering)
     if (children.length === 0) children.push(new Paragraph({}))
+
+    // groupSections 与 resolveSections 数的是同一件事（分节符数 + 1），下标一一对应；
+    // 兜底到首节只是防御（真到那一步说明两处对分节符的看法分了家）
+    const section = liveSections[index] ?? liveSections[0]
+    const settings = section?.settings
+    /** 关联前节 = 不写页脚引用，Word 自会沿用前一节的页脚（PLAN 7.2） */
+    const linkPrevious = settings?.linkPrevious ?? true
 
     return {
       properties: {
         page: {
-          size: { width: spec.page.size.width, height: spec.page.size.height },
+          size: {
+            // 宽高按**纵向**给：docx 库的 createPageSize 在 orientation=landscape 时
+            // 会自己把 w/h 互换（node_modules/docx 实测，2026-09-13）。
+            // 这里若再手动换一次，就会换两遍 → 纸变成「纵向尺寸 + 横向标记」。
+            width: spec.page.size.width,
+            height: spec.page.size.height,
+            orientation:
+              settings?.orientation === 'landscape'
+                ? PageOrientation.LANDSCAPE
+                : PageOrientation.PORTRAIT,
+          },
           margin: {
             top: spec.page.margin.top,
             right: spec.page.margin.right,
@@ -491,7 +516,8 @@ export function buildDocument(
             header: spec.page.header,
             footer: spec.page.footer,
           },
-          ...(group.restartNumbering ? { pageNumbers: { start: 1 } } : {}),
+          // w:pgNumType 只在「从 1 重排」时写；不写就接着上一节往下数
+          ...(settings?.restartAtOne ? { pageNumbers: { start: 1 } } : {}),
         },
         // 文档网格。Word 的「行」单位段距（w:beforeLines）以它的 linePitch 为基准，
         // 没有它 Word 会按一套我们控制不了的行高去算，段间距就对不上了。
@@ -502,7 +528,17 @@ export function buildDocument(
           linePitch: ptToTwips(spec.page.gridLinePt),
         },
       },
-      footers: { default: new Footer({ children: [pageNumberParagraph(spec)] }) },
+      // 关联前节时**整个 footers 都不写** —— 不写才没有 <w:footerReference>，
+      // Word 才会沿用前一节的页脚。写了（哪怕是空页脚）就等于本节自带页脚。
+      ...(linkPrevious
+        ? {}
+        : {
+            footers: {
+              default: new Footer({
+                children: [pageNumberParagraph(spec, settings?.pageNumbers ?? true)],
+              }),
+            },
+          }),
       children,
     }
   })

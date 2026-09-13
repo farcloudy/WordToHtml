@@ -757,7 +757,14 @@ try {
   /* ------------------------------------------------------------------ */
   console.log('\n=== H6. 文末插分节符：Word 会多留一张空白页 ===')
   await openApp()
-  const beforeTail = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  const beforeTail = await page.evaluate(() => {
+    const pages = Array.from(document.querySelectorAll('.wtp-page'))
+    const last = pages[pages.length - 1]
+    return {
+      pages: pages.length,
+      lastNumber: (last?.querySelector('.wtp-page-number')?.textContent ?? '').trim(),
+    }
+  })
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('2026年9月12日'))
   await page.click('button.tool[title^="在光标所在段落后插入分节符"]')
   await page.waitForTimeout(300)
@@ -770,9 +777,15 @@ try {
       lastNumber: (last?.querySelector('.wtp-page-number')?.textContent ?? '').trim(),
     }
   })
-  eq('文末分节符多留了一张空白页', tail.pages, beforeTail + 1)
+  eq('文末分节符多留了一张空白页', tail.pages, beforeTail.pages + 1)
   eq('最后一张确实没有片段', tail.lastFragments, 0)
-  eq('空白页页码重排为 1', tail.lastNumber, '1')
+  // W5：新插的分节符是**全默认**（关联前节 + 不重排），所以空白页的页码接着前一节往下数。
+  // 旧行为是「每插一个分节符就从 1 重排」，那个默认值已被用户改掉（需求：默认关联前节）。
+  eq(
+    '空白页页码接着前一节往下数（新分节符默认不重排）',
+    tail.lastNumber,
+    String(Number(beforeTail.lastNumber) + 1),
+  )
   await checkNoOverflow('H6 文末分节符后')
 
   /* ------------------------------------------------------------------ */
@@ -1128,6 +1141,7 @@ try {
         '.styles',
         '.toolbar',
         '.sub-toolbar',
+        '.section-toolbar',
         '.pane-head',
         '.legend',
         'textarea',
@@ -1183,6 +1197,7 @@ try {
     '.styles',
     '.toolbar',
     '.sub-toolbar',
+    '.section-toolbar',
     '.wtp-comments',
     '.wtp-measure-root',
     '.wtp-break',
@@ -1704,7 +1719,9 @@ try {
       min2: document.querySelectorAll('.wtp-table.wtp-table-min2').length,
       min1: document.querySelectorAll('.wtp-table.wtp-table-min1').length,
     }))
-  const subToolbar = page.locator('.sub-toolbar')
+  // W5 起编辑模式常驻一条「节」工具条，它也在 .sub-toolbar 上（共用外观）；
+  // 表格那一条靠 :not(.section-toolbar) 排掉，否则下面的 count()===0 会永远不成立
+  const subToolbar = page.locator('.sub-toolbar:not(.section-toolbar)')
   const subButton = (name) => subToolbar.getByRole('button', { name, exact: true })
   /** 上下文工具条里某个 radio 组里的一个选项（组按左边的标签文字定位，避免「有/无」重名） */
   const subRadio = (group, name) =>
@@ -2079,6 +2096,186 @@ try {
     pagesBeforeAlign,
   )
   await checkNoOverflow('W5 两组对齐后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== S. 「节」工具条（W5）：回显 / 置灰 / 改方向与页码 ===')
+  await openApp()
+  // 编辑模式常驻：节工具条与表格工具条同在一层，但节这条永远在
+  const secToolbar = page.locator('.section-toolbar')
+  const secRadio = (group, name) =>
+    secToolbar.locator('.tk-group', { hasText: group }).getByRole('radio', { name, exact: true })
+  /** 读回节工具条的回显：节号提示 + 四组 radio 的选中项与整组是否置灰 */
+  const secState = () =>
+    page.evaluate(() => {
+      const bar = document.querySelector('.section-toolbar')
+      if (!bar) return null
+      const groups = Array.from(bar.querySelectorAll('.tk-group'))
+      const read = (name) => {
+        const group = groups.find((g) => (g.textContent ?? '').includes(name))
+        if (!group) return null
+        const radios = Array.from(group.querySelectorAll('input[type="radio"]'))
+        return {
+          label: radios
+            .filter((i) => i.checked)
+            .map((i) => (i.closest('label')?.textContent ?? '').trim())
+            .join(','),
+          disabled: radios.length > 0 && radios.every((i) => i.disabled),
+        }
+      }
+      return {
+        hint: (bar.querySelector('.tk-hint')?.textContent ?? '').trim(),
+        orientation: read('方向'),
+        numbers: read('页码'),
+        link: read('关联前节'),
+        restart: read('从 1 开始'),
+      }
+    })
+  /** 每张纸的几何与它挂的命名页（判断横竖混排只看这两个数） */
+  const paperState = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('.wtp-page')).map((el) => {
+        const rect = el.getBoundingClientRect()
+        return {
+          page: el.style.getPropertyValue('page'),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          number: (el.querySelector('.wtp-page-number')?.textContent ?? '').trim(),
+        }
+      }),
+    )
+
+  ok('编辑模式下「节」工具条常驻', (await secToolbar.count()) === 1)
+
+  // 首节：没有前节 → 「关联前节」整组置灰；恒从 1 开始 → 「从 1 开始」整组置灰
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(250)
+  const s0 = await secState()
+  eq('节号回显（首节）', s0?.hint, '第 1 节 / 共 2 节')
+  eq('首节方向回显为纵向', s0?.orientation?.label, '纵向')
+  ok('首节「关联前节」整组置灰（没有前节）', s0?.link?.disabled === true)
+  ok('首节「从 1 开始」整组置灰（恒从 1 开始）', s0?.restart?.disabled === true)
+  ok('首节「页码」可用（首节可以关掉页码）', s0?.numbers?.disabled === false)
+  eq('首节页码回显为开', s0?.numbers?.label, '开')
+
+  // 第 2 节：样本里写的是 `--- link=off restart=on`
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('2026年9月12日'))
+  await page.waitForTimeout(250)
+  const s1 = await secState()
+  eq('节号回显（第 2 节）', s1?.hint, '第 2 节 / 共 2 节')
+  ok('第 2 节「关联前节」可用', s1?.link?.disabled === false)
+  eq('样本里第 2 节声明了 link=off → 回显「否」', s1?.link?.label, '否')
+  eq('样本里第 2 节声明了 restart=on → 回显「是」', s1?.restart?.label, '是')
+
+  // 点「方向 → 横向」：只有这一节的纸变成横的（宽 > 高），首节仍是纵的
+  const papersBefore = await paperState()
+  await secRadio('方向', '横向').click()
+  await page.waitForTimeout(400)
+  const papersAfter = await paperState()
+  eq(
+    '模型里第 2 节记成 landscape',
+    await page.evaluate(() => window.__wtpPaper.getModel().sections?.[1]?.orientation),
+    'landscape',
+  )
+  const portraitPapers = papersAfter.filter((p) => p.page === 'wtp-portrait')
+  const landscapePapers = papersAfter.filter((p) => p.page === 'wtp-landscape')
+  ok('改完有横排的纸', landscapePapers.length > 0, JSON.stringify(papersAfter))
+  ok(
+    '横排的纸宽 > 高',
+    landscapePapers.every((p) => p.width > p.height),
+    JSON.stringify(landscapePapers[0]),
+  )
+  ok(
+    '纵排的纸仍是宽 < 高（只有那一节被改）',
+    portraitPapers.length > 0 && portraitPapers.every((p) => p.width < p.height),
+    JSON.stringify(portraitPapers[0]),
+  )
+  ok(
+    '横排纸的宽高恰好是纵排纸的对调',
+    landscapePapers[0]?.width === portraitPapers[0]?.height &&
+      landscapePapers[0]?.height === portraitPapers[0]?.width,
+    `${JSON.stringify(landscapePapers[0])} vs ${JSON.stringify(portraitPapers[0])}`,
+  )
+  eq(
+    '横竖混排没有多出纸来（页数不变）',
+    papersAfter.length,
+    papersBefore.length,
+  )
+
+  // 点「页码 → 关」：这一节（横排那几页）不再有页码元素，其它节不受影响
+  await secRadio('页码', '关').click()
+  await page.waitForTimeout(400)
+  const mutedPapers = await paperState()
+  ok(
+    '横排节不再显示页码',
+    mutedPapers.filter((p) => p.page === 'wtp-landscape').every((p) => p.number === ''),
+    JSON.stringify(mutedPapers),
+  )
+  ok(
+    '纵排节照旧显示页码',
+    mutedPapers
+      .filter((p) => p.page === 'wtp-portrait')
+      .every((p) => /^\d+$/.test(p.number)),
+    JSON.stringify(mutedPapers),
+  )
+  eq(
+    '模型里第 2 节 numbers=false',
+    await page.evaluate(() => window.__wtpPaper.getModel().sections?.[1]?.pageNumbers),
+    false,
+  )
+
+  // 还原：页码回开、方向回纵向；模型里也不再留冗余字段
+  await secRadio('页码', '开').click()
+  await page.waitForTimeout(300)
+  await secRadio('方向', '纵向').click()
+  await page.waitForTimeout(400)
+  const restored = await secState()
+  eq('还原后方向回显纵向', restored?.orientation?.label, '纵向')
+  eq('还原后页码回显开', restored?.numbers?.label, '开')
+  eq(
+    '还原后模型里不留 orientation（默认值不落字段）',
+    await page.evaluate(() => window.__wtpPaper.getModel().sections?.[1]?.orientation),
+    undefined,
+  )
+  ok(
+    '还原后所有纸都是纵排',
+    (await paperState()).every((p) => p.page === 'wtp-portrait' && p.width < p.height),
+  )
+  await checkNoOverflow('S 节设置来回切后')
+
+  // 打印：方向靠两档命名 @page 表达（未命名的 @page 只是兜底），两档尺寸必须互换
+  const namedPageRules = await page.evaluate(() => {
+    const out = []
+    for (const sheet of document.styleSheets) {
+      let rules
+      try {
+        rules = sheet.cssRules
+      } catch {
+        continue
+      }
+      for (const rule of rules) {
+        if (rule.conditionText !== 'print') continue
+        for (const inner of rule.cssRules ?? []) {
+          if (inner.constructor.name !== 'CSSPageRule') continue
+          out.push({ cssText: inner.cssText, size: inner.style.size, margin: inner.style.margin })
+        }
+      }
+    }
+    return out
+  })
+  const portraitRule = namedPageRules.find((r) => r.cssText.includes('wtp-portrait'))
+  const landscapeRule = namedPageRules.find((r) => r.cssText.includes('wtp-landscape'))
+  ok('打印样式里有命名页 wtp-portrait', portraitRule !== undefined, JSON.stringify(namedPageRules))
+  ok('打印样式里有命名页 wtp-landscape', landscapeRule !== undefined, JSON.stringify(namedPageRules))
+  if (portraitRule && landscapeRule) {
+    const p = portraitRule.size.split(/\s+/)
+    const l = landscapeRule.size.split(/\s+/)
+    ok(
+      `两档命名页的 size 恰好互换（${portraitRule.size} ↔ ${landscapeRule.size}）`,
+      p[0] === l[1] && p[1] === l[0],
+      `${JSON.stringify(p)} vs ${JSON.stringify(l)}`,
+    )
+    eq('命名页的外边距归 0（白边由纸张自己的 padding 提供）', landscapeRule.margin, '0px')
+  }
 } finally {
   await browser?.close()
   await server.close()
@@ -2092,10 +2289,11 @@ if (failures.length > 0) {
 }
 console.log(
   '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
-    '金额格式、特殊空格、切文件模板、打印（含新增对齐/删表按钮的隐藏）、查找替换（面板/高亮/范围/替换一处与全部）、' +
+    '金额格式、特殊空格、切文件模板、打印（含新增对齐/删表按钮的隐藏、两档命名 @page）、查找替换（面板/高亮/范围/替换一处与全部）、' +
     '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）、' +
     '表格编辑交互（上下文工具条与落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
     '格首 Backspace 与格尾 Delete 护栏）、表格收尾（Tab/Shift+Tab 与 ←/→ 跨格、最后一格 Tab 无响应、' +
-    '删除整表后插入符落上一块末尾、格内点样式 chip 只改那一格、两组对齐的 active 态与行内样式、对齐不改页数）' +
-    '均落到模型。',
+    '删除整表后插入符落上一块末尾、格内点样式 chip 只改那一格、两组对齐的 active 态与行内样式、对齐不改页数）、' +
+    '节工具条（常驻、节号回显、首节与「关联前节=是」的置灰、改方向后逐页几何横竖互换且页数不变、' +
+    '关页码后该节不再有页码元素而别的节不受影响、默认值不落模型字段）均落到模型。',
 )

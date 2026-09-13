@@ -9,6 +9,7 @@
 import { contentBoxPx, lineSpacePt, ptToPx } from '../spec'
 import type { Spec } from '../spec'
 import { computeNumbering } from '../numbering'
+import { resolveSections } from '../section'
 import type { DocModel } from '../types'
 import { renderInlinesHtml, renderTableFragment } from './html'
 import type { MeasuredBlock, MeasuredItem, MeasuredTableRow } from './paginate'
@@ -151,10 +152,10 @@ function measureElement(
  * 签名里带上渲出来的 HTML，等于把「文字、加粗、颜色、修订、编号」一起算了进去
  * —— 表格的签名含**整张表**的 HTML，任一格改动即失效。
  *
- * **缓存只在同一份规格表下有效**：版心宽度由 spec.page.margin 决定，换文件模板（DOC_TEMPLATES）
- * 就会变，而签名里**故意不含宽度与样式值** —— 否则每次敲键都要为每个块序列化一遍 spec。
- * 所以规格表一变就必须 clearMeasureCache，否则会拿旧版心的量测值算分页；
- * 调用点见 WordPaper.vue 里 props.spec 的 watcher（清缓存 → 还原插入符 → force 重排）。
+ * **签名里还带版心宽度**（`<kind>\0<width>\0<html>`）：W5 起每节可以有各自的页面方向，
+ * 版心宽因此不再全局固定。把宽度写进签名，「换方向 / 换模板就必须清缓存」这条
+ * 不再是靠人记得的约定，而是签名自己保证的（宽度变了签名必然不等）。
+ * clearMeasureCache 仍保留（处理「规格表整体换了一套」这类改动）。
  */
 export type MeasuredCacheValue = MeasuredBlock | MeasuredTableRow[]
 
@@ -165,7 +166,7 @@ export interface MeasureCacheEntry {
 
 export type MeasureCache = Map<string, MeasureCacheEntry>
 
-/** 清空缓存（规格表换了一套样式时必须调用，否则会拿旧样式的量测值） */
+/** 清空缓存（整份规格表换了一套时调用；单块失效靠签名里带的宽度与 HTML 自动完成） */
 export function clearMeasureCache(cache: MeasureCache): void {
   cache.clear()
 }
@@ -173,8 +174,10 @@ export function clearMeasureCache(cache: MeasureCache): void {
 /**
  * 测量整篇文档（带增量缓存）。
  *
- * root 只需是一个已挂载在文档里的元素（用来挂载测量容器）；
- * 测量容器的宽度由版心尺寸决定，与预览页的版心一致。
+ * root 只需是一个已挂载在文档里的元素（用来挂载测量容器）。
+ * 探针宽度**逐节切换**：横排节的版心宽与纵排节不同，量出来的行盒也就不同。
+ * 切换时必须先把上一节的矩形读完（改宽会让已挂进去的元素重排，rect 就变了），
+ * 所以结构是「遇到分节符 → flush 上一批 → 再改宽度」。
  */
 export function measureDocument(
   doc: DocModel,
@@ -185,10 +188,12 @@ export function measureDocument(
   const numbering = computeNumbering(doc.blocks, (b) =>
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
+  const sections = resolveSections(doc, spec)
+  const widthOf = (index: number): number =>
+    (sections[index] ?? sections[0])?.content.width ?? contentBoxPx(spec).width
 
   const probe = document.createElement('div')
   probe.className = 'wtp-probe'
-  probe.style.width = `${contentBoxPx(spec).width}px`
 
   const pending: {
     el: HTMLElement
@@ -208,12 +213,50 @@ export function measureDocument(
   const resolvedTables = new Map<string, MeasuredTableRow[]>()
   const alive = new Set<string>()
 
+  const flush = (): void => {
+    if (pending.length === 0 && pendingTables.length === 0) return
+    root.appendChild(probe)
+    // 强制一次布局，后面读 rect 就不会反复触发回流
+    void probe.getBoundingClientRect()
+
+    for (const item of pending) {
+      const measured = measureElement(item.el, spec, item.kind, item.id, item.length)
+      resolved.set(item.id, measured)
+      cache?.set(item.id, { signature: item.signature, measured })
+    }
+    for (const item of pendingTables) {
+      const rows = measureTableRows(item.el, item.id)
+      resolvedTables.set(item.id, rows)
+      cache?.set(item.id, { signature: item.signature, measured: rows })
+    }
+
+    root.removeChild(probe)
+    // 探针会被下一节复用，上一节的元素必须清掉 —— 留着会让下一节的探针里
+    // 混进上一节的内容，量出来的行盒全错（而且宽度是新的，重排结果无从预料）
+    probe.replaceChildren()
+    pending.length = 0
+    pendingTables.length = 0
+  }
+
+  let sectionIndex = 0
+  probe.style.width = `${widthOf(0)}px`
+
   for (const block of doc.blocks) {
+    if (block.t === 'sectionBreak') {
+      // 先把上一节的矩形读完，再改探针宽度 —— 反了的话量到的是改宽后重排过的版本
+      flush()
+      sectionIndex += 1
+      probe.style.width = `${widthOf(sectionIndex)}px`
+      continue
+    }
+
+    const width = widthOf(sectionIndex)
+
     if (block.t === 'table') {
       // 表格走独立分支：整张表渲进探针，只量每行的实测高（行是原子的，不量 rowStarts）
       alive.add(block.id)
       const html = renderTableFragment(block, 0, block.rows.length)
-      const signature = `table\u0000${html}`
+      const signature = `table\u0000${width}\u0000${html}`
       const cached = cache?.get(block.id)
       if (cached && cached.signature === signature && Array.isArray(cached.measured)) {
         resolvedTables.set(block.id, cached.measured)
@@ -230,7 +273,7 @@ export function measureDocument(
     alive.add(block.id)
     const prefix = numbering.get(block.id) ?? ''
     const html = renderInlinesHtml(block.inlines, prefix)
-    const signature = `${block.kind}\u0000${html}`
+    const signature = `${block.kind}\u0000${width}\u0000${html}`
 
     let length = prefix.length
     for (const inline of block.inlines) {
@@ -250,45 +293,20 @@ export function measureDocument(
     pending.push({ el, kind: block.kind, id: block.id, length, signature })
   }
 
+  flush()
+
   if (cache) {
     for (const id of cache.keys()) {
       if (!alive.has(id)) cache.delete(id)
     }
   }
 
-  if (pending.length > 0 || pendingTables.length > 0) {
-    root.appendChild(probe)
-    // 强制一次布局，后面读 rect 就不会反复触发回流
-    void probe.getBoundingClientRect()
-
-    for (const item of pending) {
-      const measured = measureElement(item.el, spec, item.kind, item.id, item.length)
-      resolved.set(item.id, measured)
-      cache?.set(item.id, { signature: item.signature, measured })
-    }
-
-    for (const item of pendingTables) {
-      const rows = measureTableRows(item.el, item.id)
-      resolvedTables.set(item.id, rows)
-      cache?.set(item.id, { signature: item.signature, measured: rows })
-    }
-
-    root.removeChild(probe)
-  }
-
   return doc.blocks.flatMap<MeasuredItem>((block) => {
     if (block.t === 'sectionBreak') {
-      return [
-        {
-          t: 'break',
-          blockId: block.id,
-          kind: 'section',
-          restartNumbering: block.restartNumbering,
-        },
-      ]
+      return [{ t: 'break', blockId: block.id, kind: 'section' }]
     }
     if (block.t === 'pageBreak') {
-      return [{ t: 'break', blockId: block.id, kind: 'page', restartNumbering: false }]
+      return [{ t: 'break', blockId: block.id, kind: 'page' }]
     }
     if (block.t === 'table') return resolvedTables.get(block.id) ?? []
     const m = resolved.get(block.id)

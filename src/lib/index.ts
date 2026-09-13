@@ -65,8 +65,10 @@ export type {
   Inline,
   InlineHolder,
   PageBreakBlock,
+  PageOrientation,
   RevMark,
   SectionBreakBlock,
+  SectionSettings,
   TableBlock,
   TableCellAlign,
   TableCellModel,
@@ -75,6 +77,19 @@ export type {
   TextBlock,
   TextInline,
 } from './types'
+
+export { resolveSectionSettings, resolveSections } from './section'
+export type { ResolvedSection, ResolvedSectionSettings, SectionRuntime } from './section'
+
+export {
+  insertSectionBreakAfter,
+  normalizeSectionSettings,
+  removeSectionBreak,
+  sectionCountOf,
+  sectionIndexOf,
+  setSectionSetting,
+  settingsOf,
+} from './edit/section'
 
 export { chineseNum, computeNumbering, numberingPrefix, stripAutoNumber } from './numbering'
 
@@ -105,7 +120,13 @@ export {
   splitBlock,
   updateComment,
 } from './edit/model'
-export type { BlockPoint, EditorSelection, InlineContainer, TableSelectionContext } from './edit/model'
+export type {
+  BlockPoint,
+  EditorSelection,
+  InlineContainer,
+  SectionSelectionContext,
+  TableSelectionContext,
+} from './edit/model'
 
 export {
   bodyInsertIndex,

@@ -10,6 +10,7 @@
  */
 
 import type { BlockKind } from '../spec'
+import type { SectionRuntime } from '../section'
 
 export interface MeasuredBlock {
   t: 'block'
@@ -29,7 +30,7 @@ export interface MeasuredBlock {
   rowStarts: number[]
 }
 
-/** 换页的原因：分页符只换页，分节符换页且新开一节（页码可重排） */
+/** 换页的原因：分页符只换页，分节符换页且新开一节（页码是否重排由该节的设置决定） */
 export type BreakKind = 'page' | 'section'
 
 export interface MeasuredBreak {
@@ -37,8 +38,6 @@ export interface MeasuredBreak {
   /** 模型里那个分页符/分节符块的 id，编辑器要按它删除 */
   blockId: string
   kind: BreakKind
-  /** 仅分节符有意义：本节页码是否从 1 重新开始 */
-  restartNumbering: boolean
 }
 
 /**
@@ -95,8 +94,10 @@ export interface PageBreakMark {
 
 export interface PageLayout {
   sectionIndex: number
-  /** 本节内页码，从 1 开始；是否重启用分节符控制 */
+  /** 本节内页码，从 1 开始；是否重启用分节符 + 该节设置控制 */
   pageNumber: number
+  /** 这一页最终显不显示页码（分页器只搬运解析好的结果，不解析「关联前节」） */
+  showPageNumber: boolean
   fragments: PageFragment[]
   /**
    * 这一页底部的换页标记，按出现顺序。
@@ -108,9 +109,16 @@ export interface PageLayout {
   breaks: PageBreakMark[]
 }
 
+/** 一节缺省时的运行时参数：版心高 = 全局值、显示页码、不重排 */
+function defaultRuntime(contentHeight: number): SectionRuntime {
+  return { contentHeight, showPageNumber: true, restartAtOne: false }
+}
+
 export interface PaginateOptions {
-  /** 版心高度（px） */
+  /** 版心高度（px），`sections` 缺项时的兜底 */
   contentHeight: number
+  /** 逐节运行时参数（下标 = 节号）。缺项一律用 contentHeight / 显示页码 / 不重排兜底 */
+  sections?: readonly SectionRuntime[]
   /** 孤行控制，默认开启 */
   widowOrphan?: boolean
 }
@@ -119,30 +127,40 @@ export function paginate(
   items: readonly MeasuredItem[],
   options: PaginateOptions,
 ): PageLayout[] {
-  const contentHeight = options.contentHeight
   const widowOrphan = options.widowOrphan !== false
+  const runtimeOf = (index: number): SectionRuntime =>
+    options.sections?.[index] ?? defaultRuntime(options.contentHeight)
 
   const pages: PageLayout[] = []
   let sectionIndex = 0
   let pageNumber = 1
+  // 逐节版心高：横竖混排时每节不同，装箱只能按当前节算。换节时在 stepNumbering 里跟着换。
+  let contentHeight = runtimeOf(0).contentHeight
   let fragments: PageFragment[] = []
   let cursor = 0
 
   /** 收尾当前页。页码只在当前页确实有内容时才前进，避免留下空白页。 */
   const newPage = (): void => {
     if (fragments.length > 0) {
-      pages.push({ sectionIndex, pageNumber, fragments, breaks: [] })
+      pages.push({
+        sectionIndex,
+        pageNumber,
+        showPageNumber: runtimeOf(sectionIndex).showPageNumber,
+        fragments,
+        breaks: [],
+      })
       fragments = []
       pageNumber += 1
     }
     cursor = 0
   }
 
-  /** 换页标记落下时，推进节号与页码。分节符新开一节，页码是否重排由它自己说了算。 */
+  /** 换页标记落下时，推进节号与页码。分节符新开一节，页码是否重排由该节设置说了算。 */
   const stepNumbering = (item: MeasuredBreak): void => {
     if (item.kind === 'section') {
       sectionIndex += 1
-      pageNumber = item.restartNumbering ? 1 : pageNumber + 1
+      contentHeight = runtimeOf(sectionIndex).contentHeight
+      pageNumber = runtimeOf(sectionIndex).restartAtOne ? 1 : pageNumber + 1
     } else {
       pageNumber += 1
     }
@@ -196,6 +214,7 @@ export function paginate(
         pages.push({
           sectionIndex,
           pageNumber,
+          showPageNumber: runtimeOf(sectionIndex).showPageNumber,
           fragments,
           breaks: [...pending, mark],
         })
@@ -268,7 +287,13 @@ export function paginate(
   }
 
   if (fragments.length > 0) {
-    pages.push({ sectionIndex, pageNumber, fragments, breaks: [...pending] })
+    pages.push({
+      sectionIndex,
+      pageNumber,
+      showPageNumber: runtimeOf(sectionIndex).showPageNumber,
+      fragments,
+      breaks: [...pending],
+    })
   } else if (
     pages.length === 0 ||
     (pages[pages.length - 1]?.sectionIndex ?? -1) !== sectionIndex
@@ -276,7 +301,13 @@ export function paginate(
     // 这一节一页都还没有：文末是分节符，或者整篇为空。
     // Word 会给这样的节留一张空白页（实测：内容 + 文末分节符 → Word 报 2 页 2 节），
     // 不补的话预览会比 Word 少一页，而「预览页数 = Word 页数」正是这个组件的前提。
-    pages.push({ sectionIndex, pageNumber, fragments: [], breaks: [...pending] })
+    pages.push({
+      sectionIndex,
+      pageNumber,
+      showPageNumber: runtimeOf(sectionIndex).showPageNumber,
+      fragments: [],
+      breaks: [...pending],
+    })
   }
 
   return pages

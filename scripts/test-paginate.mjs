@@ -109,14 +109,20 @@ console.log('\n=== 5. 孤行控制：4 行以上可以拆，且两侧各留 2 �
   eq('第2页承接的行数', (pages[1].fragments[0].to - pages[1].fragments[0].from) / 10, 3)
 }
 
-console.log('\n=== 6. 分节符：新起一页 + 页码重排 ===')
+console.log('\n=== 6. 分节符：新起一页 + 页码按该节设置重排 ===')
 {
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 's0', kind: 'section', restartNumbering: true },
+    { t: 'break', blockId: 's0', kind: 'section' },
     block('b', { rows: 1, length: 10 }),
   ]
-  const pages = paginate(items, { contentHeight: 100 })
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: true },
+    ],
+  })
   eq('页数', pages.length, 2)
   eq('第1页节号', pages[0].sectionIndex, 0)
   eq('第2页节号', pages[1].sectionIndex, 1)
@@ -126,25 +132,101 @@ console.log('\n=== 6. 分节符：新起一页 + 页码重排 ===')
   eq('标记带着块 id（编辑器要按它删除）', pages[0].breaks[0]?.blockId, 's0')
   eq('第1页只有一枚标记', pages[0].breaks.length, 1)
   eq('第2页没有标记', pages[1].breaks.length, 0)
+  ok('两页都显示页码', pages[0].showPageNumber === true && pages[1].showPageNumber === true)
 }
 
 console.log('\n=== 7. 分节符：不重排时页码延续 ===')
 {
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 's1', kind: 'section', restartNumbering: false },
+    { t: 'break', blockId: 's1', kind: 'section' },
+    block('b', { rows: 1, length: 10 }),
+  ]
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+    ],
+  })
+  eq('页数', pages.length, 2)
+  eq('第2页页码（延续）', pages[1].pageNumber, 2)
+}
+
+console.log('\n=== 7.0 不传 sections：缺项按全默认兜底（显示页码、不重排）===')
+{
+  const items = [
+    block('a', { rows: 1, length: 10 }),
+    { t: 'break', blockId: 's1', kind: 'section' },
     block('b', { rows: 1, length: 10 }),
   ]
   const pages = paginate(items, { contentHeight: 100 })
   eq('页数', pages.length, 2)
-  eq('第2页页码（延续）', pages[1].pageNumber, 2)
+  eq('第2页页码（默认不重排）', pages[1].pageNumber, 2)
+  ok('默认显示页码', pages[0].showPageNumber === true && pages[1].showPageNumber === true)
+
+  // sections 偏短（只手写了一项）时，后面的节也用同一套兜底
+  const short = paginate(items, {
+    contentHeight: 100,
+    sections: [{ contentHeight: 100, showPageNumber: true, restartAtOne: false }],
+  })
+  eq('sections 偏短仍能分页', short.length, 2)
+  eq('偏短时第2页页码延续', short[1].pageNumber, 2)
+}
+
+console.log('\n=== 7.0b 逐节版心高：横排节的版心更矮 → 页数变多 ===')
+{
+  // 8 行、行高 25px：版心 100px 每页 4 行 → 2 页；第 2 节版心只有 50px → 每页 2 行 → 4 页
+  const items = [
+    block('a', { rows: 4, length: 40, lineHeight: 25 }),
+    { t: 'break', blockId: 's1', kind: 'section' },
+    block('b', { rows: 8, length: 80, lineHeight: 25 }),
+  ]
+  const wide = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+    ],
+  })
+  const short = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 50, showPageNumber: true, restartAtOne: false },
+    ],
+  })
+  eq('同一版心高时 1 + 2 = 3 页', wide.length, 3)
+  eq('第 2 节版心矮一半时 1 + 4 = 5 页', short.length, 5)
+  eq('第 2 节第 1 页属第 2 节', short[1].sectionIndex, 1)
+  eq('第 2 节每页 2 行', short[1].fragments[0].to - short[1].fragments[0].from, 20)
+}
+
+console.log('\n=== 7.0c showPageNumber 由分页器原样搬运（含「关联前节」解析后的结果）===')
+{
+  const items = [
+    block('a', { rows: 1, length: 10 }),
+    { t: 'break', blockId: 's1', kind: 'section' },
+    block('b', { rows: 1, length: 10 }),
+  ]
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      // 第 2 节「关联前节」，继承来的结果是「不显示」
+      { contentHeight: 100, showPageNumber: false, restartAtOne: false },
+    ],
+  })
+  ok('第1页显示页码', pages[0].showPageNumber === true)
+  ok('第2页不显示页码', pages[1].showPageNumber === false)
+  eq('不显示页码不影响页码推进', pages[1].pageNumber, 2)
 }
 
 console.log('\n=== 7.1 分页符：只换页，不新开一节、页码连续 ===')
 {
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 'p0', kind: 'page', restartNumbering: false },
+    { t: 'break', blockId: 'p0', kind: 'page' },
     block('b', { rows: 1, length: 10 }),
   ]
   const pages = paginate(items, { contentHeight: 100 })
@@ -160,7 +242,7 @@ console.log('\n=== 7.2 文末分页符：内容不变也要留下标记 ===')
   // Word 实测：这种情况不会多出一张空白页（1 页），换页落在空页上被吸收。
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 'p1', kind: 'page', restartNumbering: false },
+    { t: 'break', blockId: 'p1', kind: 'page' },
   ]
   const pages = paginate(items, { contentHeight: 100 })
   eq('仍然只有一页', pages.length, 1)
@@ -173,11 +255,17 @@ console.log('\n=== 7.3 分页符 + 分节符连在一起：两枚标记都要看
   // 两枚标记都落在第 1 页底部（落到空页上的那一枚只吸收换页，不吸收标记）。
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 'pb', kind: 'page', restartNumbering: false },
-    { t: 'break', blockId: 'sc', kind: 'section', restartNumbering: true },
+    { t: 'break', blockId: 'pb', kind: 'page' },
+    { t: 'break', blockId: 'sc', kind: 'section' },
     block('b', { rows: 1, length: 10 }),
   ]
-  const pages = paginate(items, { contentHeight: 100 })
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: true },
+    ],
+  })
   eq('页数（只推进一页，与 Word 一致）', pages.length, 2)
   eq('第1页挂了两枚标记', pages[0].breaks.length, 2)
   eq('第1枚是分页符', pages[0].breaks[0]?.kind, 'page')
@@ -192,11 +280,17 @@ console.log('\n=== 7.4 分节符在后面 + 分页符在前（顺序反过来）
   // Word 实测的 pg4：内容 + 分节符 + 分页符 + 内容 → 2 页 2 节，两枚标记都看得见
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 'sc', kind: 'section', restartNumbering: true },
-    { t: 'break', blockId: 'pb', kind: 'page', restartNumbering: false },
+    { t: 'break', blockId: 'sc', kind: 'section' },
+    { t: 'break', blockId: 'pb', kind: 'page' },
     block('b', { rows: 1, length: 10 }),
   ]
-  const pages = paginate(items, { contentHeight: 100 })
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: true },
+    ],
+  })
   eq('页数', pages.length, 2)
   eq('两枚标记都在第1页', pages[0].breaks.length, 2)
   eq('顺序保持插入顺序', pages[0].breaks.map((b) => b.kind).join(','), 'section,page')
@@ -207,9 +301,15 @@ console.log('\n=== 7.5 文末分节符：Word 会留一张空白页 ===')
   // Word 实测的 pg3：内容 + 文末分节符 → 2 页 2 节（第 2 页是空白页）
   const items = [
     block('a', { rows: 1, length: 10 }),
-    { t: 'break', blockId: 'sc', kind: 'section', restartNumbering: true },
+    { t: 'break', blockId: 'sc', kind: 'section' },
   ]
-  const pages = paginate(items, { contentHeight: 100 })
+  const pages = paginate(items, {
+    contentHeight: 100,
+    sections: [
+      { contentHeight: 100, showPageNumber: true, restartAtOne: false },
+      { contentHeight: 100, showPageNumber: true, restartAtOne: true },
+    ],
+  })
   eq('页数', pages.length, 2)
   eq('第2页没有片段（空白页）', pages[1].fragments.length, 0)
   eq('第2页属于新节', pages[1].sectionIndex, 1)
@@ -221,7 +321,7 @@ console.log('\n=== 7.5 文末分节符：Word 会留一张空白页 ===')
 console.log('\n=== 7.6 文档一开头就是换页标记：标记挂到第一页 ===')
 {
   const items = [
-    { t: 'break', blockId: 'pb', kind: 'page', restartNumbering: false },
+    { t: 'break', blockId: 'pb', kind: 'page' },
     block('a', { rows: 1, length: 10 }),
   ]
   const pages = paginate(items, { contentHeight: 100 })
@@ -318,7 +418,7 @@ console.log('\n=== 13. 表格与段落混排、换页标记、超版心兜底 ==
 
   // 分页符紧跟在表格之后：标记落在表格所在页底部
   const withBreak = paginate(
-    [row('tb1', 0, 25), { t: 'break', blockId: 'pgx', kind: 'page', restartNumbering: false }, block('p', { rows: 1, length: 10 })],
+    [row('tb1', 0, 25), { t: 'break', blockId: 'pgx', kind: 'page' }, block('p', { rows: 1, length: 10 })],
     { contentHeight: 100 },
   )
   eq('换页标记生效', withBreak.length, 2)

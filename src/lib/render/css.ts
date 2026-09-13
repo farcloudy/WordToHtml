@@ -59,15 +59,17 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     `.${ns}-pages { display: flex; flex-direction: row; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 18px; }`,
     // flex: none（不放大也不缩小）：纸宽是绝对的，容器不够宽时宁可让外层横向滚动，
     // 也不能把纸压窄 —— 纸一窄版心就变，实测出来的行盒和分页算术立刻全体对不上。
-    `.${ns}-page { flex: none; position: relative; width: ${spec.page.size.width}; height: ${spec.page.size.height}; ` +
-      `padding: ${spec.page.margin.top} ${spec.page.margin.right} ${spec.page.margin.bottom} ${spec.page.margin.left}; ` +
-      `box-sizing: border-box; background: #fff; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18); }`,
+    //
+    // 纸宽/纸高/页边距（padding）**不在这里**：W5 起每节可以有各自的页面方向，
+    // 它们是按页给的行内样式（见 WordPaper.vue 的 pageStyle）。这里只留与节无关的。
+    `.${ns}-page { flex: none; position: relative; box-sizing: border-box; background: #fff; ` +
+      `box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18); }`,
     // 版心用 flex 纵向排列：flex 子项之间的 margin 不会合并，
     // 这一点很重要 —— Word 里段后与段前是相加的，而普通块级布局会取较大者。
     `.${ns}-content { display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }`,
     // 页码元素只负责定位，字体字号对齐全部来自 .${ns}-footer（= 内置「页脚」样式），
-    // 这样预览的页码排版与 docx 里那条样式同源。
-    `.${ns}-page-number { position: absolute; left: 0; right: 0; bottom: ${spec.page.footer}; color: #000; }`,
+    // 这样预览的页码排版与 docx 里那条样式同源。页脚距（bottom）也是逐节的，走行内样式。
+    `.${ns}-page-number { position: absolute; left: 0; right: 0; color: #000; }`,
     // 测量容器：必须参与布局（不能用 display:none），否则量不到行盒
     `.${ns}-probe { position: absolute; left: -100000px; top: 0; visibility: hidden; pointer-events: none; }`,
     // 编辑态：版面本身就是编辑区，去掉浏览器默认的聚焦描边
@@ -156,7 +158,12 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    */
   out.push(
     `@media print {`,
+    // 未命名的那条是兜底（纸只有一档尺寸 = 规格表）；混排方向靠下面两条命名页规则，
+    // 每页在行内挂 `page: wtp-portrait|wtp-landscape`（见 WordPaper.vue 的 pageStyle）。
+    // landscape 那条把规格表的宽高互换 —— @page 的 size 是「纸的实际朝向」，不认 w:orient 那套。
     `  @page { size: ${spec.page.size.width} ${spec.page.size.height}; margin: 0; }`,
+    `  @page ${ns}-portrait { size: ${spec.page.size.width} ${spec.page.size.height}; margin: 0; }`,
+    `  @page ${ns}-landscape { size: ${spec.page.size.height} ${spec.page.size.width}; margin: 0; }`,
     `  html, body { background: #fff; }`,
     `  .${ns}-root { display: block !important; }`,
     `  .${ns}-pages { display: block !important; gap: 0 !important; }`,

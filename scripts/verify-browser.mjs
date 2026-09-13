@@ -32,6 +32,7 @@ import {
   lineSpacePt,
   parseMd,
   ptToPx,
+  resolveSections,
   resolveSpec,
   toMd,
 } from '../dist-lib/wordtohtml.mjs'
@@ -202,6 +203,21 @@ async function selectTemplate(page, template) {
   }
 }
 
+/**
+ * 逐节信息（从模型现推）。verify-page-count 拿它当 oracle：
+ * 「重排的节数」= 除首节外声明了「从 1 开始」的节数，所以预览里页码 1 的出现次数
+ * 应当恰好是 `1 + restartCount`（首节的第一页也是 1）。
+ * 从模型推而不是从预览数自己，才能真的验到东西。
+ */
+function sectionInfo(report, template) {
+  const model = report.model ?? parseMd(report.source ?? '')
+  const lives = resolveSections(model, resolveSpec(template.spec))
+  return {
+    sectionCount: lives.length,
+    restartCount: lives.filter((s) => s.settings.restartAtOne).length,
+  }
+}
+
 const server = await createServer({
   root,
   logLevel: 'warn',
@@ -263,7 +279,21 @@ try {
     }
     const numbers = report.pages.map((p) => p.number).join(',')
     console.log(`  页码序列：${numbers}`)
-    eq(`${tag} 末页页码（分节应重排为 1）`, report.pages[report.pages.length - 1]?.number, '1')
+    // W5：页码「重排」由**该节的设置**决定（新插的分节符默认不重排），所以不能写死
+    // 「末页是 1」。能断言的是两条硬事实：页码 1 的出现次数 = 首节 + 声明了「从 1 开始」
+    // 的节数；且序列里确实出现过回退（一节都不重排的话它必然单调不减）。
+    const restartInfo = sectionInfo(report, template)
+    const ones = report.pages.filter((p) => p.number === '1').length
+    eq(
+      `${tag} 页码 1 的出现次数（首节 1 次 + 声明重排的 ${restartInfo.restartCount} 次）`,
+      ones,
+      1 + restartInfo.restartCount,
+    )
+    ok(
+      `${tag} 页码确实在某节处重排过（序列出现回退）`,
+      report.pages.some((p, i) => i > 0 && Number(p.number) <= Number(report.pages[i - 1]?.number)),
+      `页码序列 ${numbers}`,
+    )
 
     console.log('\n=== 2. 预览样式与版心宽 vs 规格表 ===')
     for (const kind of Object.keys(spec.styles)) {
@@ -553,7 +583,119 @@ try {
   await page.setViewportSize({ width: 1700, height: 1100 })
   await page.waitForTimeout(300)
 
-  console.log('\n=== 8. 产出物 ===')
+  console.log('\n=== 8. 逐节几何与命名页（横竖混排；W5）===')
+  /** 每张纸的几何 + 它挂的命名页 + 页间断页方式 */
+  const paperView = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('.wtp-page')).map((el) => {
+        const rect = el.getBoundingClientRect()
+        return {
+          page: el.style.getPropertyValue('page'),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          contentWidth: el.querySelector('.wtp-content')?.clientWidth ?? 0,
+          breakBefore: getComputedStyle(el).breakBefore,
+        }
+      }),
+    )
+  /** 把插入符放进含 needle 的那一片段的末尾（verify-browser 里没有 __wtpTest，手工做一遍） */
+  const setCaretInText = (needle) =>
+    page.evaluate((n) => {
+      const frag = Array.from(document.querySelectorAll('.wtp-content > [data-block-id]')).find(
+        (el) => (el.textContent ?? '').includes(n),
+      )
+      if (!frag) return null
+      const host = frag.closest('[contenteditable="true"]')
+      if (host) host.focus()
+      const walker = document.createTreeWalker(frag, NodeFilter.SHOW_TEXT)
+      const node = walker.nextNode()
+      if (!node) return null
+      const range = document.createRange()
+      range.setStart(node, node.data.length)
+      range.collapse(true)
+      const sel = document.getSelection()
+      sel.removeAllRanges()
+      sel.addRange(range)
+      return frag.dataset.blockId ?? null
+    }, needle)
+
+  const secBar = page.locator('.section-toolbar')
+  ok('编辑模式下「节」工具条常驻', (await secBar.count()) === 1)
+  const screenView = await paperView()
+  ok(
+    '每张纸都挂了命名页（wtp-portrait / wtp-landscape）',
+    screenView.length > 0 &&
+      screenView.every((p) => p.page === 'wtp-portrait' || p.page === 'wtp-landscape'),
+    JSON.stringify(screenView.slice(0, 2)),
+  )
+  ok(
+    '样本默认方向是纵向（宽 < 高）',
+    screenView.every((p) => p.width < p.height),
+    JSON.stringify(screenView[0]),
+  )
+  ok(
+    '第 2 张纸起都在新的一页开始（一页一张纸靠它）',
+    screenView.slice(1).every((p) => p.breakBefore === 'page'),
+    JSON.stringify(screenView.map((p) => p.breakBefore)),
+  )
+
+  // 打印媒体下：命名页不许把分页改坏（break-before 与页数都得原样）
+  await page.emulateMedia({ media: 'print' })
+  const printPapers = await paperView()
+  await page.emulateMedia({ media: 'screen' })
+  eq('打印媒体下纸数不变', printPapers.length, screenView.length)
+  ok(
+    '打印媒体下命名页仍在每张纸上',
+    printPapers.every((p) => p.page === 'wtp-portrait' || p.page === 'wtp-landscape'),
+    JSON.stringify(printPapers.map((p) => p.page)),
+  )
+  ok(
+    '打印媒体下第 2 张起仍在新的纸开始（命名页没有引入多余断页）',
+    printPapers.slice(1).every((p) => p.breakBefore === 'page'),
+    JSON.stringify(printPapers.map((p) => p.breakBefore)),
+  )
+
+  // 用「节」工具条把最后一节改成横排：只有那一节的纸横过来，页数不变
+  const tailBlock = await setCaretInText('2026年9月12日')
+  ok('找得到最后一节里的落点', tailBlock !== null)
+  await secBar
+    .locator('.tk-group', { hasText: '方向' })
+    .getByRole('radio', { name: '横向', exact: true })
+    .click()
+  await page.waitForTimeout(500)
+  const mixed = await paperView()
+  const landscape = mixed.filter((p) => p.page === 'wtp-landscape')
+  const portrait = mixed.filter((p) => p.page === 'wtp-portrait')
+  ok('最后一节变成横排（宽 > 高）', landscape.length > 0 && landscape.every((p) => p.width > p.height), JSON.stringify(mixed))
+  ok(
+    '其余节仍是纵排（只有那一节被改）',
+    portrait.length > 0 && portrait.every((p) => p.width < p.height),
+    JSON.stringify(mixed),
+  )
+  ok(
+    '横排纸的宽高恰好是纵排纸的对调',
+    landscape[0]?.width === portrait[0]?.height && landscape[0]?.height === portrait[0]?.width,
+    `${JSON.stringify(landscape[0])} vs ${JSON.stringify(portrait[0])}`,
+  )
+  eq('横竖混排纸数不变', mixed.length, screenView.length)
+  // 横排纸比页带宽：wrap 之后它独占一行且不许被压窄（压窄 = 版心变窄 = 分页全错）
+  ok(
+    '横排纸没有被压窄',
+    landscape.every((p) => p.width === portrait[0]?.height),
+    JSON.stringify(landscape[0]),
+  )
+  // 还原成纵向，免得影响后面的产出物与截图
+  await secBar
+    .locator('.tk-group', { hasText: '方向' })
+    .getByRole('radio', { name: '纵向', exact: true })
+    .click()
+  await page.waitForTimeout(400)
+  ok(
+    '还原后所有纸都是纵排',
+    (await paperView()).every((p) => p.page === 'wtp-portrait' && p.width < p.height),
+  )
+
+  console.log('\n=== 9. 产出物 ===')
   const tmpDir = join(root, '.qwen', 'tmp')
   mkdirSync(tmpDir, { recursive: true })
   const sourcePath = join(tmpDir, 'demo-source.md')
@@ -580,6 +722,10 @@ try {
               pageNumbers: report.pages.map((p) => p.number),
               contentWidth: report.pages[0]?.contentWidth ?? 0,
               contentHeight: report.pages[0]?.contentHeight ?? 0,
+              // 逐节结果（从模型现推，与预览/导出同一个真相源）。
+              // 「重排的节数」是 verify:pages 对账页码 1 出现次数的依据 ——
+              // 用模型推出来的期望值当 oracle，而不是拿预览自己数自己。
+              ...sectionInfo(report, template),
             },
           ]),
         ),
@@ -613,5 +759,7 @@ if (failures.length > 0) {
 }
 console.log(
   '[PASS] 浏览器实测：两套模板的样式与版心一致、分页无溢出、切模板页数改变、' +
-    '宽视口双页并排、窄视口回落一页一排、分节页码已重排、批注侧栏与锚点一致。',
+    '宽视口双页并排、窄视口回落一页一排、分节页码已重排、批注侧栏与锚点一致、' +
+    '逐页几何按节（改方向后只有那一节的纸横过来且宽高对调、页数不变）、' +
+    '每张纸挂命名页且打印媒体下分页不被改坏。',
 )

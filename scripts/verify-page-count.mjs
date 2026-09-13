@@ -96,7 +96,7 @@ if (!existsSync(browserPath) || !existsSync(sourcePath)) {
 const browser = JSON.parse(readFileSync(browserPath, 'utf8').replace(/^\uFEFF/, ''))
 const reports = browser.templates ?? {}
 
-console.log('### 1/2 用同一份源码逐套模板生成 docx，比对页数与分节重编号')
+console.log('### 1/2 用同一份源码逐套模板生成 docx，比对页数与分节')
 for (const template of DOC_TEMPLATES) {
   const preview = reports[template.key]
   if (!preview) {
@@ -107,7 +107,17 @@ for (const template of DOC_TEMPLATES) {
   const round = wordRoundTrip(template, ['--source', sourcePath])
   const { dump } = round
   dropRoundTrip(round)
+
+  /*
+   * 页码 1 的出现次数不能拿来当节数（W5 起新插的分节符默认「关联前节 + 不重排」）。
+   * 期望值从**模型**推：页码 1 恰好出现「首节 1 次 + 声明了从 1 开始的节数」次；
+   * 分节数则直接比 Word 的 sectionCount 与模型的节数。
+   * 两个数都由 verify-browser 用 resolveSections() 算好写进报告（与预览/导出同源）。
+   */
   const restarts = preview.pageNumbers.filter((n) => n === '1').length
+  const restartCount = preview.restartCount ?? 0
+  const expectedOnes = 1 + restartCount
+  const expectedSections = preview.sectionCount ?? restarts
 
   console.log(`\n=== 页数对账「${template.label}」===`)
   console.log(`  浏览器预览：${preview.pageCount} 页，页码序列 ${preview.pageNumbers.join(',')}`)
@@ -118,9 +128,15 @@ for (const template of DOC_TEMPLATES) {
       `「${template.label}」页数不一致：预览 ${preview.pageCount}，Word ${dump.pageCount}`,
     )
   }
-  if (dump.sectionCount !== restarts) {
+  if (dump.sectionCount !== expectedSections) {
     failures.push(
-      `「${template.label}」分节数不一致：Word ${dump.sectionCount} 节，预览里出现 ${restarts} 次页码 1`,
+      `「${template.label}」分节数不一致：Word ${dump.sectionCount} 节，模型里 ${expectedSections} 节`,
+    )
+  }
+  if (restarts !== expectedOnes) {
+    failures.push(
+      `「${template.label}」页码 1 的出现次数与模型不符：预览里 ${restarts} 次，` +
+        `模型推出应为 ${expectedOnes} 次（首节 1 次 + ${restartCount} 个声明了「从 1 开始」的节）`,
     )
   }
 }
@@ -165,5 +181,5 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`)
   process.exit(1)
 }
-console.log('[PASS] 每套模板的预览分页与 Word 的分页结果一致（页数、分节重编号均吻合），')
+console.log('[PASS] 每套模板的预览分页与 Word 的分页结果一致（页数、节数、页码重排次数均吻合），')
 console.log('       且两套模板的页数确实不同（切模板整篇重量的证据）。')

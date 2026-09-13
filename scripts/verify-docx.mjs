@@ -24,6 +24,7 @@ import {
   lengthToPx,
   normalizeBlocks,
   parseMd,
+  resolveSections,
   resolveSpec,
   toBase64,
   toMd,
@@ -100,7 +101,9 @@ const SAMPLE = [
   '',
   '相关日期以{红|通知书}记载为准[[通知书原件|日期需与通知书原件核对]]。',
   '',
-  '---',
+  // W5：分节符后面的 kwargs 描述**它开启的那一节**（只写非默认值）。
+  // 这一节独立设页脚（link=off）+ 页码从 1 重排（restart=on）= 旧 `---` 的含义，写全了才是显式的。
+  '--- link=off restart=on',
   '',
   '## 附件说明',
   '',
@@ -112,7 +115,18 @@ const SAMPLE = [
   // 独立段落里的 w:br w:type="page"，否则换页会被静默丢掉。Word 每次验 P1
   // 都会真的打开一次这种形状。
   '===',
-  '---',
+  // W5：这一节横排（orientation=landscape），且**不写 kwargs 的其余项** = 关联前节
+  // （页脚沿用前一节的，docx 里表现为这一节的 sectPr 里没有 <w:footerReference>）。
+  // 横排 + 继承这两件事都由这一节覆盖。
+  '--- orientation=landscape',
+  '',
+  '本节横排，页脚与页码沿用前一节。',
+  '',
+  // W5：这一节独立设页脚（link=off）且**不显示页码**（numbers=off —— 必须写成
+  // 空页脚，什么都不写就变成「继承前一节的页码」，「无页码」就落空了）。
+  '--- link=off numbers=off',
+  '',
+  '本节不显示页码。',
   '',
   '>> 江苏爱康光电破产管理人',
   '>> 2026年9月12日',
@@ -155,15 +169,21 @@ const model = parseMd(bodySource, { author: '张三', now })
 const md2 = toMd(model)
 const model2 = parseMd(md2, { author: '张三', now })
 
-const before = JSON.stringify(normalizeBlocks(model))
-const after = JSON.stringify(normalizeBlocks(model2))
+/*
+ * 往返比对必须把 `sections` 也算进去：逐节设置是 W5 新加的文档级状态，
+ * 只看 blocks 的话「方向/页码开关丢了」这类缺陷会静默通过。
+ * 形状里用 `?? null` 归一：全默认时 sections 整个不写，两种形态必须等价。
+ */
+const shape = (doc) => JSON.stringify({ blocks: normalizeBlocks(doc), sections: doc.sections ?? null })
+const before = shape(model)
+const after = shape(model2)
 if (before !== after) {
   console.error('[FAIL] 往返不一致：模型 → md → 模型 之后结构发生了变化')
   console.error('  原始:', before)
   console.error('  往返:', after)
   process.exit(1)
 }
-console.log('[ok] 往返一致性通过（模型 → md → 模型）')
+console.log('[ok] 往返一致性通过（模型 → md → 模型，含逐节设置）')
 
 const buffer = Buffer.from(
   await toBase64(model, spec, { title: '爱康光电资产核查情况说明' }),
@@ -400,6 +420,103 @@ writeFileSync(outPath, buffer)
         tally([...xml.matchAll(/<w:vAlign w:val="([^"]+)"\/>/g)].map((m) => m[1])),
       )
     })
+  }
+
+  /*
+   * 逐节：w:pgSz（含 w:orient）/ w:pgNumType / footerReference 有无。
+   *
+   * 期望值从 resolveSections(model, spec) 现推 —— 与导出侧同一个真相源，
+   * 不在这里另写一套「哪节该有页脚」的判断（那会变成两份真相）。
+   * 三个分支的判据：
+   *   · linkPrevious=false  → 本节必须自带 <w:footerReference>（哪怕空页脚）
+   *   · linkPrevious=true   → 本节**不许**有 footerReference（不写才是继承）
+   *   · restartAtOne=true   → <w:pgNumType w:start="1"/> 必须出现；否则不许有 w:start
+   */
+  {
+    const sections = resolveSections(model, spec)
+    const sectPrs = [...docXml.matchAll(/<w:sectPr\b[\s\S]*?<\/w:sectPr>/g)].map((m) => m[0])
+    if (usedBuiltinSample && sections.length < 3) {
+      problems.push(`内置样本的节数只有 ${sections.length} —— 逐节 docx 属性没能覆盖到各类组合`)
+    }
+    if (sectPrs.length !== sections.length) {
+      problems.push(`sectPr 数不符：document.xml 里 ${sectPrs.length} 个，模型里 ${sections.length} 节`)
+    }
+    let linkedSections = 0
+    let restartSections = 0
+    sections.forEach((sec, i) => {
+      const xml = sectPrs[i] ?? ''
+      const tag = `第${i}节`
+      // docx 库在 orientation=landscape 时自己把宽高互换（createPageSize 实测），
+      // 所以传进去的是纵向尺寸；这里按 resolveSections 的换算结果对账
+      if (!xml.includes(`w:w="${sec.page.size.width}"`)) {
+        problems.push(`${tag}的 w:pgSz 宽不是 ${sec.page.size.width}`)
+      }
+      if (!xml.includes(`w:h="${sec.page.size.height}"`)) {
+        problems.push(`${tag}的 w:pgSz 高不是 ${sec.page.size.height}`)
+      }
+      if (!xml.includes(`w:orient="${sec.settings.orientation}"`)) {
+        problems.push(`${tag}的 w:orient 不是 ${sec.settings.orientation}`)
+      }
+      if (sec.settings.restartAtOne) {
+        restartSections += 1
+        if (!/<w:pgNumType\b[^>]*w:start="1"/.test(xml)) {
+          problems.push(`${tag}该重排（restartAtOne）却缺 <w:pgNumType w:start="1"/>`)
+        }
+      } else if (/<w:pgNumType\b[^>]*w:start=/.test(xml)) {
+        problems.push(`${tag}不该重排，却写了 w:pgNumType w:start`)
+      }
+      const hasFooter = /<w:footerReference\b/.test(xml)
+      if (sec.settings.linkPrevious) {
+        linkedSections += 1
+        if (hasFooter) {
+          problems.push(`${tag}关联前节（linkPrevious）却仍写了 <w:footerReference>`)
+        }
+      } else if (!hasFooter) {
+        problems.push(`${tag}独立设页脚（linkPrevious=false）却没有 <w:footerReference>`)
+      }
+    })
+    if (usedBuiltinSample && linkedSections === 0) {
+      problems.push('内置样本里没有「关联前节」的节 —— footerReference 有无这一项等于没验')
+    }
+    if (usedBuiltinSample && restartSections === 0) {
+      problems.push('内置样本里没有「从 1 重排」的节 —— w:pgNumType 这一项等于没验')
+    }
+    const landscape = sections.filter((s) => s.settings.orientation === 'landscape').length
+    if (usedBuiltinSample && landscape === 0) {
+      problems.push('内置样本里没有横排的节 —— w:orient / 宽高互换这一项等于没验')
+    }
+    console.log(
+      `[ok] 逐节：${sections.length} 节（关联前节 ${linkedSections}、重排 ${restartSections}、` +
+        `横排 ${landscape}）；w:pgSz/w:orient/w:pgNumType/footerReference 均在字节层核对`,
+    )
+
+    /*
+     * 「独立页脚 + 不显示页码」= 空页脚（一个没有 PAGE 域的段落）。
+     * 内置样本刻意没放这一种（它会让 Word 侧的页脚文本断言变得绕），
+     * 这里单独造一份最小 docx 在字节层验：footerReference 必须有，
+     * 且 PAGE 域只能出现一次（第一节的那个）——第二节若也写了，就不叫「不显示页码」。
+     */
+    const muteModel = parseMd('甲\n\n--- link=off numbers=off\n\n乙', { now })
+    const muteBuf = Buffer.from(await toBase64(muteModel, spec, { title: '无页码一节' }), 'base64')
+    const muteZip = await JSZip.loadAsync(muteBuf)
+    const muteXml = await muteZip.file('word/document.xml').async('string')
+    const muteSectPrs = [...muteXml.matchAll(/<w:sectPr\b[\s\S]*?<\/w:sectPr>/g)].map((m) => m[0])
+    const silent = muteSectPrs[1] ?? ''
+    if (!/<w:footerReference\b/.test(silent)) {
+      problems.push('「独立页脚 + 不显示页码」的节缺 <w:footerReference>（会变成继承前一节的页码）')
+    }
+    const footerParts = Object.keys(muteZip.files).filter((n) => /^word\/footer\d+\.xml$/.test(n))
+    let pageFields = (muteXml.match(/<w:instrText\b[^>]*>\s*PAGE\s*<\/w:instrText>/g) ?? []).length
+    for (const name of footerParts) {
+      const text = await muteZip.file(name).async('string')
+      pageFields += (text.match(/<w:instrText\b[^>]*>\s*PAGE\s*<\/w:instrText>/g) ?? []).length
+    }
+    if (pageFields !== 1) {
+      problems.push(`「不显示页码」的节仍写了 PAGE 域：整份 docx 里 PAGE 域 ${pageFields} 处（应为 1）`)
+    }
+    console.log(
+      `[ok] 空页脚：独立页脚 + numbers=off 写出 footerReference（头部 ${footerParts.length} 个），PAGE 域 ${pageFields} 处`,
+    )
   }
 
   if (problems.length > 0) {

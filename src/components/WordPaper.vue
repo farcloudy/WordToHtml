@@ -60,7 +60,7 @@ import {
   splitBlock,
   updateComment as updateCommentOp,
 } from '../lib/edit/model'
-import type { EditorSelection } from '../lib/edit/model'
+import type { EditorSelection, SectionSelectionContext } from '../lib/edit/model'
 import {
   bodyInsertIndex,
   bodyRowIndexes,
@@ -80,6 +80,8 @@ import {
 import type { CellStep } from '../lib/edit/table'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
+import { resolveSections } from '../lib/section'
+import type { ResolvedSection } from '../lib/section'
 import {
   KEEP_SELECTION_HIGHLIGHT,
   SEARCH_CURRENT_HIGHLIGHT,
@@ -102,7 +104,18 @@ import {
   parseCellId,
   sliceInlines,
 } from '../lib/types'
-import type { CellVerticalAlign, DocModel, Inline, RevMark, TableBlock, TextBlock, TextInline } from '../lib/types'
+import type {
+  CellVerticalAlign,
+  DocModel,
+  Inline,
+  PageOrientation,
+  RevMark,
+  SectionSettings,
+  TableBlock,
+  TextBlock,
+  TextInline,
+} from '../lib/types'
+import { sectionIndexOf, setSectionSetting } from '../lib/edit/section'
 
 const props = withDefaults(
   defineProps<{
@@ -154,6 +167,11 @@ const root = ref<HTMLElement | null>(null)
 const pages = shallowRef<PageLayout[]>([])
 /** 最近一次分页实际用到的量测值，排错时用来和渲染结果对账 */
 const measured = shallowRef<MeasuredItem[]>([])
+/**
+ * 逐节解析结果（下标 = 节号）。页面几何、页码显示、工具条都吃它 ——
+ * 它是「模型 + 规格表」的纯函数产物，所以每次重排跟着 viewDoc 一起换新。
+ */
+const resolvedSections = shallowRef<ResolvedSection[]>([])
 /** 侧栏里正在查看的批注；只影响高亮，不触发重排 */
 const activeCommentId = ref<number | null>(null)
 /** 侧栏里正在改写的那条批注与草稿（只在侧栏里用，不进模型） */
@@ -302,17 +320,82 @@ function fragmentStyle(frag: PageFragment, isFirst: boolean): Record<string, str
   return style
 }
 
+/**
+ * 一节的页面几何（纸宽高 + 页边距 + 方向）。纸宽/纸高/页边距（padding）逐节不同
+ * （页面方向按节），所以不能写死在 CSS 里（W5 改动）。顺带挂上打印用的命名页 —— 混排方向靠它。
+ */
+function styleOfSection(section: ResolvedSection | undefined): Record<string, string> {
+  const spec = resolved.value
+  const size = section?.page.size ?? spec.page.size
+  const margin = section?.page.margin ?? spec.page.margin
+  return {
+    width: size.width,
+    height: size.height,
+    padding: `${margin.top} ${margin.right} ${margin.bottom} ${margin.left}`,
+    page: section?.settings.orientation === 'landscape' ? 'wtp-landscape' : 'wtp-portrait',
+  }
+}
+
+/** 某一页的几何：按它所属的节取 */
+function pageStyle(page: PageLayout): Record<string, string> {
+  return styleOfSection(sectionOf(page))
+}
+
+/** 某一页所属的节（下表越界时兜底到首节） */
+function sectionOf(page: PageLayout): ResolvedSection | undefined {
+  return resolvedSections.value[page.sectionIndex] ?? resolvedSections.value[0]
+}
+
+/** 页码元素的定位：页脚距也是逐节的（横排节的页脚距与纵排节可以不同） */
+function pageNumberStyle(page: PageLayout): Record<string, string> {
+  return { bottom: (sectionOf(page)?.page ?? resolved.value.page).footer }
+}
+
+/** 还没有分页结果时占位那张纸的「页」（几何仍按首节，免得闪一下默认 A4） */
+const EMPTY_PAGE: PageLayout = {
+  sectionIndex: 0,
+  pageNumber: 1,
+  showPageNumber: true,
+  fragments: [],
+  breaks: [],
+}
+
 /* -------------------------------------------------------------------------- */
 /* 重排                                                                        */
 /* -------------------------------------------------------------------------- */
 
-function sameLayout(a: readonly PageLayout[], b: readonly PageLayout[]): boolean {
+/** 一节的页面几何（纸宽高 + 页边距 + 方向 + 页脚距）—— 模板里直接吃的那几样 */
+function geometryOf(section: ResolvedSection): unknown {
+  return [styleOfSection(section), section.page.footer]
+}
+
+/** 逐节几何的指纹。分页片段一样但几何变了（空节/单行节切方向）也必须重建 DOM */
+function geometryKey(sections: readonly ResolvedSection[]): string {
+  return JSON.stringify(sections.map(geometryOf))
+}
+
+/**
+ * 判断这次分页结果与当前渲染的是不是同一份「版面」。
+ *
+ * 不只看页码与片段：**逐节几何也要比**。反例很实在 —— 把一节改成横排，若那一节的内容
+ * 在横竖两种宽度下都只占一行，量测值与分页片段会一模一样，只比片段就会认定「没变化」，
+ * 于是页面几何不更新、纸还是竖的（模型却已经是横的，预览与模型就此分家）。
+ */
+function sameLayout(
+  a: readonly PageLayout[],
+  b: readonly PageLayout[],
+  aSections: readonly ResolvedSection[],
+  bSections: readonly ResolvedSection[],
+): boolean {
   if (a.length !== b.length) return false
+  if (geometryKey(aSections) !== geometryKey(bSections)) return false
   for (let i = 0; i < a.length; i += 1) {
     const pa = a[i]
     const pb = b[i]
     if (!pa || !pb) return false
     if (pa.sectionIndex !== pb.sectionIndex || pa.pageNumber !== pb.pageNumber) return false
+    // 页码显示与否也逐节变（关联前节 / 关掉页码），漏比会让「切了开关却没重建 DOM」
+    if (pa.showPageNumber !== pb.showPageNumber) return false
     // 换页标记也要比：插一个「文末分页符」不会改变片段，但标记得画出来；
     // 换了是哪几条（kind/blockId）标记的文案与删除目标也不同
     if (pa.breaks.length !== pb.breaks.length) return false
@@ -383,13 +466,25 @@ function refreshLayout(options: RefreshOptions = {}): void {
 
   const items = measureDocument(doc.value, spec, el, cache)
   measured.value = items
-  const nextPages = paginate(items, { contentHeight: contentBoxPx(spec).height })
-  const changed = options.force === true || !sameLayout(pages.value, nextPages)
+  // 逐节解析必须在量测之后、分页之前：量测要按节切探针宽度，分页要逐节版心高
+  const sections = resolveSections(doc.value, spec)
+  const nextPages = paginate(items, {
+    contentHeight: contentBoxPx(spec).height,
+    sections: sections.map((s) => ({
+      contentHeight: s.content.height,
+      showPageNumber: s.showPageNumber,
+      restartAtOne: s.settings.restartAtOne,
+    })),
+  })
+  const changed =
+    options.force === true || !sameLayout(pages.value, nextPages, resolvedSections.value, sections)
 
   if (changed) {
     viewDoc.value = cloneDoc(doc.value)
     viewNumbering.value = numberingOf(viewDoc.value)
     pages.value = nextPages
+    // 页面几何（纸宽高、页边距、方向）随 viewDoc 一起换新 —— 模板里按节取
+    resolvedSections.value = sections
     domGen += 1
     emit('paginated', nextPages.length)
   }
@@ -656,7 +751,30 @@ function emitSelection(): void {
     bold: to > from ? rangeIsBold(container, from, to) : false,
     color: to > from ? rangeColor(container, from, to) : undefined,
     ...(cell && table ? { table: tableContextOf(table, cell.row, cell.col) } : {}),
+    section: sectionContextOf(range.start.blockId),
   })
+}
+
+/**
+ * 光标所在节的上下文（「节」工具条回显与置灰用）。
+ *
+ * 三个开关给的是**已解析值**，不是模型里的原始字段 —— 工具条的 radio 选中态
+ * 要的是「现在实际是什么」，缺省与继承都在这里算完。
+ */
+function sectionContextOf(blockId: string): SectionSelectionContext {
+  const sections = resolveSections(doc.value, resolved.value)
+  const total = sections.length
+  const at = Math.min(Math.max(0, sectionIndexOf(doc.value, blockId)), total - 1)
+  const settings = sections[at]?.settings
+  return {
+    index: at,
+    total,
+    isFirst: at === 0,
+    orientation: settings?.orientation ?? 'portrait',
+    pageNumbers: settings?.pageNumbers ?? true,
+    linkPrevious: settings?.linkPrevious ?? at > 0,
+    restartAtOne: settings?.restartAtOne ?? false,
+  }
 }
 
 /** 表格上下文（工具条回显与禁用用）：行列下标、role、以及**已解析默认值**的两组对齐 */
@@ -1371,6 +1489,8 @@ function insertBreak(kind: BreakKind): void {
   pushHistory(point)
   insertBreakAfter(doc.value, point?.blockId, kind)
   refreshLayout({ anchor: point, force: true })
+  // 新分节符会改「第 N 节 / 共 M 节」，补一次回显（点按钮已把焦点移出正文）
+  void nextTick(emitSelection)
 }
 
 /** 点页间标记上的 × 时删掉那一枚分页符/分节符 */
@@ -1380,6 +1500,7 @@ function deleteBreak(blockId: string): void {
   pushHistory(point)
   if (!removeBreakOp(doc.value, blockId)) return
   refreshLayout({ anchor: point, force: true })
+  void nextTick(emitSelection)
 }
 
 /** 工具栏按钮：在落点所在块之后插入分页符 / 分节符 */
@@ -1389,6 +1510,41 @@ function insertPageBreak(): void {
 
 function insertSectionBreak(): void {
   insertBreak('section')
+}
+
+/* -------------------------------------------------------------------------- */
+/* 节设置（W5）                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 改光标所在节的设置。收尾三件与会话/节相关：pushHistory 记撤销点 → 重排
+ * （版心高、页码显示都可能变） → 补一次 emitSelection（按钮/radio 会把焦点
+ * 从正文拿走，selectionchange 未必再触发，不补工具条的选中态就停在旧值）。
+ */
+function updateSectionSetting(patch: SectionSettings): void {
+  if (!props.editable) return
+  const point = caretPoint()
+  if (!point) return
+  pushHistory(point)
+  setSectionSetting(doc.value, sectionIndexOf(doc.value, point.blockId), patch)
+  refreshLayout({ anchor: point, force: true })
+  void nextTick(emitSelection)
+}
+
+function setSectionOrientation(orientation: PageOrientation): void {
+  updateSectionSetting({ orientation })
+}
+
+function setSectionPageNumbers(on: boolean): void {
+  updateSectionSetting({ pageNumbers: on })
+}
+
+function setSectionLinkPrevious(on: boolean): void {
+  updateSectionSetting({ linkPrevious: on })
+}
+
+function setSectionRestartAtOne(on: boolean): void {
+  updateSectionSetting({ restartAtOne: on })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2079,6 +2235,11 @@ defineExpose({
   editComment,
   insertPageBreak,
   insertSectionBreak,
+  // 节设置（W5）
+  setSectionOrientation,
+  setSectionPageNumbers,
+  setSectionLinkPrevious,
+  setSectionRestartAtOne,
   insertTable,
   // 表格结构操作（W4b-1）
   insertTableRow,
@@ -2116,7 +2277,7 @@ defineExpose({
   <div ref="root" class="wtp-root">
     <div class="wtp-pages">
       <template v-for="page in pages" :key="`${page.sectionIndex}-${page.pageNumber}`">
-        <div class="wtp-page">
+        <div class="wtp-page" :style="pageStyle(page)">
           <div
             class="wtp-content"
             :contenteditable="editable ? 'true' : undefined"
@@ -2144,7 +2305,13 @@ defineExpose({
             />
           </div>
           <!-- wtp-footer 提供排版（= 内置「页脚」样式），wtp-page-number 只负责定位 -->
-          <div class="wtp-page-number wtp-footer">{{ page.pageNumber }}</div>
+          <div
+            v-if="page.showPageNumber"
+            class="wtp-page-number wtp-footer"
+            :style="pageNumberStyle(page)"
+          >
+            {{ page.pageNumber }}
+          </div>
         </div>
         <!--
           换页标记，可以有不止一枚（分页符 + 分节符连在一起时两枚都落在同一页底部）。
@@ -2171,9 +2338,9 @@ defineExpose({
           </button>
         </div>
       </template>
-      <div v-if="pages.length === 0" class="wtp-page">
+      <div v-if="pages.length === 0" class="wtp-page" :style="pageStyle(EMPTY_PAGE)">
         <div class="wtp-content" />
-        <div class="wtp-page-number wtp-footer">1</div>
+        <div class="wtp-page-number wtp-footer" :style="pageNumberStyle(EMPTY_PAGE)">1</div>
       </div>
     </div>
 

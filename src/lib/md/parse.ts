@@ -15,9 +15,14 @@
  *   %      附件标记（基于正文：黑体、顶格、段前 0、段后 1 行）
  *   -      列表段落
  *   !      列表标题
- *   ---    分节符（单独一行，新起一页且页码重新从 1 开始）
+ *   ---    分节符（单独一行，新起一页；后面可跟 kwargs 描述**它开启的那一节**）
  *   ===    分页符（单独一行，只强制换页，页码连续）
  *   :::table … :::  表格围栏块（见下）
+ *
+ * 节的设置（语义见 types.ts 的 SectionSettings；只写非默认值，双向可逆）：
+ *   ::section …   文档首行描述**首节**：numbers=off / restart=on / orientation=landscape
+ *   --- …         分节符所开启的节：link=off / numbers=off / restart=on / orientation=landscape
+ *   例：`--- link=off restart=on`（独立页脚 + 页码从 1 重排，= 旧 `---` 的含义）
  *
  * 表格围栏块：
  *   :::table minLines=2
@@ -51,12 +56,14 @@ import type {
   DocModel,
   Inline,
   RevMark,
+  SectionSettings,
   TableBlock,
   TableCellAlign,
   TableCellModel,
   TableRowModel,
 } from '../types'
 import { nextBlockId } from '../types'
+import { normalizeSectionSettings } from '../edit/section'
 
 export interface ParseOptions {
   /** 修订与批注的作者名，写进 docx 的 w:author */
@@ -319,8 +326,42 @@ const BLOCK_RULES: readonly BlockRule[] = [
   { re: /^-\s+(.*)$/, kind: 'listItem' },
 ]
 
-const SECTION_BREAK_RE = /^-{3,}\s*$/
+const SECTION_BREAK_RE = /^-{3,}(?:\s+(.*))?$/
 const PAGE_BREAK_RE = /^={3,}\s*$/
+/**
+ * 文档首行描述**首节**的指令：`::section numbers=off orientation=landscape`。
+ * 只用两个冒号，与表格围栏的三个冒号不撞车；也只认文件第一处非空行，
+ * 免得正文里写「::section …」被吃掉。
+ */
+const SECTION_DIRECTIVE_RE = /^::\s*section\b(.*)$/
+
+/**
+ * 解析分节 kwargs：`link=on|off` / `numbers=on|off` / `restart=on|off` / `orientation=portrait|landscape`。
+ * 认不出的键与值一律忽略（不报错）；认出默认值也不落字段 —— 归一化交给
+ * normalizeSectionSettings（与 setSectionSetting 同一个约定，模型里不留冗余值）。
+ */
+function parseSectionKwargs(attrs: string, isFirst: boolean): SectionSettings {
+  const out: SectionSettings = {}
+  for (const m of attrs.matchAll(/([A-Za-z]+)\s*=\s*(\S+)/g)) {
+    const key = m[1]
+    const value = m[2]
+    if (key === 'numbers') {
+      if (value === 'off') out.pageNumbers = false
+      else if (value === 'on') out.pageNumbers = true
+    } else if (key === 'link') {
+      if (value === 'off') out.linkPrevious = false
+      else if (value === 'on') out.linkPrevious = true
+    } else if (key === 'restart') {
+      if (value === 'on') out.restartAtOne = true
+      else if (value === 'off') out.restartAtOne = false
+    } else if (key === 'orientation') {
+      if (value === 'landscape' || value === 'portrait') out.orientation = value
+    }
+  }
+  normalizeSectionSettings(out, isFirst)
+  return out
+}
+
 /** 表格围栏的起始行：`:::table`，后面可跟 minLines=1|2、cantSplit=yes|no */
 const TABLE_FENCE_RE = /^:::\s*table\b(.*)$/
 /** 表格围栏的结束行（trim 后逐字比较） */
@@ -528,6 +569,10 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
 
   const comments: CommentDef[] = []
   const blocks: Block[] = []
+  // 逐节设置，下标 = 节号。首节由文档首行的 ::section 指令描述；每遇到一个 `---`
+  // 就往后面追加一项（它开启的那一节）。全默认时最后不写进模型（见函数末尾）。
+  const sections: SectionSettings[] = [{}]
+  let firstLineSeen = false
 
   const baseCtx = {
     bold: false,
@@ -552,6 +597,16 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
     const line = (lines[li] ?? '').trimEnd()
     if (line.trim() === '') continue
 
+    // 文档首行（第一处非空行）可能是 `::section …`，描述首节。只在第一行认。
+    if (!firstLineSeen) {
+      firstLineSeen = true
+      const head = SECTION_DIRECTIVE_RE.exec(line)
+      if (head) {
+        sections[0] = parseSectionKwargs(head[1] ?? '', true)
+        continue
+      }
+    }
+
     const fence = TABLE_FENCE_RE.exec(line)
     if (fence) {
       const parsed = parseTableBlock(lines, li, fence[1] ?? '', baseCtx)
@@ -563,8 +618,11 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
       }
     }
 
-    if (SECTION_BREAK_RE.test(line)) {
-      blocks.push({ t: 'sectionBreak', id: nextBlockId('s'), restartNumbering: true })
+    const sectionBreak = SECTION_BREAK_RE.exec(line)
+    if (sectionBreak) {
+      // `---` 后面可以跟 kwargs（只写非默认值），描述**它开启的**那一节
+      sections.push(parseSectionKwargs(sectionBreak[1] ?? '', false))
+      blocks.push({ t: 'sectionBreak', id: nextBlockId('s') })
       continue
     }
 
@@ -597,5 +655,9 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
     })
   }
 
-  return { blocks, comments }
+  // 全默认就不写这个字段：`sections: [{}, {}]` 与「没有 sections」语义相同，
+  // 两种形态都能存在的话，「模型 → md → 模型」会在两者之间漂移（见 edit/section.ts）。
+  const doc: DocModel = { blocks, comments }
+  if (sections.some((s) => Object.keys(s).length > 0)) doc.sections = sections
+  return doc
 }
