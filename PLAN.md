@@ -554,6 +554,89 @@ NaN/空串/0/负数/小数/超大值全部落在界内、U 节断言不放水也
 
 ---
 
+### 6.10 W4b 设计（2026-09-13 拍板，勿再改回）
+
+**用户拍板四条**：① 控件形态 = **上下文工具条**（不是浮动面板）；② Tab 走到**最后一个格子时按了不作任何响应**
+（不换行、不自动加行）；③ 本波**拆两轮**：W4b-1（模型操作 + 工具条 + radio + 格内 Shift+Enter + 边界护栏）
+→ W4b-2（Tab / 方向键跨格）；④ 派发子进程**不钉 `--model`**（用 CLI 默认，主 session 自己跑 type-check 兜底）。
+
+**模型不动**：`TableBlock` 已能表达全部状态（`rows` 顺序即显示顺序、`role`、`columns`、`minLines`、`cantSplit`）。
+增删行列 = 数组增删 + `normalizeTable()` 重算 `columns` + 重排渲染；量测缓存签名含整张表 HTML，改一格即失效。
+
+**W4b-1 内容**
+
+- 新文件 `src/lib/edit/table.ts`（纯函数、node 可单测）：`findTable(doc, id)`（id 可以是表格 id 或格子的
+  cellId）、`insertBodyRow(table, at)`、`removeBodyRow(table, at)`（body 行只剩 1 行时拒绝）、
+  `setRoleRow(table, 'unit' | 'note', on)`（各至多一行）、`insertColumn(table, at)` / `removeColumn(table, at)`
+  （只作用于 body 行，`columns` 会掉到 0 时拒绝）、`normalizeTable(table)`（`columns` = body 行最大格数且 ≥1；
+  unit/note 行只留第 0 格）、`setMinLines()`。
+- `EditorSelection`（`edit/model.ts` + `index.ts` 导出）增加可选 `table` 上下文：tableId / row / col / role /
+  rows / columns / bodyRows / minLines / hasUnit / hasNote，由 `WordPaper.vue` 的 `emitSelection()` 从模型现算
+  —— App 侧拿不到响应式的模型，上下文工具条只能吃这一次 emit。
+- `App.vue`：主工具栏下方多加一条 `v-if="mode === 'edit' && selection?.table"` 的上下文工具条：行（上方插入 /
+  下方插入 / 删除行）、列（左侧插入 / 右侧插入 / 删除列）、行高两档 radio、表头行(unit) 有/无 radio、
+  附注行(note) 有/无 radio。按钮一律 `@mousedown.prevent`（焦点不离开正文，落点与 native 选区才保得住）。
+  禁用规则：删除行（光标在 unit/note 行、或 body 行只剩 1 行）、删除列（`columns <= 1`）。
+  **列的下标参照**：unit/note 行天然只有一格（恒为 `c0`），在那两行做列操作就按第 0 列算。
+  记得加进 `@media print` 的隐藏清单并同步打印隐藏断言（`.table-panel` 已有先例）。
+- `WordPaper.vue` 新增并 `defineExpose`：`insertTableRow(where)`、`removeTableRow()`、
+  `insertTableColumn(where)`、`removeTableColumn()`、`setTableMinLines(n)`、`setTableRoleRow(role, on)`。
+  每个都是「取落点 → `pushHistory(caret)` → 改模型 → 用**新下标**重算锚点 → `refreshLayout({anchor, force:true})`」。
+- **`cellId` 里嵌的是行/列下标**（`tb1.r2c1`），所以任何增删都会让其后的格子 id 整体位移 —— 新锚点必须按
+  新下标重算。这是 W4a 定的坐标方案的必然结果，不是缺陷。
+- 格内 **Shift+Enter** 插 `{ t: 'break' }`。**落点是个坑**：软换行零宽，`offsetToPoint` 会把同一偏移还原到
+  「换行之前」（上一行末尾），照原样 `placeCaret` 会让回车后敲的字打回上一行。做法：`edit/dom.ts` 新增
+  `placeCaretAfterBreak(root, point)`（定位到该字符偏移处的 `.wtp-br`，用 `range.setStartAfter(br)`），
+  `refreshLayout` 的选项加 `afterBreak?: boolean`，只在 Shift+Enter 这一条路径上传 `true`。
+  **不要**去改 `offsetToPoint` 的通用约定（那会连带影响普通段落里已有的软换行）。
+- 格内**边界护栏**（现在缺，必须补）：格首 Backspace、格尾 Delete 都要 `preventDefault` —— 否则浏览器原生
+  会把相邻 `<td>` 的 DOM 并掉，直接破坏表格结构。格内 Enter 仍不接管（单元格是单段落，见 6.1）。
+- 验收脚本：`test-edit-model.mjs` 补 `edit/table.ts` 的结构操作单测（含两处保底：最后一行 body 不可删、
+  最后一列不可删；以及 `normalizeTable` 的 columns 归一）；`verify-docx.mjs` 扩样本（带 unit/note 行的多行表）
+  与对账；`verify-editor.mjs` **写**上下文工具条与 Shift+Enter 的浏览器断言（本机跑不了，见 9.7）。
+
+**W4b-2 内容**（等 W4b-1 验收完再派）：Tab / Shift+Tab 行优先跨格（unit/note 行整行算一格）；Tab 在最后一格
+= 无响应；→/← 在格首/格尾跨格；↑/↓ 在格内首/末视觉行跨格（用 `getClientRects()` 比较插入符与格内首字符 /
+末字符的 top 来判定）。纯手感，只能人工核对。
+
+### 6.11 W4b-1 结论（2026-09-13，已提交）
+
+**范围**：新增 `src/lib/edit/table.ts`；`EditorSelection` 加表格上下文；`WordPaper.vue` 增加 6 个表格操作
+并 `defineExpose`；格内 Shift+Enter；格首 Backspace / 格尾 Delete 护栏；`App.vue` 的上下文工具条。
+**Tab / 方向键跨格按用户拍板留给 W4b-2**（且「Tab 停在最后一个格子时按了不作任何响应」）。
+
+**本波定下的接口事实（W4b-2 与 W5 照做，别再重新设计）**：
+
+- `edit/table.ts` 导出 `findTable` / `bodyRowIndexes` / `bodyInsertIndex` / `insertBodyRow` / `removeBodyRow` /
+  `setRoleRow` / `insertColumn` / `removeColumn` / `normalizeTable` / `setMinLines`；**组件层不要再自己实现一份**
+  （W4a-2 时组件里那份本地 `bodyIndexes` 已删掉）。
+- **插入行的落点必须先过 `bodyInsertIndex(table, at)`**：它把「想插在第几行」夹进 body 区间。不夹的话，
+  光标停在 unit 行时点「上方插入行」会把 body 行插到表头之前（note 行对称），破坏 unit → body… → note 的显示顺序。
+  锚点行 = `at <= 光标行 ? 光标行 + 1 : 光标行`。
+- `EditorSelection.table`（`TableSelectionContext`）由 `emitSelection()` 从模型现算 —— App 侧没有响应式模型，
+  上下文工具条只能吃这一次 emit。
+- **每个结构操作在 `refreshLayout` 之后都要补一次 `void nextTick(emitSelection)`**：点按钮 / radio 会把焦点
+  从正文拿走，`selectionchange` 未必再触发；不补这一下，工具条的 radio 选中态与行列提示会停在旧值
+  （用户看着就是「点了没反应」）。
+- 格内 Shift+Enter 的落点走 `edit/dom.ts` 新增的 `placeCaretAfterBreak()` + `RefreshOptions.afterBreak`。
+  原因：软换行零宽，同一字符偏移既能是「换行前」也能是「换行后」，通用 `offsetToPoint` 一律还原到换行前，
+  于是回车后敲的字会打回上一行。**`afterBreak: true` 全仓库只允许 Shift+Enter 这一条路径上传**。
+- 格内边界键一律 `preventDefault`：格首 Backspace / 格尾 Delete 若放给浏览器，原生会把相邻 `<td>` 的 DOM 并掉，
+  直接破坏表格结构。格内 **Enter 仍不接管**（单元格是单段落）。
+
+**机器验收（全绿）**：`type-check` 0 错；`test-edit-model` **341 → 365**；`test-paginate` 96/96；
+`verify:docx` 全 ok；`verify:p1` Word COM `[PASS]`（含「unit + body×5 + note」共 7 行的逐项对账）。
+`verify-editor.mjs` 新增 V 节（工具条出现/消失、插入行、删列禁用、两组 radio、Shift+Enter 的落点在换行之后、
+格首 Backspace 后模型不变）**写了但本机没跑**（Edge 坏，见 9.7）；`verify:p2` / `p3` / `pages` 一律没跑。
+
+**独立验收与增量复核**：第一轮判**「可接受」**，两条非阻断项 —— ① 在 unit/note 行上插入行会破坏行序；
+② 单测没覆盖「**列下标 0 + 含 unit/note 行**」这个「unit/note 豁免」唯一会暴露的角落（第一轮变异 M3/M4
+当时红不了）。两条都在提交前修掉：新增 `bodyInsertIndex` 夹取 + 补两组单测；复核方用变异实测确认现在会变红。
+提交前主 session 还误跑过一次 `prettier --write`（见 9.4），已逐字节还原，并就此单独派了一轮增量复核，
+结论同为**「可接受」**。
+
+---
+
 ## 7. W5 —— 节编辑框架
 
 **需求原文（issue 第 1 条）**：
@@ -683,6 +766,13 @@ NaN/空串/0/负数/小数/超大值全部落在界内、U 节断言不放水也
 4. **prettier**：仓库 `format` 脚本用 `npx prettier --experimental-cli`。
    默认 CLI 会对**你根本没碰过**的既有文件报格式问题（`numbering.ts` / `paginate.ts` / `measure.ts` 等），
    那属既有状态，不要顺手格式化它们。
+   ⚠️ **不要对既有文件跑 `prettier --write`**：根 `.prettierrc.json` 写的是 `tabWidth: 4`，而源码实际是
+   **2 空格缩进**、也不满足 prettier 的若干其它规则 —— 一旦 `--write`，整批文件会被按 4 空格重排。
+   （2026-09-13 W4b-1 会话踩过：9 个代码文件被重排，靠 `git -c core.autocrlf=false checkout --` 退回 HEAD、
+   再用**格式化之前**的工作区快照 `.qwen/tmp/w4b1r-baseline.diff` 的对应 hunk `git apply --include=` 回去，
+   才做到逐字节还原。要动格式化，先想清楚这一步。）
+   另外 **prettier 会忽略 `.qwen/` 下的文件**：把 HEAD 副本拷进 `.qwen/tmp/` 再 `prettier --check`，会得到
+   「全部合规」的**假阴性**，不能拿它判定某个文件是否 prettier-clean。
 5. **字体依赖本机安装**：预览与 docx 都写「仿宋 / 华文中宋 / Times New Roman」，都是商业字体、不能内置。
    「方正小标宋」这类公文字体本机大概率没有 —— 涉及新字体前先确认，否则预览会回退、行宽会变。
 6. **`docx` 库打包后再改 `styles.xml` 时必须 `createFolders: false`**（见 `lib/docx/lineUnits.ts`），
@@ -706,7 +796,8 @@ NaN/空串/0/负数/小数/超大值全部落在界内、U 节断言不放水也
 | W3 | 查找替换 + 导航窗格 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——替换后插入符锚点缺失，修完聚焦复核「可接受」，结论见第 5.3 节） |
 | W4a-1 | 表格：模型 + md 围栏语法 + docx 导出 + Word 读回对账 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——格内 `{红|…}` / `[[]]` 里的竖线被当列分隔符，修完聚焦复核「可接受」且做了变异测试；结论见第 6.7 节） |
 | W4a-2 | 表格：预览渲染 + 量测 + 分页 + 编辑读回收口 + demo 样本放表 + 「插入表格」按钮 + 软换行 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收「可接受」并修掉一处必修缺陷；**版式一致性改人工核对**，结论见 6.9） |
-| W4b | 表格：编辑交互（Tab / 方向键跨格、增删行列、unit/note 行开关、行高两档、格内 Shift+Enter） | 未开工 |
+| W4b-1 | 表格：结构操作（增删行列、unit/note radio、行高两档）+ 上下文工具条 + 格内 Shift+Enter + 边界护栏 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收与增量复核均判「可接受」，结论见 6.11） |
+| W4b-2 | 表格：Tab / 方向键跨格导航（用户已定：Tab 停在最后一格时按了不作任何响应） | 未开工（设计见 6.10 末段） |
 | W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |
 
 **收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。

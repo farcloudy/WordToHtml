@@ -244,6 +244,21 @@ writeFileSync(outPath, buffer)
   if (usedBuiltinSample && tables.length === 0) {
     problems.push('内置样本里没有表格 —— 这一项等于没验')
   }
+  /*
+   * W4b-1 的表格结构操作产出的就是这几种行（unit / 多行 body / note），
+   * 对账侧要真验到它们才有意义 —— 内置样本退化成「缺某种行」时要红，别静默放水。
+   * 只约束内置样本：外部源码（verify:pages 把界面里的源码喂进来）里表格长什么样是调用方的事。
+   */
+  if (usedBuiltinSample && tables.length > 0) {
+    const roles = new Set(tables.flatMap((t) => t.rows.map((r) => r.role)))
+    const missing = ['unit', 'body', 'note'].filter((role) => !roles.has(role))
+    if (missing.length > 0) {
+      problems.push(`内置样本的表格没覆盖这些行角色：${missing.join('、')} —— 对它们等于没验`)
+    }
+    if (tables.some((t) => t.rows.filter((r) => r.role === 'body').length < 2)) {
+      problems.push('内置样本的表格 body 行少于 2 行 —— 多行 body 的形状没被验到')
+    }
+  }
   if (tables.length > 0) {
     // 版心宽（缇）：1in = 1440twips = 96px，即 px × 15
     const contentTwips = Math.round(

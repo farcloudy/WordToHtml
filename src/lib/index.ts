@@ -101,7 +101,20 @@ export {
   splitBlock,
   updateComment,
 } from './edit/model'
-export type { BlockPoint, EditorSelection, InlineContainer } from './edit/model'
+export type { BlockPoint, EditorSelection, InlineContainer, TableSelectionContext } from './edit/model'
+
+export {
+  bodyInsertIndex,
+  bodyRowIndexes,
+  findTable,
+  insertBodyRow,
+  insertColumn,
+  normalizeTable,
+  removeBodyRow,
+  removeColumn,
+  setMinLines,
+  setRoleRow,
+} from './edit/table'
 
 export { formatAmount } from './edit/amount'
 
@@ -119,6 +132,7 @@ export {
   fragmentOf,
   offsetToPoint,
   placeCaret,
+  placeCaretAfterBreak,
   placeRange,
   pointToOffset,
   prefixLengthOf,

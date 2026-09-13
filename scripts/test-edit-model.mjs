@@ -19,6 +19,8 @@ import {
   addComment,
   applyFormat,
   blockLength,
+  bodyInsertIndex,
+  bodyRowIndexes,
   buildOutline,
   cellId,
   cloneDoc,
@@ -28,11 +30,15 @@ import {
   findBlock,
   findContainer,
   findMatches,
+  findTable,
   formatAmount,
+  insertBodyRow,
   insertBreakAfter,
+  insertColumn,
   insertText,
   mergeIntoPrevious,
   normalizeBlocks,
+  normalizeTable,
   outlineSignature,
   parseCellId,
   parseMd,
@@ -40,7 +46,9 @@ import {
   rangeColor,
   rangeIsBold,
   rangeIsUnderline,
+  removeBodyRow,
   removeBreak,
+  removeColumn,
   removeComment,
   renderTableFragment,
   replyComment,
@@ -48,6 +56,8 @@ import {
   replaceRange,
   resolveSpec,
   setBlockKind,
+  setMinLines,
+  setRoleRow,
   sliceInlines,
   splitBlock,
   toBase64,
@@ -999,6 +1009,230 @@ console.log('\n=== 22. 表格片段渲染：接口约束（外层无 data-block-
 
   const single = parseMd(':::table\n| a |\n:::').blocks[0]
   eq('minLines=1 用另一个修饰类', renderTableFragment(single, 0, 1).includes('wtp-table-min1'), true)
+}
+
+console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、归一化、行高 ===')
+{
+  /** 直接造一张表（不走 md，才能造出「各 body 行格数参差」这类形状） */
+  const makeTable = (rows, columns = 1, minLines = 1) => ({
+    t: 'table',
+    id: 'tb1',
+    rows,
+    columns,
+    minLines,
+    cantSplit: true,
+  })
+  const bodyRow = (...texts) => ({
+    role: 'body',
+    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
+  })
+  const roleRow = (role, text = '') => ({
+    role,
+    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
+  })
+  const shape = (table) => table.rows.map((r) => `${r.role}:${r.cells.length}`).join(',')
+
+  // ---- insertBodyRow ----
+  {
+    const table = makeTable([bodyRow('a', 'b'), bodyRow('c', 'd'), bodyRow('e', 'f')], 2)
+    eq('插在中间返回新行下标', insertBodyRow(table, 1), 1)
+    eq('插在中间后行数 +1', table.rows.length, 4)
+    eq('新行是 body', table.rows[1].role, 'body')
+    eq('新行格数 = 当时的 columns', table.rows[1].cells.length, 2)
+    eq('其余行没被挪动', table.rows[2].cells[0].inlines[0].text, 'c')
+
+    const front = makeTable([bodyRow('a', 'b')], 2)
+    eq('插在最前返回 0', insertBodyRow(front, 0), 0)
+    eq('插在最前落到 0 号位', front.rows[0].role === 'body' && front.rows.length, 2)
+
+    const end = makeTable([bodyRow('a', 'b')], 2)
+    eq('插在末尾（下标 = 行数）', insertBodyRow(end, 1), 1)
+    eq('插入后总数', end.rows.length, 2)
+
+    const over = makeTable([bodyRow('a', 'b')], 2)
+    eq('越界下标夹到末尾', insertBodyRow(over, 99), 1)
+    eq('新行格数仍是 columns', over.rows[1].cells.length, 2)
+  }
+
+  // ---- bodyRowIndexes / bodyInsertIndex ----
+  {
+    const table = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a'), bodyRow('b'), roleRow('note', 'n')],
+      1,
+    )
+    eq('body 行下标按显示顺序', bodyRowIndexes(table).join(','), '1,2')
+    const noUnit = makeTable([bodyRow('a'), bodyRow('b')], 1)
+    eq('没有 unit 时 body 下标从 0 起', bodyRowIndexes(noUnit).join(','), '0,1')
+    const noBody = makeTable([roleRow('unit', 'u'), roleRow('note', 'n')], 1)
+    eq('没有 body 行时是空数组', bodyRowIndexes(noBody).length, 0)
+
+    // 光标在 unit 行时「上方插入行」的直觉落点是 0 号位，必须被夹到第一个 body 行之前，
+    // 否则 body 行会插到表头行上面（note 行同理）
+    eq('unit 行上「上方插入」被夹到 unit 之后', bodyInsertIndex(table, 0), 1)
+    eq('unit 行上「下方插入」也落在 unit 之后', bodyInsertIndex(table, 1), 1)
+    eq('note 行上「下方插入」被夹到 note 之前', bodyInsertIndex(table, table.rows.length), 3)
+    eq('note 行上「上方插入」也在 note 之前', bodyInsertIndex(table, 3), 3)
+    eq('body 行之间照原样', bodyInsertIndex(table, 2), 2)
+    eq('负数夹到第一个 body 行', bodyInsertIndex(table, -5), 1)
+    eq('越界数夹到 note 之前', bodyInsertIndex(table, 99), 3)
+
+    const target = makeTable([roleRow('unit', 'u'), bodyRow('a'), roleRow('note', 'n')], 1)
+    insertBodyRow(target, bodyInsertIndex(target, 0))
+    eq('夹过之后行序仍是 unit → body → note', shape(target), 'unit:1,body:1,body:1,note:1')
+
+    // 一个 body 行都没有的表（md 里只写了 unit / note）
+    const lonely = makeTable([roleRow('unit', 'u'), roleRow('note', 'n')], 1)
+    eq('无 body 行时插到 note 之前', bodyInsertIndex(lonely, 0), 1)
+    const noNote = makeTable([roleRow('unit', 'u')], 1)
+    eq('无 body 也无 note 时插在末尾', bodyInsertIndex(noNote, 0), 1)
+    const onlyNote = makeTable([roleRow('note', 'n')], 1)
+    eq('只有 note 时插在最前', bodyInsertIndex(onlyNote, 0), 0)
+  }
+
+  // ---- removeBodyRow ----
+  {
+    const table = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b'), bodyRow('c', 'd')], 2)
+    const before = JSON.stringify(table)
+    eq('越界行删不掉', removeBodyRow(table, 9), false)
+    eq('越界时原样不动', JSON.stringify(table), before)
+    eq('非 body 行（unit）删不掉', removeBodyRow(table, 0), false)
+    eq('非 body 行时原样不动', JSON.stringify(table), before)
+    eq('正常删除返回 true', removeBodyRow(table, 1), true)
+    eq('删完只剩 unit + 1 个 body', shape(table), 'unit:1,body:2')
+
+    const last = makeTable([bodyRow('a', 'b')], 2)
+    const lastBefore = JSON.stringify(last)
+    eq('只剩一个 body 行时拒绝', removeBodyRow(last, 0), false)
+    eq('拒绝时原样不动', JSON.stringify(last), lastBefore)
+  }
+
+  // ---- setRoleRow ----
+  {
+    const table = makeTable([bodyRow('a', 'b')], 2)
+    setRoleRow(table, 'unit', true)
+    eq('unit 加在最前', shape(table), 'unit:1,body:2')
+    eq('unit 行只留一格', table.rows[0].cells.length, 1)
+    setRoleRow(table, 'unit', true)
+    eq('重复 unit=true 幂等（不产生第二行）', table.rows.filter((r) => r.role === 'unit').length, 1)
+
+    setRoleRow(table, 'note', true)
+    eq('note 加在最后', shape(table), 'unit:1,body:2,note:1')
+    setRoleRow(table, 'note', true)
+    eq('重复 note=true 幂等', table.rows.filter((r) => r.role === 'note').length, 1)
+
+    setRoleRow(table, 'unit', false)
+    eq('删 unit 只删它自己', shape(table), 'body:2,note:1')
+    setRoleRow(table, 'note', false)
+    eq('删 note 只删它自己', shape(table), 'body:2')
+    setRoleRow(table, 'note', false)
+    eq('note=false 且本来没有 → 空操作', shape(table), 'body:2')
+  }
+
+  // ---- insertColumn / removeColumn ----
+  {
+    const table = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b'), bodyRow('c', 'd'), roleRow('note', 'n')], 2)
+    insertColumn(table, 1)
+    eq('插列只动 body 行', shape(table), 'unit:1,body:3,body:3,note:1')
+    eq('unit 行格数不变', table.rows[0].cells.length, 1)
+    eq('新列内容为空', table.rows[1].cells[1].inlines.length, 0)
+    eq('原格向后挪', table.rows[1].cells[2].inlines[0].text, 'b')
+
+    // 参差行：at 按每行实际格数夹取，不要求先拍平
+    const ragged = makeTable([bodyRow('a', 'b'), bodyRow('c', 'd', 'e')], 3)
+    insertColumn(ragged, 2)
+    eq('参差行各按自己的长度夹取', shape(ragged), 'body:3,body:4')
+    eq('columns 重算为最大格数', ragged.columns, 4)
+
+    // removeColumn：只动 body；unit/note 不变
+    const del = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b', 'c'), bodyRow('d', 'e', 'f'), roleRow('note', 'n')], 3)
+    eq('删列成功', removeColumn(del, 1), true)
+    eq('删列只动 body 行', shape(del), 'unit:1,body:2,body:2,note:1')
+    eq('删掉的是第 1 列', del.rows[1].cells.map((c) => c.inlines[0]?.text).join(''), 'ac')
+    eq('columns 重算', del.columns, 2)
+
+    // 最后一列不可删：逐行逐格深比较，一格都不许动
+    const single = makeTable([roleRow('unit', 'u'), bodyRow('a'), roleRow('note', 'n')], 1)
+    const singleBefore = JSON.stringify(single)
+    eq('columns<=1 时拒绝删列', removeColumn(single, 0), false)
+    eq('拒绝时逐行逐格原样', JSON.stringify(single), singleBefore)
+
+    // 参差表删列：有的行没有这一列，就不动它
+    const raggedDel = makeTable([bodyRow('a', 'b'), bodyRow('c', 'd', 'e')], 3)
+    eq('参差表删列成功', removeColumn(raggedDel, 2), true)
+    eq('没有该列的行不动', shape(raggedDel), 'body:2,body:2')
+
+    /*
+     * 第 0 列 + 含 unit/note 行：这是「unit/note 豁免」唯一会暴露的角落 ——
+     * 下标 ≥1 时 normalizeTable 会把多出来的格裁掉，看起来像是豁免生效了；
+     * 只有在下标 0 上插/删，表头与附注的文字才会被新格顶掉。所以必须专门测这一例。
+     */
+    const zeroCol = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a', 'b'), roleRow('note', 'n')],
+      2,
+    )
+    insertColumn(zeroCol, 0)
+    eq('第 0 列插列不动 unit/note', shape(zeroCol), 'unit:1,body:3,note:1')
+    eq('插列后 unit 行的文字还在', zeroCol.rows[0].cells[0].inlines[0].text, 'u')
+    eq('插列后 note 行的文字还在', zeroCol.rows[2].cells[0].inlines[0].text, 'n')
+    eq('新列插在 body 行的 0 号位', zeroCol.rows[1].cells[0].inlines.length, 0)
+    eq('body 行原格向后挪', zeroCol.rows[1].cells[1].inlines[0].text, 'a')
+
+    const zeroDel = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a', 'b'), roleRow('note', 'n')],
+      2,
+    )
+    const zeroDelUnit = JSON.stringify(zeroDel.rows[0])
+    const zeroDelNote = JSON.stringify(zeroDel.rows[2])
+    eq('第 0 列删列成功', removeColumn(zeroDel, 0), true)
+    eq('第 0 列删列不动 unit/note', shape(zeroDel), 'unit:1,body:1,note:1')
+    eq('删列后 unit 行逐格原样', JSON.stringify(zeroDel.rows[0]), zeroDelUnit)
+    eq('删列后 note 行逐格原样', JSON.stringify(zeroDel.rows[2]), zeroDelNote)
+    eq('body 行删掉的确实是第 0 列', zeroDel.rows[1].cells[0].inlines[0].text, 'b')
+  }
+
+  // ---- normalizeTable ----
+  {
+    const table = makeTable(
+      [roleRow('unit', 'u'), bodyRow('a'), bodyRow('b', 'c', 'd'), roleRow('note', 'n')],
+      1,
+    )
+    normalizeTable(table)
+    eq('columns = body 行最大格数', table.columns, 3)
+    eq('参差 body 行不增不减（不被拍平）', shape(table), 'unit:1,body:1,body:3,note:1')
+
+    const trim = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b', 'c')], 3)
+    trim.rows[0].cells = [{ inlines: [] }, { inlines: [] }, { inlines: [] }]
+    normalizeTable(trim)
+    eq('unit 行被裁到只剩第 0 格', trim.rows[0].cells.length, 1)
+
+    const empty = makeTable([bodyRow(), bodyRow('a', 'b')], 0)
+    normalizeTable(empty)
+    eq('columns 取 body 行的最大值（空格不影响）', empty.columns, 2)
+    const zero = makeTable([bodyRow()], 0)
+    normalizeTable(zero)
+    eq('全是空格时 columns 兜底为 1', zero.columns, 1)
+  }
+
+  // ---- setMinLines ----
+  {
+    const table = makeTable([bodyRow('a', 'b')], 2, 2)
+    setMinLines(table, 1)
+    eq('行高切到最小一行', table.minLines, 1)
+    setMinLines(table, 2)
+    eq('行高切回最小两行', table.minLines, 2)
+  }
+
+  // ---- findTable ----
+  {
+    const table = makeTable([bodyRow('a', 'b')], 2)
+    const paragraph = { t: 'textBlock', id: 't0', kind: 'body', inlines: [{ t: 'text', text: '正文' }] }
+    const model = { blocks: [paragraph, table], comments: [] }
+    eq('按表格 id 命中', findTable(model, 'tb1')?.id, 'tb1')
+    eq('按 cellId 命中同一张表', findTable(model, cellId('tb1', 0, 1))?.id, 'tb1')
+    eq('不存在的 id → undefined', findTable(model, 'tbX'), undefined)
+    eq('段落 id → undefined（它不是表）', findTable(model, 't0'), undefined)
+    eq('cellId 指向的表格不存在 → undefined', findTable(model, cellId('tbX', 0, 0)), undefined)
+  }
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

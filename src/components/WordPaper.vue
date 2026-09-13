@@ -26,6 +26,7 @@ import {
   fragmentOf,
   offsetToPoint,
   placeCaret,
+  placeCaretAfterBreak,
   placeRange,
   prefixLengthOf,
   readInlines,
@@ -40,6 +41,7 @@ import {
   addComment,
   applyFormat,
   cloneDoc,
+  containerLength,
   findBlock,
   findContainer,
   insertBreakAfter,
@@ -58,6 +60,17 @@ import {
   updateComment as updateCommentOp,
 } from '../lib/edit/model'
 import type { EditorSelection } from '../lib/edit/model'
+import {
+  bodyInsertIndex,
+  bodyRowIndexes,
+  findTable,
+  insertBodyRow,
+  insertColumn,
+  removeBodyRow,
+  removeColumn,
+  setMinLines,
+  setRoleRow,
+} from '../lib/edit/table'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
 import {
@@ -323,6 +336,11 @@ interface RefreshOptions {
   anchorEnd?: DisplayPoint | null
   /** 即使分页没变也重建 DOM（格式化、批注这类不改行数但要改外观的操作） */
   force?: boolean
+  /**
+   * 锚点落在软换行处时，落到换行**之后**（只有单元格里的 Shift+Enter 用）。
+   * 软换行零宽，默认的 placeCaret 会还原到换行之前 —— 那会让回车后敲的字打回上一行。
+   */
+  afterBreak?: boolean
 }
 
 function ensureCss(spec: Spec): void {
@@ -375,12 +393,15 @@ function refreshLayout(options: RefreshOptions = {}): void {
   const anchor = options.anchor
   if (!anchor) return
   const anchorEnd = options.anchorEnd
+  const afterBreak = options.afterBreak === true
   void nextTick(() => {
     if (current !== token) return
     const rootEl = root.value
     if (!rootEl) return
     if (anchorEnd && (anchorEnd.blockId !== anchor.blockId || anchorEnd.offset !== anchor.offset)) {
       placeRange(rootEl, anchor, anchorEnd)
+    } else if (afterBreak) {
+      placeCaretAfterBreak(rootEl, anchor)
     } else {
       placeCaret(rootEl, anchor)
     }
@@ -608,6 +629,9 @@ function emitSelection(): void {
   const p = prefixLength(range.start.blockId)
   const from = Math.max(0, range.start.offset - p)
   const to = Math.max(from, range.end.offset - p)
+  // 光标在格子里时把表格上下文一并带出去：App 没有响应式的模型，上下文工具条只能靠这一次 emit
+  const cell = parseCellId(range.start.blockId)
+  const table = cell ? findTable(doc.value, cell.tableId) : undefined
   emit('selection-change', {
     blockId: range.start.blockId,
     kind,
@@ -616,6 +640,22 @@ function emitSelection(): void {
     collapsed: to === from,
     bold: to > from ? rangeIsBold(container, from, to) : false,
     color: to > from ? rangeColor(container, from, to) : undefined,
+    ...(cell && table
+      ? {
+          table: {
+            tableId: cell.tableId,
+            row: cell.row,
+            col: cell.col,
+            role: table.rows[cell.row]?.role ?? 'body',
+            rows: table.rows.length,
+            columns: table.columns,
+            bodyRows: table.rows.filter((row) => row.role === 'body').length,
+            minLines: table.minLines,
+            hasUnit: table.rows.some((row) => row.role === 'unit'),
+            hasNote: table.rows.some((row) => row.role === 'note'),
+          },
+        }
+      : {}),
   })
 }
 
@@ -758,14 +798,17 @@ function onKeydown(event: KeyboardEvent): void {
   }
   if (event.key === 'Enter') {
     /*
-     * 格内的一律不接管：Enter / Shift+Enter 都只 preventDefault，不动模型。
-     * Enter 分段与 Shift+Enter 软换行的按键绑定都留给 W4b —— 但护栏现在就得上：
+     * 格内 Enter 一律不接管（单元格是单段落，分段表达不出来）—— 但护栏现在就得有：
      * 不拦的话回车会掉进 insertParagraphBreak，把整张表当段落切开。
      * （insertParagraphBreak 里还有一道 findBlock 兜底，两道都在，免得日后改一处漏一处。）
+     * 格内 Shift+Enter 插一枚软换行（Word 的 <w:br/>），插入符落到换行之后。
      */
     const point = caretPoint()
     event.preventDefault()
-    if (point && isTableCell(point.blockId)) return
+    if (point && isTableCell(point.blockId)) {
+      if (event.shiftKey) insertSoftBreak(point)
+      return
+    }
     insertParagraphBreak()
     return
   }
@@ -774,6 +817,15 @@ function onKeydown(event: KeyboardEvent): void {
     if (!sel || !sel.isCollapsed) return
     const point = caretPoint()
     if (!point) return
+    /*
+     * 格内退格单独守住：格首那一退如果放给浏览器，原生会把相邻 `<td>` 的 DOM 并掉，
+     * 表格结构当场就坏了（格内偏移为 0 = 光标顶在格首；格子的前缀恒为 0）。
+     * 格内别的位置不动，交给浏览器在格内正常退格。
+     */
+    if (isTableCell(point.blockId)) {
+      if (point.offset <= prefixLength(point.blockId)) event.preventDefault()
+      return
+    }
     if (point.offset > prefixLength(point.blockId)) return
     const merged = mergeIntoPrevious(doc.value, point.blockId)
     if (!merged) return
@@ -786,7 +838,39 @@ function onKeydown(event: KeyboardEvent): void {
       },
       force: true,
     })
+    return
   }
+  if (event.key === 'Delete' && !mod) {
+    const sel = document.getSelection()
+    if (!sel || !sel.isCollapsed) return
+    const point = caretPoint()
+    if (!point || !isTableCell(point.blockId)) return
+    /*
+     * 格尾的 Delete 同样是结构性的：不拦的话原生会跟下一格合并。
+     * 只在「格内偏移已到格文字长度」时接管，格内其它位置留给浏览器。
+     */
+    const container = findContainer(doc.value, point.blockId)
+    if (!container) return
+    if (point.offset >= prefixLength(point.blockId) + containerLength(container)) {
+      event.preventDefault()
+    }
+    return
+  }
+}
+
+/** 单元格里 Shift+Enter：在插入符处插一枚软换行（零宽），插入符落到换行之后 */
+function insertSoftBreak(point: DisplayPoint): void {
+  const container = findContainer(doc.value, point.blockId)
+  if (!container) return
+  const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+  pushHistory(point)
+  replaceRange(container, offset, offset, [{ t: 'break' }])
+  refreshLayout({
+    // 模型偏移在换行处不变（零宽），靠 afterBreak 把插入符落到换行之后
+    anchor: { blockId: point.blockId, offset: prefixLength(point.blockId) + offset },
+    force: true,
+    afterBreak: true,
+  })
 }
 
 /** 这个 id 是表格格子（`tableId.rNcM`）还是普通段落？格子的结构性操作都得绕开 */
@@ -1199,6 +1283,171 @@ function insertTable(rows: number = NEW_TABLE_ROWS, columns: number = NEW_TABLE_
 }
 
 /* -------------------------------------------------------------------------- */
+/* 表格结构操作（W4b-1）                                                       */
+/* -------------------------------------------------------------------------- */
+
+/** 表格结构操作的落点。取不到（不可编辑 / 不在格子里）时为 null */
+interface TableCaretTarget {
+  tableId: string
+  table: TableBlock
+  /** 光标所在行在 rows 数组里的下标 */
+  row: number
+  /** 列下标；unit/note 行天然只有一格，恒为 0 */
+  col: number
+  /** 格内模型偏移（格子的前缀恒为 0，仍按现有写法扣一次更稳） */
+  offset: number
+  /** 改之前那一刻的落点，记进撤销栈用 */
+  point: DisplayPoint
+}
+
+/** 取落点所在的表格与格子；不在格子里就直接判空（调用方据此空转、不 pushHistory） */
+function tableTarget(): TableCaretTarget | null {
+  if (!props.editable) return null
+  const point = caretPoint()
+  if (!point) return null
+  const cell = parseCellId(point.blockId)
+  if (!cell) return null
+  const table = findTable(doc.value, cell.tableId)
+  if (!table) return null
+  return {
+    tableId: cell.tableId,
+    table,
+    row: cell.row,
+    col: cell.col,
+    offset: Math.max(0, point.offset - prefixLength(point.blockId)),
+    point,
+  }
+}
+
+/** 某个 rows 下标之前有几个 body 行（即该行在 body 行里的序数） */
+function bodyOrdinal(table: TableBlock, row: number): number {
+  let count = 0
+  for (let i = 0; i < row && i < table.rows.length; i += 1) {
+    if (table.rows[i]?.role === 'body') count += 1
+  }
+  return count
+}
+
+/**
+ * 表格结构操作的收尾：按**新下标**重算锚点 → 重排 → 把选区回显给工具条。
+ *
+ * `cellId` 里嵌的是行/列下标（`tb1.r2c1`），任何增删都会让其后的格子 id 整体位移，
+ * 所以新锚点只能拿新下标重新组，不能沿用旧 id；偏移也要夹到该格的新长度以内。
+ */
+function finishTableOp(target: TableCaretTarget, row: number, col: number, offset: number): void {
+  const table = target.table
+  const r = Math.min(Math.max(0, row), Math.max(0, table.rows.length - 1))
+  const cellCount = table.rows[r]?.cells.length ?? 0
+  const c = Math.min(Math.max(0, col), Math.max(0, cellCount - 1))
+  const cell = table.rows[r]?.cells[c]
+  const at = Math.min(Math.max(0, offset), cell ? containerLength(cell) : 0)
+  refreshLayout({
+    anchor: { blockId: cellId(target.tableId, r, c), offset: at },
+    force: true,
+  })
+  /*
+   * 点工具条按钮 / radio 会把焦点从正文拿走，selectionchange 未必再触发 ——
+   * 不补这一下，工具条的 radio 选中态与行列提示会停在旧值（用户看着就是「点了没反应」）。
+   * emitSelection 只对外发事件、App 只把它存进 ref，不会有回环。
+   */
+  void nextTick(emitSelection)
+}
+
+/** 在光标所在行的上方 / 下方插入一行 body 行 */
+function insertTableRow(where: 'above' | 'below'): void {
+  const target = tableTarget()
+  if (!target) return
+  pushHistory(target.point)
+  /*
+   * 落点要夹进 body 区间：光标停在 unit 行时「上方插入行」的直觉落点是 0 号位，
+   * 那会插到 unit 之前、破坏 unit → body… → note 的显示顺序（note 行同理）。
+   */
+  const at = bodyInsertIndex(target.table, where === 'above' ? target.row : target.row + 1)
+  insertBodyRow(target.table, at)
+  // 插在光标那一行之前 → 光标行整体 +1；插在它那一行（含）之后 → 光标行不动
+  finishTableOp(target, at <= target.row ? target.row + 1 : target.row, target.col, target.offset)
+}
+
+/** 删除光标所在的 body 行；光标不在 body 行、或只剩一个 body 行时空转 */
+function removeTableRow(): void {
+  const target = tableTarget()
+  if (!target) return
+  // 这两种情形工具条上的按钮本来就是禁用态，这里再兜一道，权当防呆
+  if (target.table.rows[target.row]?.role !== 'body') return
+  if (bodyRowIndexes(target.table).length <= 1) return
+  const ordinal = bodyOrdinal(target.table, target.row)
+  pushHistory(target.point)
+  removeBodyRow(target.table, target.row)
+  // 删完后的 body 行序数取 min(k, bodyRows'-1)，再换算回 rows 数组下标
+  const bodies = bodyRowIndexes(target.table)
+  const row = bodies[Math.min(ordinal, bodies.length - 1)] ?? 0
+  finishTableOp(target, row, target.col, target.offset)
+}
+
+/** 在光标所在列的左侧 / 右侧插入一列（只作用 body 行；unit/note 行整行一格，不动） */
+function insertTableColumn(where: 'left' | 'right'): void {
+  const target = tableTarget()
+  if (!target) return
+  pushHistory(target.point)
+  insertColumn(target.table, where === 'left' ? target.col : target.col + 1)
+  // 左侧插入：光标那一列变成 +1；右侧插入：光标那一列不动
+  finishTableOp(target, target.row, where === 'left' ? target.col + 1 : target.col, target.offset)
+}
+
+/** 删除光标所在列；只剩一列时空转 */
+function removeTableColumn(): void {
+  const target = tableTarget()
+  if (!target) return
+  if (target.table.columns <= 1) return
+  pushHistory(target.point)
+  removeColumn(target.table, target.col)
+  finishTableOp(target, target.row, Math.min(target.col, target.table.columns - 1), target.offset)
+}
+
+/** 行高两档（最小一行 / 最小两行）；锚点不变 */
+function setTableMinLines(minLines: 1 | 2): void {
+  const target = tableTarget()
+  if (!target) return
+  if (target.table.minLines === minLines) return
+  pushHistory(target.point)
+  setMinLines(target.table, minLines)
+  finishTableOp(target, target.row, target.col, target.offset)
+}
+
+/** radio 开关：增删表头行（unit，插在最前）/ 附注行（note，加在最后）；锚点按行号位移重算 */
+function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
+  const target = tableTarget()
+  if (!target) return
+  const table = target.table
+  const index = table.rows.findIndex((row) => row.role === role)
+  if (on && index >= 0) return
+  if (!on && index < 0) return
+
+  pushHistory(target.point)
+  setRoleRow(table, role, on)
+
+  if (role === 'unit') {
+    if (on) {
+      // 新行插在 0 号位，光标所在行整体 +1
+      finishTableOp(target, target.row + 1, target.col, target.offset)
+      return
+    }
+    // 删掉表头行：光标就在它上面 → 落到第 0 行（此时是第一个 body 行）、偏移归 0；否则整体 -1
+    if (target.row === index) finishTableOp(target, 0, target.col, 0)
+    else finishTableOp(target, target.row - 1, target.col, target.offset)
+    return
+  }
+
+  // note 加在最后、删的也是最后一行，光标不在附注行时行号不变
+  if (!on && target.row === index) {
+    const bodies = bodyRowIndexes(table)
+    finishTableOp(target, bodies[bodies.length - 1] ?? 0, target.col, target.offset)
+    return
+  }
+  finishTableOp(target, target.row, target.col, target.offset)
+}
+
+/* -------------------------------------------------------------------------- */
 /* 选区保持                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -1590,6 +1839,13 @@ defineExpose({
   insertPageBreak,
   insertSectionBreak,
   insertTable,
+  // 表格结构操作（W4b-1）
+  insertTableRow,
+  removeTableRow,
+  insertTableColumn,
+  removeTableColumn,
+  setTableMinLines,
+  setTableRoleRow,
   deleteBreak,
   keepSelection,
   dropKeptSelection,

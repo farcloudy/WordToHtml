@@ -299,6 +299,66 @@ export function placeCaret(root: Root, point: DisplayPoint): boolean {
   return true
 }
 
+/**
+ * 找到显示坐标 offset 处的那枚软换行（`.wtp-br`），按文档顺序数文字长度。
+ * 找不到返回 null（例如偏移落在换行之前、或这一片里根本没有换行）。
+ */
+function breakAt(frag: HTMLElement, offset: number): HTMLBRElement | null {
+  let seen = 0
+  let hit: HTMLBRElement | null = null
+  const visit = (node: Node): boolean => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === TEXT_NODE) {
+        seen += (child as Text).data.length
+        continue
+      }
+      if (child.nodeType !== ELEMENT_NODE) continue
+      const el = child as HTMLElement
+      if (el.tagName === 'BR') {
+        // 零宽：只有累计长度正好等于该偏移的那一枚才算「这里的换行」
+        if (el.classList.contains('wtp-br') && seen === offset) {
+          hit = el as HTMLBRElement
+          return true
+        }
+        continue
+      }
+      if (visit(el)) return true
+    }
+    return false
+  }
+  visit(frag)
+  return hit
+}
+
+/**
+ * 把插入符放到某枚软换行**之后**（单元格里 Shift+Enter 专用）。
+ *
+ * 软换行是零宽的，offsetToPoint 会把同一个偏移还原到「换行之前」（上一行末尾），
+ * 照原样 placeCaret 就会让回车之后敲的字打回上一行。这里定位到那枚 `<br>`，
+ * 用 `setStartAfter` 明确落到它后面；找不到就退回 placeCaret。
+ *
+ * **不要**把这条规则并进 placeCaret 或 offsetToPoint —— 普通段落里已有的软换行
+ * （`{br}` 指令）与所有既有断言的落点都依赖「偏移 → 换行之前」这个通用约定。
+ */
+export function placeCaretAfterBreak(root: Root, point: DisplayPoint): boolean {
+  const frag = fragmentAt(root, point.blockId, point.offset)
+  if (!frag) return false
+  const prefix = frag.querySelector('.wtp-num') ? prefixLengthOf(frag) : 0
+  const local = Math.max(point.offset - fragmentStart(frag), prefix)
+  const br = breakAt(frag, local)
+  if (!br) return placeCaret(root, point)
+  const host = frag.closest('[contenteditable="true"]')
+  if (host instanceof HTMLElement) host.focus({ preventScroll: true })
+  const sel = document.getSelection()
+  if (!sel) return false
+  const range = document.createRange()
+  range.setStartAfter(br)
+  range.collapse(true)
+  sel.removeAllRanges()
+  sel.addRange(range)
+  return true
+}
+
 /** 把一段显示坐标区间还原成选区（格式化后保持选中状态用） */
 export function placeRange(root: Root, from: DisplayPoint, to: DisplayPoint): boolean {
   const a = fragmentAt(root, from.blockId, from.offset)

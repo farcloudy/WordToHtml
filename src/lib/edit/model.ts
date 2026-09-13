@@ -12,13 +12,45 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { Block, CommentDef, DocModel, Inline, InlineHolder, RevMark, TextBlock } from '../types'
+import type {
+  Block,
+  CommentDef,
+  DocModel,
+  Inline,
+  InlineHolder,
+  RevMark,
+  TableRowRole,
+  TextBlock,
+} from '../types'
 import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
 
 export interface BlockPoint {
   blockId: string
   /** 模型文字坐标下的字符偏移 */
   offset: number
+}
+
+/**
+ * 光标落在表格格子里时的上下文，供调用方的「上下文工具条」回显与禁用按钮。
+ *
+ * 调用方（App）手里只有这一次 `selection-change` 事件，没有响应式的模型，
+ * 所以行/列下标、行数、role 这些都得由组件现算后一并带出来。
+ */
+export interface TableSelectionContext {
+  tableId: string
+  /** 光标所在行在 rows 数组里的下标 */
+  row: number
+  /** 列下标；unit/note 行天然只有一格，恒为 0 */
+  col: number
+  role: TableRowRole
+  /** 总行数（含 unit/note） */
+  rows: number
+  columns: number
+  /** body 行的行数 */
+  bodyRows: number
+  minLines: 1 | 2
+  hasUnit: boolean
+  hasNote: boolean
 }
 
 /** 工具栏要的选区信息（模型文字坐标，不含自动编号前缀） */
@@ -33,6 +65,8 @@ export interface EditorSelection {
   bold: boolean
   /** 选区内文字是否同色；混色或无色时为 undefined */
   color?: string
+  /** 落点在表格格子里时给出表格上下文；不在格子里则没有这个字段 */
+  table?: TableSelectionContext
 }
 
 /**

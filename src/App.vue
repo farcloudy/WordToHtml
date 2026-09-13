@@ -182,6 +182,18 @@ const spec = computed<Spec>(() => resolveSpec(specOverride.value))
 
 const kind = computed<BlockKind>(() => selection.value?.kind ?? 'body')
 
+/** 光标落在表格格子里时的上下文；其余时候为 null（上下文工具条据此显示/隐藏） */
+const tableCtx = computed(() => selection.value?.table ?? null)
+
+/** 上下文工具条上的落点提示：正文行显示行列（下标 +1），表头/附注行没有列的概念 */
+const tablePosLabel = computed(() => {
+  const t = tableCtx.value
+  if (!t) return ''
+  if (t.role === 'unit') return '表头行'
+  if (t.role === 'note') return '附注行'
+  return `第 ${t.row + 1} 行第 ${t.col + 1} 列`
+})
+
 /**
  * 样式库按钮照 Word 的做法「所见即所得」：用这条样式自己的字体与字重显示按钮文字。
  * 字号按样式字号缩放但夹在 12–15px，否则标题那类大字号会把整条样式栏撑高一倍。
@@ -613,6 +625,150 @@ onBeforeUnmount(() => {
       </span>
     </div>
 
+    <!--
+      表格的上下文工具条：只在光标落在格子里时出现（跟着 selection-change 的 table 上下文走）。
+      所有按钮与 radio 都 @mousedown.prevent —— 焦点不离开正文，落点与 native 选区才保得住。
+    -->
+    <div v-if="mode === 'edit' && tableCtx" class="toolbar sub-toolbar">
+      <span class="tk-hint">表格 · {{ tablePosLabel }}</span>
+
+      <span class="tk-group">
+        <span class="tk-label">行</span>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在行的上方插入一行"
+          @mousedown.prevent
+          @click="paper?.insertTableRow('above')"
+        >
+          上方插入行
+        </button>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在行的下方插入一行"
+          @mousedown.prevent
+          @click="paper?.insertTableRow('below')"
+        >
+          下方插入行
+        </button>
+        <button
+          type="button"
+          class="tool"
+          :disabled="tableCtx.role !== 'body' || tableCtx.bodyRows <= 1"
+          title="删除光标所在行（只剩一个正文行、或光标在表头行／附注行时不可用）"
+          @mousedown.prevent
+          @click="paper?.removeTableRow()"
+        >
+          删除行
+        </button>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">列</span>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在列的左侧插入一列"
+          @mousedown.prevent
+          @click="paper?.insertTableColumn('left')"
+        >
+          左侧插入列
+        </button>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在列的右侧插入一列"
+          @mousedown.prevent
+          @click="paper?.insertTableColumn('right')"
+        >
+          右侧插入列
+        </button>
+        <button
+          type="button"
+          class="tool"
+          :disabled="tableCtx.columns <= 1"
+          title="删除光标所在列（只剩一列时不可用）"
+          @mousedown.prevent
+          @click="paper?.removeTableColumn()"
+        >
+          删除列
+        </button>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">行高</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-minlines"
+            :checked="tableCtx.minLines === 1"
+            @click="paper?.setTableMinLines(1)"
+          />
+          最小一行
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-minlines"
+            :checked="tableCtx.minLines === 2"
+            @click="paper?.setTableMinLines(2)"
+          />
+          最小两行
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">表头行</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-unit"
+            :checked="tableCtx.hasUnit"
+            @click="paper?.setTableRoleRow('unit', true)"
+          />
+          有
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-unit"
+            :checked="!tableCtx.hasUnit"
+            @click="paper?.setTableRoleRow('unit', false)"
+          />
+          无
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span class="tk-label">附注行</span>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-note"
+            :checked="tableCtx.hasNote"
+            @click="paper?.setTableRoleRow('note', true)"
+          />
+          有
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-note"
+            :checked="!tableCtx.hasNote"
+            @click="paper?.setTableRoleRow('note', false)"
+          />
+          无
+        </label>
+      </span>
+    </div>
+
     <main class="panes" :class="{ single: mode === 'edit' }">
       <!-- 导航窗格：有标题才出现，挂在编辑器最左侧（不是塞在 WordPaper 里面） -->
       <section v-if="outline.length > 0 && navOpen" class="pane nav-pane">
@@ -967,6 +1123,51 @@ button.primary:disabled {
   font-size: 13px;
 }
 
+/* 表格的上下文工具条：复用主工具栏的观感，次要色 + 更紧的行距，别另起一套设计 */
+.sub-toolbar {
+  gap: 12px;
+  padding: 6px 16px;
+  background: #f6f7f9;
+  font-size: 12px;
+}
+
+.sub-toolbar .tool {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.sub-toolbar .tool:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tk-hint {
+  color: #33383f;
+  font-weight: 600;
+}
+
+.tk-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #5a5f66;
+}
+
+.tk-label {
+  color: #8a9099;
+}
+
+.tk-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.tk-radio input {
+  margin: 0;
+}
+
 .sep {
   width: 1px;
   height: 20px;
@@ -1316,6 +1517,7 @@ textarea {
   .bar,
   .styles,
   .toolbar,
+  .sub-toolbar,
   .pane-head,
   .legend,
   textarea,

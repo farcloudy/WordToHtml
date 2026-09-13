@@ -1111,8 +1111,9 @@ try {
   /* ------------------------------------------------------------------ */
   console.log('\n=== O. 打印：只出 A4 纸，且不多不少 ===')
   await openApp()
-  // 打开查找面板：打印时它和导航窗格都必须一起消失
-  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  // 打开查找面板：打印时它和导航窗格都必须一起消失。
+  // 落点放进表格格子里 —— 上下文工具条（.sub-toolbar）只在格内出现，打印时它也必须一起消失。
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.keyboard.press('Control+f')
   await page.waitForSelector('.search-panel', { timeout: 3000 })
   // 插入表格面板也要一起验：它和查找面板一样是浮层，打印时同样不该出现
@@ -1126,6 +1127,7 @@ try {
         '.bar',
         '.styles',
         '.toolbar',
+        '.sub-toolbar',
         '.pane-head',
         '.legend',
         'textarea',
@@ -1180,6 +1182,7 @@ try {
     '.bar',
     '.styles',
     '.toolbar',
+    '.sub-toolbar',
     '.wtp-comments',
     '.wtp-measure-root',
     '.wtp-break',
@@ -1667,6 +1670,189 @@ try {
   eq('行数下界夹到 1', clampedAdded2[0]?.rows.length, 1)
   eq('列数上界夹到 12', clampedAdded2[0]?.columns, 12)
   await checkNoOverflow('U 另一侧越界夹回后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== V. 表格编辑交互（W4b-1）：上下文工具条、增删行列、unit/note、行高、Shift+Enter、边界护栏 ===')
+  const sampleTable = (model) => model.blocks.find((b) => b.t === 'table')
+  const modelTable = async () => sampleTable(await getModel())
+  const cellText = (t, r, c) =>
+    (t?.rows?.[r]?.cells?.[c]?.inlines ?? [])
+      .map((i) => (i.t === 'text' ? i.text : ''))
+      .join('')
+  const cellInlines = (t, r, c) => t?.rows?.[r]?.cells?.[c]?.inlines ?? []
+  /** 表格在页面上的 DOM 概况（片段的 tr 加起来应等于模型行数） */
+  const tableDom = () =>
+    page.evaluate(() => ({
+      tables: document.querySelectorAll('.wtp-table').length,
+      trs: document.querySelectorAll('.wtp-table tbody tr').length,
+      tds: document.querySelectorAll('.wtp-table td').length,
+      min2: document.querySelectorAll('.wtp-table.wtp-table-min2').length,
+      min1: document.querySelectorAll('.wtp-table.wtp-table-min1').length,
+    }))
+  const subToolbar = page.locator('.sub-toolbar')
+  const subButton = (name) => subToolbar.getByRole('button', { name, exact: true })
+  /** 上下文工具条里某个 radio 组里的一个选项（组按左边的标签文字定位，避免「有/无」重名） */
+  const subRadio = (group, name) =>
+    subToolbar.locator('.tk-group', { hasText: group }).getByRole('radio', { name, exact: true })
+
+  // ---- V1. 工具条的出现/消失 + 下方插入行 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  eq('光标进表格后上下文工具条出现', await subToolbar.count(), 1)
+  ok(
+    '工具条显示落点（行/列都是下标，显示时 +1）',
+    (await subToolbar.innerText()).includes('第 3 行第 1 列'),
+    await subToolbar.innerText(),
+  )
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(200)
+  eq('光标离开表格后工具条消失', await subToolbar.count(), 0)
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  const beforeV1 = await modelTable()
+  const domBeforeV1 = await tableDom()
+  await subButton('下方插入行').click()
+  await page.waitForTimeout(300)
+  const afterV1 = await modelTable()
+  const domAfterV1 = await tableDom()
+  eq('下方插入行：模型行数 +1', afterV1?.rows.length, (beforeV1?.rows.length ?? 0) + 1)
+  eq('新行插在光标那一行之后', afterV1?.rows[3]?.role, 'body')
+  eq('新行格数 = columns', afterV1?.rows[3]?.cells.length, afterV1?.columns)
+  eq('DOM 也多一个 <tr>', domAfterV1.trs, domBeforeV1.trs + 1)
+  eq('DOM 的 tr 数仍等于模型行数', domAfterV1.trs, afterV1?.rows.length)
+  const v1Caret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符仍在原来那一格（r2c0）', v1Caret?.blockId, `${afterV1?.id ?? ''}.r2c0`)
+  eq('插入符偏移没变（该格文字末尾）', v1Caret?.offset, '数控加工中心'.length)
+  await checkNoOverflow('V1 下方插入行后')
+
+  // ---- V2. 删除列到最后一列 → 按钮禁用 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  const deleteCol = subButton('删除列')
+  ok('多列时「删除列」可用', (await deleteCol.isDisabled()) === false)
+  await deleteCol.click()
+  await page.waitForTimeout(300)
+  const afterFirstDel = await modelTable()
+  eq('删掉一列后 columns -1', afterFirstDel?.columns, 2)
+  eq('删除列只动 body 行（unit/note 仍一格）', `${afterFirstDel?.rows[0]?.cells.length}/${afterFirstDel?.rows[afterFirstDel.rows.length - 1]?.cells.length}`, '1/1')
+  await deleteCol.click()
+  await page.waitForTimeout(300)
+  const afterSecondDel = await modelTable()
+  eq('再删一列后只剩 1 列', afterSecondDel?.columns, 1)
+  ok('只剩最后一列时「删除列」被禁用', await deleteCol.isDisabled())
+  await checkNoOverflow('V2 删除列后')
+
+  // ---- V3. 两个 radio：行高 2↔1、表头行有/无 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  const domMinBefore = await tableDom()
+  ok(
+    '样本表初始 minLines=2（DOM 用 -min2 类）',
+    domMinBefore.min2 >= 1 && domMinBefore.min1 === 0,
+    JSON.stringify(domMinBefore),
+  )
+  await subRadio('行高', '最小一行').click()
+  await page.waitForTimeout(300)
+  eq('切到最小一行：模型 minLines=1', (await modelTable())?.minLines, 1)
+  const domMin1 = await tableDom()
+  ok(
+    '切到最小一行：DOM 类名换成 -min1',
+    domMin1.min1 >= 1 && domMin1.min2 === 0,
+    JSON.stringify(domMin1),
+  )
+  await subRadio('行高', '最小两行').click()
+  await page.waitForTimeout(300)
+  eq('切回最小两行：模型 minLines=2', (await modelTable())?.minLines, 2)
+  const domMin2 = await tableDom()
+  ok(
+    '切回最小两行：DOM 类名回到 -min2',
+    domMin2.min2 >= 1 && domMin2.min1 === 0,
+    JSON.stringify(domMin2),
+  )
+
+  const beforeUnit = await modelTable()
+  eq('样本表本来有表头行', beforeUnit?.rows[0]?.role, 'unit')
+  await subRadio('表头行', '无').click()
+  await page.waitForTimeout(300)
+  const afterUnitOff = await modelTable()
+  eq('表头行 radio=无：unit 行消失', afterUnitOff?.rows.some((r) => r.role === 'unit'), false)
+  eq('表头行 radio=无：只少这一行', afterUnitOff?.rows.length, (beforeUnit?.rows.length ?? 0) - 1)
+  await subRadio('表头行', '有').click()
+  await page.waitForTimeout(300)
+  const afterUnitOn = await modelTable()
+  eq('表头行 radio=有：unit 行回到最前', afterUnitOn?.rows[0]?.role, 'unit')
+  eq('表头行 radio=有：行数复原', afterUnitOn?.rows.length, beforeUnit?.rows.length)
+
+  const beforeNote = await modelTable()
+  eq('样本表本来有附注行', beforeNote?.rows[beforeNote.rows.length - 1]?.role, 'note')
+  await subRadio('附注行', '有').click()
+  await page.waitForTimeout(300)
+  const afterNoteOn = await modelTable()
+  eq('附注行 radio=有：note 仍在最后（幂等）', afterNoteOn?.rows[afterNoteOn.rows.length - 1]?.role, 'note')
+  eq('附注行 radio=有：再点一次不产生第二行', afterNoteOn?.rows.length, beforeNote?.rows.length)
+  await subRadio('附注行', '无').click()
+  await page.waitForTimeout(300)
+  const afterNoteOff = await modelTable()
+  eq('附注行 radio=无：note 行消失', afterNoteOff?.rows.some((r) => r.role === 'note'), false)
+  eq('附注行 radio=无：只少这一行', afterNoteOff?.rows.length, (beforeNote?.rows.length ?? 0) - 1)
+  await checkNoOverflow('V3 radio 切换后')
+
+  // ---- V4. 格内 Shift+Enter：插入符落在换行之后 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('检测仪器'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Shift+Enter')
+  await page.waitForTimeout(300)
+  const shifted = await modelTable()
+  const shiftRow = shifted?.rows.findIndex((_r, i) => cellText(shifted, i, 0) === '检测仪器') ?? -1
+  ok('找得到目标格子', shiftRow >= 0, `shiftRow=${shiftRow}`)
+  const shiftInlines = cellInlines(shifted, shiftRow, 0)
+  eq('Shift+Enter 只插一枚软换行', shiftInlines.filter((i) => i.t === 'break').length, 1)
+  eq('软换行是零宽的：格内文字没变', cellText(shifted, shiftRow, 0), '检测仪器')
+  // 换行之后敲字：必须落在新的一行（模型里排在 break 之后），而不是回到上一行末尾
+  await page.keyboard.insertText('X')
+  await page.waitForTimeout(300)
+  const typed = await modelTable()
+  const typedInlines = cellInlines(typed, shiftRow, 0)
+  const breakIdx = typedInlines.findIndex((i) => i.t === 'break')
+  const typedIdx = typedInlines.findIndex((i) => i.t === 'text' && i.text.includes('X'))
+  ok('Shift+Enter 后插入符落在换行之后（敲的字排在 break 之后）', breakIdx >= 0 && typedIdx > breakIdx)
+  eq('换行后敲的字没打回上一行', cellText(typed, shiftRow, 0), '检测仪器X')
+  const v4Caret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符仍在同一格', v4Caret?.blockId, `${typed?.id ?? ''}.r${shiftRow}c0`)
+  await checkNoOverflow('V4 Shift+Enter 后')
+
+  // ---- V5. 边界护栏：格首 Backspace、格尾 Delete 都不许动模型/DOM ----
+  await openApp()
+  const guardDom = await tableDom()
+  const guardTable = await modelTable()
+  await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 0))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Backspace')
+  await page.waitForTimeout(300)
+  const afterBackspace = await modelTable()
+  const domAfterBackspace = await tableDom()
+  eq('格首 Backspace：行数不变', afterBackspace?.rows.length, guardTable?.rows.length)
+  eq('格首 Backspace：格内文字不变', cellText(afterBackspace, 2, 0), '数控加工中心')
+  eq('格首 Backspace：<td> 数没变（原生没并掉相邻格）', domAfterBackspace.tds, guardDom.tds)
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('检测仪器'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Delete')
+  await page.waitForTimeout(300)
+  const afterDelete = await modelTable()
+  eq('格尾 Delete：行数不变', afterDelete?.rows.length, guardTable?.rows.length)
+  eq('格尾 Delete：格内文字不变', cellText(afterDelete, 4, 0), '检测仪器')
+  eq(
+    '格尾 Delete：<td> 数没变',
+    (await tableDom()).tds,
+    guardDom.tds,
+  )
+  await checkNoOverflow('V5 边界护栏后')
 } finally {
   await browser?.close()
   await server.close()
@@ -1681,6 +1867,7 @@ if (failures.length > 0) {
 console.log(
   '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
     '金额格式、特殊空格、切文件模板、打印、查找替换（面板/高亮/范围/替换一处与全部）、' +
-    '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）' +
-    '均落到模型。',
+    '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）、' +
+    '表格编辑交互（上下文工具条与落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
+    '格首 Backspace 与格尾 Delete 护栏）均落到模型。',
 )
