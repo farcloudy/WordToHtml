@@ -7,7 +7,7 @@
 > **W2** 样式模板绑定 + 双页并排 → **W3** 查找替换 + 导航窗格 → **W4** 表格编辑器 → **W5** 节编辑框架。
 >
 > **维护约定**：每完成一波，把该波标题改成「（已完成 YYYY-MM-DD）」，并在最后一节补一行结论。
-> 涉及改数据格式的波次（W4、W5）**必须先出模型设计给用户过目，用户点头才写实现** —— 这是用户定下的闸门。
+> 涉及改数据格式的波次（W4、W5）**必须先出模型设计给用户过目，用户点头才写实现**
 
 ---
 
@@ -19,21 +19,16 @@
 > headless 进程没有 TUI，把 stdout 重定向到文件之后，进主 session 的只有 shell 工具那几行摘要。
 >
 > ```
-> qwen -p "<任务书>" --model <与主 session 同一个模型> -y > .qwen/tmp/wX-impl.log 2>&1
+> qwen -p "<任务书>" --model deepseek-flash -y > .qwen/tmp/wX-impl.log 2>&1
 > ```
 >
 > - 任务书里固定要求：**结论写进 `.qwen/tmp/wX-impl-result.md`（≤ 40 行）**，细节与长日志留在
 >   `wX-impl.log`；主 session 只读那个结果文件，需要细节再 grep 日志。
-> - **要 `-y`（YOLO），不要用 `--approval-mode auto-edit`**：`auto-edit` 只自动批准**文件写入**，
 >   **不批准 shell** —— 非交互 session 里 `run_shell_command` 会被直接拒掉（日志里只有一句
 >   `Warning: Tool "run_shell_command" requires user approval but cannot execute in non-interactive mode`）。
->   W3 因此交出过一次「代码写完了、命令一条没跑」的成果，类型错误还留在里面（主 session 补跑才发现）。
->   纯写文件的活儿 `auto-edit` 够用；只要任务里含「跑 npm / 起浏览器 / 跑探针」，一律 `-y`。
-> - **验收代理同样要 `-y`**（它要跑 `verify:p2`/`verify:p3`、常要自写 playwright 探针），但任务书里必须
->   限定「只许在 `.qwen/tmp/` 下新建文件，仓库内任何文件都不许改」，并且**验收一跑完主 session 立刻
+> - 验收代理的任务书里必须限定「只许在 `.qwen/tmp/` 下新建文件，仓库内任何文件都不许改」，并且**验收一跑完主 session 立刻
 >   `git status --short` 复核**：只要有一个仓库内文件被动过，这次验收作废。
->   若这一轮验收既不用跑命令也不用写脚本，`--approval-mode plan` 更省心 —— 实测它是硬闸门：写操作被拦在
->   执行前，当轮工具表里连 `write_file` / `Edit` 都没有，而且不会挂住（写完「待批准方案」就退出）。
+>   若这一轮验收既不用跑命令也不用写脚本，使用`--approval-mode plan`替换`-y`，把写操作被拦在执行前，当轮工具表里连 `write_file` / `Edit` 都没有，而且不会挂住（写完「待批准方案」就退出）。
 > - 可选护栏：`--max-session-turns N`（超限退出码 53）、`--max-wall-time`、`--max-tool-calls`（预算类退出码 55）。
 > - 子进程启动会打一条「MCP server(s) failed to start」（那三个 `qwen-mm-plugins-*` 起不来），
 >   **属正常**，内置工具照常可用，不要去修它。
@@ -901,11 +896,9 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
    记在 `C:\Users\18082\.qwen\qwen-tui-large-output-crash.md`（用户 2026-09-13 选择暂不改设置）。
    对策：让命令输出重定向到文件、代理报告限长（见第 0 节）；**长任务做完后另开新 session**，
    别让一条进程链背着几千万 token 的 transcript 继续往前推。
-2. **命令环境**：Windows 11 + cmd.exe（不是 bash），路径统一用正斜杠；所有命令加 `rtk` 前缀
-   （它是 token 压缩包装，没有对应过滤器时原样透传，始终安全）。
-   ⚠️ `rtk` 成功时也可能打印 `Error: (none)` 之类的文本，**判断成功看 exit code（0 = 成功）**。
-3. **`npm run verify` 很重**：`verify:p1` 会真的用 Word COM 打开 docx 读回格式（本机需装 Word），
-   `verify:p2/p3` 会真的用系统 Edge 起无头浏览器。跑一次全量约十几分钟，别在循环里反复跑。
+2. **命令环境**：Windows 11 + cmd.exe（不是 bash），路径统一用正斜杠。
+3. **`npm run verify` 很重**：`verify:p1` 会真的用 Word COM 打开 docx 读回格式（本机已装 Word），
+   `verify:p2/p3` 无头浏览器应当用chrome，禁止用edge。跑一次全量约十几分钟，别在循环里反复跑。
    注意：`verify:p1` 那套脚本必须保持纯 ASCII。
 4. **prettier**：仓库 `format` 脚本用 `npx prettier --experimental-cli`。
    默认 CLI 会对**你根本没碰过**的既有文件报格式问题（`numbering.ts` / `paginate.ts` / `measure.ts` 等），
@@ -922,13 +915,7 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
 6. **`docx` 库打包后再改 `styles.xml` 时必须 `createFolders: false`**（见 `lib/docx/lineUnits.ts`），
    否则会多出目录条目，Word 打开这种 docx 会**卡死在 `Documents.Open` 不返回**。
    （历史教训：`w:beforeLines` / `w:afterLines` 只能靠这种方式补写，库不暴露这对属性。）
-7. **本机 Edge 的程序化启动从 2026-09-13 13:42 起坏了**（`msedge.exe --version` 零输出；用新建目录做
-   `--headless=new --dump-dom about:blank` 也零输出；playwright 无头/有头一律报 `browser has been closed`；
-   **窗口模式正常**，所以「Edge 能开」不等于能跑验收）。此时 `verify:p2` / `verify:p3` 的浏览器半场
-   与 `verify:pages`（依赖 verify-browser 产出的预览页数）**都跑不了**；**用户要求不跑 playwright、只做代码级验证**。
-   复检一条命令：`msedge.exe --version` 应打印版本号。详见项目记忆 `project/edge-headless-broken.md`。
-   ⚠️ 与第 3 条一起看：第 3 条里「`verify:p2/p3` 会真的用系统 Edge 起无头浏览器」这句，现在跑不动。
-8. **派发用的辅助脚本（`.ps1` / `.cmd`）必须是纯 ASCII**。2026-09-13 W4b-2 实测：无 BOM 的 UTF-8
+7. **派发用的辅助脚本（`.ps1` / `.cmd`）必须是纯 ASCII**。2026-09-13 W4b-2 实测：无 BOM 的 UTF-8
    `.ps1` 里只要有中文（注释或 `D:\Work\代码\...` 这样的路径），**Windows PowerShell 5.1 会按 ANSI 读**，
    脚本被读坏 —— 表现为 `Join-Path` / `Test-Path` 拿到 `$null` 参数、每轮循环刷屏报错，而**同一轮里
    它仍在正常轮询**，所以从退出码上看不出来（`$PSScriptRoot` 那条路也不可靠）。教训：等待循环脚本
