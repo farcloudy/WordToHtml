@@ -24,6 +24,7 @@ import {
   currentRange,
   displayPointOf,
   fragmentOf,
+  offsetToPoint,
   placeCaret,
   placeRange,
   prefixLengthOf,
@@ -31,6 +32,10 @@ import {
   selectedRanges,
 } from '../lib/edit/dom'
 import type { DisplayPoint, DisplayRange } from '../lib/edit/dom'
+import { buildOutline, outlineSignature } from '../lib/edit/outline'
+import type { OutlineEntry } from '../lib/edit/outline'
+import { findMatches, replaceMatches, validateQuery } from '../lib/edit/search'
+import type { Match, SearchOptions, SearchScope } from '../lib/edit/search'
 import {
   addComment,
   applyFormat,
@@ -54,7 +59,12 @@ import {
 import type { EditorSelection } from '../lib/edit/model'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
-import { KEEP_SELECTION_HIGHLIGHT, injectCss } from '../lib/render/css'
+import {
+  KEEP_SELECTION_HIGHLIGHT,
+  SEARCH_CURRENT_HIGHLIGHT,
+  SEARCH_HIGHLIGHT,
+  injectCss,
+} from '../lib/render/css'
 import { renderInlinesHtml } from '../lib/render/html'
 import { clearMeasureCache, measureDocument } from '../lib/render/measure'
 import type { MeasureCache } from '../lib/render/measure'
@@ -90,6 +100,12 @@ const emit = defineEmits<{
   'toggle-track-changes': []
   /** 一句话提示（无效输入之类），组件不做提示 UI，交给调用方 */
   toast: [message: string]
+  /** 按了 ctrl+F / ctrl+G：面板由调用方画，这里只报告该开哪一种 */
+  'open-search': [mode: 'find' | 'replace']
+  /** 匹配数与当前位置变了；error 非空时是非法正则 */
+  'search-state': [state: { total: number; current: number; error: string | null }]
+  /** 大纲变了（按指纹比对，同一份大纲只发一次），导航窗格用它 */
+  'outline-change': [entries: OutlineEntry[]]
 }>()
 
 const resolved = computed<Spec>(() => resolveSpec(props.spec))
@@ -129,6 +145,22 @@ let preEditCaret: DisplayPoint | null = null
 let stickyRanges: DisplayRange[] = []
 /** 组字结束的兜底读回（浏览器不补 input 事件时用） */
 let compSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+/* 查找会话。故意不用响应式：面板由调用方持有，组件只需要在数字/指纹变化时 emit，
+   而这些状态每敲一个字都可能变，做成 ref 反而会让 Vue 白白重渲染。 */
+let searchOn = false
+let searchQuery = ''
+let searchRegex = false
+let searchScope: SearchScope[] | undefined
+let searchMatches: Match[] = []
+let searchIndex = -1
+let searchError: string | null = null
+/** 上一次发给调用方的大纲指纹，只有它变了才 emit */
+let outlineSig = ''
+/** 页面 DOM 的代次：重建过一次就 +1，用来判断旧的高亮 Range 是否已经失效 */
+let domGen = 0
+/** 上一次画高亮时的签名（DOM 代次 + 当前匹配 + 全部匹配），一样就不必重画 */
+let searchPaintKey = ''
 
 /* -------------------------------------------------------------------------- */
 /* 渲染                                                                        */
@@ -303,13 +335,26 @@ function refreshLayout(options: RefreshOptions = {}): void {
   const items = measureDocument(doc.value, spec, el, cache)
   measured.value = items
   const nextPages = paginate(items, { contentHeight: contentBoxPx(spec).height })
+  const changed = options.force === true || !sameLayout(pages.value, nextPages)
 
-  if (!options.force && sameLayout(pages.value, nextPages)) return
+  if (changed) {
+    viewDoc.value = cloneDoc(doc.value)
+    viewNumbering.value = numberingOf(viewDoc.value)
+    pages.value = nextPages
+    domGen += 1
+    emit('paginated', nextPages.length)
+  }
 
-  viewDoc.value = cloneDoc(doc.value)
-  viewNumbering.value = numberingOf(viewDoc.value)
-  pages.value = nextPages
-  emit('paginated', nextPages.length)
+  /*
+   * 大纲与查找都必须在快照更新之后重算，且只在数字/指纹真的变了时才 emit：
+   * 正常打字不能反复重渲染左栏与计数器（那正是「正常输入不得重排」的反面）。
+   * 分页没变时 viewDoc 不动，大纲指纹也就不会变；查找跑在 doc.value 上，
+   * 但结果只在有会话时才重算。
+   */
+  syncOutline()
+  if (searchOn) recomputeSearch(false)
+
+  if (!changed) return
 
   const anchor = options.anchor
   if (!anchor) return
@@ -647,6 +692,17 @@ function onKeydown(event: KeyboardEvent): void {
   if (mod && event.shiftKey && (event.key === 'e' || event.key === 'E')) {
     event.preventDefault()
     emit('toggle-track-changes')
+    return
+  }
+  // ctrl+F 是浏览器查找、ctrl+G 是「查找下一个」，不 preventDefault 就抢不回来
+  if (mod && !event.shiftKey && (event.key === 'f' || event.key === 'F')) {
+    event.preventDefault()
+    emit('open-search', 'find')
+    return
+  }
+  if (mod && !event.shiftKey && (event.key === 'g' || event.key === 'G')) {
+    event.preventDefault()
+    emit('open-search', 'replace')
     return
   }
   if (mod && (event.key === 'z' || event.key === 'Z')) {
@@ -1071,6 +1127,237 @@ async function focusComment(id: number): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 导航窗格：大纲                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 大纲跑在渲染快照（viewDoc / viewNumbering）上，不是编辑中的模型：
+ * 打字时快照不动，左栏就不会跟着重渲染。只有指纹变了才对外发一次。
+ */
+function syncOutline(): void {
+  const entries = buildOutline(viewDoc.value, viewNumbering.value)
+  const sig = outlineSignature(entries)
+  if (sig === outlineSig) return
+  outlineSig = sig
+  emit('outline-change', entries)
+}
+
+/** 点导航条目：把该块滚到可视区中间；可编辑时再把插入符放到自动编号之后 */
+function focusBlock(blockId: string): void {
+  const rootEl = root.value
+  if (!rootEl) return
+  const frag = rootEl.querySelector<HTMLElement>(`[data-block-id="${CSS.escape(blockId)}"]`)
+  if (!frag) return
+  if (props.editable) {
+    placeCaret(rootEl, {
+      blockId,
+      offset: Number(frag.dataset.from ?? '0') + prefixLengthOf(frag),
+    })
+  }
+  frag.scrollIntoView({ block: 'center' })
+}
+
+/* -------------------------------------------------------------------------- */
+/* 查找与替换                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/** 当前选区覆盖到的每一块（模型文字坐标）；取不到就是空数组 */
+function getSelectionScope(): SearchScope[] {
+  const rootEl = root.value
+  if (!rootEl) return []
+  const ranges = selectedRanges(rootEl)
+  if (ranges.length === 0) return []
+  const numbering = numberingOf(doc.value)
+  return ranges.map((range) => {
+    const prefix = (numbering.get(range.blockId) ?? '').length
+    const from = Math.max(0, range.from - prefix)
+    return { blockId: range.blockId, from, to: Math.max(from, range.to - prefix) }
+  })
+}
+
+/**
+ * 一个匹配在页面上对应的 Range。一个匹配可能横跨两个分页片段（同一块被切开），
+ * 这时必须**按片段切成多个子 Range** —— 用「起点在 A 片、终点在 B 片」的单个 Range
+ * 会把两页之间的换页标记与页脚一并圈进去。
+ */
+function matchRanges(match: Match, numbering: Map<string, string>): Range[] {
+  const rootEl = root.value
+  if (!rootEl) return []
+  const prefix = (numbering.get(match.blockId) ?? '').length
+  const lo = prefix + match.from
+  const hi = prefix + match.to
+  if (hi <= lo) return []
+
+  const out: Range[] = []
+  const frags = rootEl.querySelectorAll<HTMLElement>(
+    `[data-block-id="${CSS.escape(match.blockId)}"]`,
+  )
+  for (const frag of frags) {
+    const from = Number(frag.dataset.from ?? '0')
+    const raw = frag.dataset.to
+    const to = raw !== undefined && raw !== '' ? Number(raw) : from + (frag.textContent ?? '').length
+    const a = Math.max(lo, from)
+    const b = Math.min(hi, to)
+    if (b <= a) continue
+    const start = offsetToPoint(frag, a - from)
+    const end = offsetToPoint(frag, b - from)
+    if (!start || !end) continue
+    const range = document.createRange()
+    range.setStart(start.node, start.offset)
+    range.setEnd(end.node, end.offset)
+    out.push(range)
+  }
+  return out
+}
+
+/**
+ * 重画高亮。浏览器不支持 Custom Highlight API 时降级成「没有高亮」，匹配与替换照常。
+ * 只在「DOM 代次 / 匹配集合 / 当前匹配」三样里有变化时才重画：Range 挂在具体节点上，
+ * 页面重建过就必须重画，其它时候同样的匹配重画一遍纯属浪费。
+ */
+function paintSearchHighlights(): void {
+  const registry = highlightRegistry()
+  if (!registry) return
+  const key = `${domGen}|${searchIndex}|${searchMatches
+    .map((m) => `${m.blockId}:${m.from}:${m.to}`)
+    .join(',')}`
+  if (key === searchPaintKey) return
+  searchPaintKey = key
+  if (searchMatches.length === 0) {
+    registry.delete(SEARCH_HIGHLIGHT)
+    registry.delete(SEARCH_CURRENT_HIGHLIGHT)
+    return
+  }
+  const numbering = numberingOf(doc.value)
+  const normal: Range[] = []
+  const current: Range[] = []
+  searchMatches.forEach((match, index) => {
+    const ranges = matchRanges(match, numbering)
+    if (ranges.length === 0) return
+    if (index === searchIndex) current.push(...ranges)
+    else normal.push(...ranges)
+  })
+  if (normal.length > 0) registry.set(SEARCH_HIGHLIGHT, new Highlight(...normal))
+  else registry.delete(SEARCH_HIGHLIGHT)
+  if (current.length > 0) registry.set(SEARCH_CURRENT_HIGHLIGHT, new Highlight(...current))
+  else registry.delete(SEARCH_CURRENT_HIGHLIGHT)
+}
+
+function emitSearchState(): void {
+  emit('search-state', {
+    total: searchMatches.length,
+    current: searchIndex >= 0 ? searchIndex + 1 : 0,
+    error: searchError,
+  })
+}
+
+/**
+ * 重跑匹配并重画。reset 为真表示查询本身变了（回到第一处）；
+ * 为假表示只是文档在改（尽量留在原来那一处，免得每敲一个字高亮都跳回文首）。
+ */
+function recomputeSearch(reset: boolean): void {
+  searchError = validateQuery(searchQuery, searchRegex)
+  searchMatches =
+    searchError !== null || searchQuery === ''
+      ? []
+      : findMatches(doc.value, searchQuery, {
+          regex: searchRegex,
+          ...(searchScope !== undefined ? { scope: searchScope } : {}),
+        })
+  if (searchMatches.length === 0) searchIndex = -1
+  else if (reset || searchIndex < 0) searchIndex = 0
+  else searchIndex = Math.min(searchIndex, searchMatches.length - 1)
+  // 高亮的 Range 要挂在新 DOM 上：重排后的节点是新建的，得等 Vue 渲染完再画
+  void nextTick(paintSearchHighlights)
+  emitSearchState()
+}
+
+/** 把当前匹配滚到可视区中间（滚动目标取它的第一片） */
+function scrollToCurrentMatch(): void {
+  const match = searchMatches[searchIndex]
+  if (!match) return
+  const range = matchRanges(match, numberingOf(doc.value))[0]
+  if (!range) return
+  const node = range.startContainer
+  const el = node.nodeType === 1 ? (node as HTMLElement) : node.parentElement
+  el?.scrollIntoView({ block: 'center' })
+}
+
+function setSearch(query: string, opts: SearchOptions = {}): void {
+  searchQuery = query
+  searchRegex = opts.regex === true
+  searchScope = opts.scope
+  searchOn = true
+  recomputeSearch(true)
+}
+
+function moveMatch(step: number): void {
+  const total = searchMatches.length
+  if (total === 0) return
+  searchIndex = (searchIndex + step + total) % total
+  void nextTick(() => {
+    paintSearchHighlights()
+    scrollToCurrentMatch()
+  })
+  emitSearchState()
+}
+
+function nextMatch(): void {
+  moveMatch(1)
+}
+
+function prevMatch(): void {
+  moveMatch(-1)
+}
+
+/** 替换用的修订标记：kind 由 replaceMatches 按用途覆盖，这里只负责唯一 id 与作者/时间 */
+const replaceRev = (): RevMark => mark('ins')
+
+/**
+ * 替换之后插入符该落在哪里：新文字的末尾（模型坐标换算成显示坐标，加自动编号前缀）。
+ * 修订模式下新文字落在被删文字之后（见 replaceMatches），所以从 to 起算；否则原地替换，从 from 起算。
+ */
+function caretAfterReplace(match: Match, text: string): DisplayPoint {
+  const at = (props.trackChanges ? match.to : match.from) + text.length
+  return { blockId: match.blockId, offset: prefixLength(match.blockId) + at }
+}
+
+function replaceCurrent(text: string): void {
+  if (!props.editable) return
+  const match = searchMatches[searchIndex]
+  if (!match) return
+  pushHistory()
+  replaceMatches(doc.value, [match], text, props.trackChanges ? replaceRev : undefined)
+  // 必须给 anchor：force 重排会重建 DOM，不给锚点插入符就丢，替换完接着敲字会插到段首
+  refreshLayout({ force: true, anchor: caretAfterReplace(match, text) })
+}
+
+function replaceAll(text: string): void {
+  if (!props.editable || searchMatches.length === 0) return
+  // 停在第一处（与下面 searchIndex 归零一致）；首处的区间不会被后面的替换挪动
+  const first = searchMatches[0]
+  pushHistory()
+  replaceMatches(doc.value, searchMatches, text, props.trackChanges ? replaceRev : undefined)
+  searchIndex = 0
+  refreshLayout({ force: true, anchor: first ? caretAfterReplace(first, text) : null })
+}
+
+function clearSearch(): void {
+  searchOn = false
+  searchQuery = ''
+  searchScope = undefined
+  searchMatches = []
+  searchIndex = -1
+  searchError = null
+  const registry = highlightRegistry()
+  registry?.delete(SEARCH_HIGHLIGHT)
+  registry?.delete(SEARCH_CURRENT_HIGHLIGHT)
+  // 高亮已经手动撤掉了，签名也要作废 —— 否则下一轮画出同样的匹配会被跳过
+  searchPaintKey = ''
+  emit('search-state', { total: 0, current: 0, error: null })
+}
+
+/* -------------------------------------------------------------------------- */
 /* 生命周期                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -1123,6 +1410,15 @@ watch(
   { deep: true },
 )
 
+watch(
+  () => props.editable,
+  (on) => {
+    // 只读预览上做替换没有意义，而且切模式时 props.source 会把模型整个重新解析一遍，
+    // 旧高亮对应的节点早没了 —— 清掉最干净。
+    if (!on) clearSearch()
+  },
+)
+
 async function exportDocx(): Promise<Blob> {
   return toBlob(doc.value, resolved.value, { title: '公文' })
 }
@@ -1170,6 +1466,16 @@ defineExpose({
   canUndo: (): boolean => undoStack.length > 0,
   canRedo: (): boolean => redoStack.length > 0,
   focusComment,
+  // 查找与替换（面板由调用方画）
+  getSelectionScope,
+  setSearch,
+  nextMatch,
+  prevMatch,
+  replaceCurrent,
+  replaceAll,
+  clearSearch,
+  // 导航窗格
+  focusBlock,
 })
 </script>
 

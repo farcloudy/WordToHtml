@@ -13,28 +13,26 @@
 
 ## 0. 工作方式（硬性，先读这段）
 
-**调度方式**：由主 session 充当调度与集成，不自己顺序做完：每波**先派实现代理 → 回来再派独立验收代理**，
-验收过了才 `git commit`，然后才进下一波。
+**调度方式**：每波**先派实现代理(独立的 headless CLI 进程) → 回来再派独立验收代理**，验收过了才 `git commit`，然后才进下一波。
 
-> **2026-09-13 改：代理不再是 subagent，改成独立的 headless CLI 进程。**
->
-> 原因见第 9 节第 1 条：宿主 TUI 会崩在「大块输出渲进 TUI」上，而 subagent 的报告走的正是
-> `<task-notification>` → 渲染进主 session 这条路径（三次崩溃全部落在报告落地那一刻）。
+> 原因：当前subagent几乎100%会崩溃，见第 9 节第 1 条：宿主 TUI 会崩在「大块输出渲进 TUI」上，而 subagent 的报告走的正是 `<task-notification>` → 渲染进主 session 这条路径（三次崩溃全部落在报告落地那一刻）。
 > headless 进程没有 TUI，把 stdout 重定向到文件之后，进主 session 的只有 shell 工具那几行摘要。
 >
 > ```
-> qwen -p "<任务书>" --model <与主 session 同一个模型> --approval-mode auto-edit > .qwen/tmp/wX-impl.log 2>&1
+> qwen -p "<任务书>" --model <与主 session 同一个模型> -y > .qwen/tmp/wX-impl.log 2>&1
 > ```
 >
-> - **模型必须显式 `--model` 钉死**：实测不带这个参数时，子进程自己挑了个快模型（`deepseek-flash`），
->   实现质量会因此完全不受控。
 > - 任务书里固定要求：**结论写进 `.qwen/tmp/wX-impl-result.md`（≤ 40 行）**，细节与长日志留在
 >   `wX-impl.log`；主 session 只读那个结果文件，需要细节再 grep 日志。
-> - `--approval-mode auto-edit` 实测可以无人值守地写文件（已跑通）。
-> - **验收代理**默认也用 `auto-edit`（它常需要自己写临时脚本，例如 playwright 断言），但任务书里必须
+> - **要 `-y`（YOLO），不要用 `--approval-mode auto-edit`**：`auto-edit` 只自动批准**文件写入**，
+>   **不批准 shell** —— 非交互 session 里 `run_shell_command` 会被直接拒掉（日志里只有一句
+>   `Warning: Tool "run_shell_command" requires user approval but cannot execute in non-interactive mode`）。
+>   W3 因此交出过一次「代码写完了、命令一条没跑」的成果，类型错误还留在里面（主 session 补跑才发现）。
+>   纯写文件的活儿 `auto-edit` 够用；只要任务里含「跑 npm / 起浏览器 / 跑探针」，一律 `-y`。
+> - **验收代理同样要 `-y`**（它要跑 `verify:p2`/`verify:p3`、常要自写 playwright 探针），但任务书里必须
 >   限定「只许在 `.qwen/tmp/` 下新建文件，仓库内任何文件都不许改」，并且**验收一跑完主 session 立刻
 >   `git status --short` 复核**：只要有一个仓库内文件被动过，这次验收作废。
->   若这一轮验收不需要自写脚本，改用 `--approval-mode plan` 更省心 —— 实测它是硬闸门：写操作被拦在
+>   若这一轮验收既不用跑命令也不用写脚本，`--approval-mode plan` 更省心 —— 实测它是硬闸门：写操作被拦在
 >   执行前，当轮工具表里连 `write_file` / `Edit` 都没有，而且不会挂住（写完「待批准方案」就退出）。
 > - 可选护栏：`--max-session-turns N`（超限退出码 53）、`--max-wall-time`、`--max-tool-calls`（预算类退出码 55）。
 > - 子进程启动会打一条「MCP server(s) failed to start」（那三个 `qwen-mm-plugins-*` 起不来），
@@ -224,7 +222,7 @@ issue 已说清（宽度足够就两页一排），按**自适应**做：容器�
 
 ---
 
-## 5. W3 —— 查找替换（ctrl+F / ctrl+G）+ 左侧导航窗格
+## 5. W3 —— 查找替换（ctrl+F / ctrl+G）+ 左侧导航窗格（已完成 2026-09-13）
 
 **需求原文（issue 第 3、2 条）**：
 
@@ -256,6 +254,35 @@ issue 已说清（宽度足够就两页一排），按**自适应**做：容器�
 - 单测：新语法/正则/范围内匹配、零宽匹配、从后往前替换的坐标正确性。
 - `scripts/verify-editor.mjs`：ctrl+F 打开查找、高亮出现且**不触发重排**、ctrl+G 替换一项/全部、
   非法正则有提示、范围选项生效、导航窗格点击跳转后插入符落在正确位置。
+
+### 5.3 结论（2026-09-13）
+
+设计按 5.1 的提案落地（界面形态由用户另定，见下）；改动 8 个文件 + 2 个新文件
+（`src/lib/edit/search.ts`、`src/lib/edit/outline.ts`），共 +1540/−30。
+
+- **界面形态（用户拍板）**：查找替换是**预览区右上角的浮动面板**（拖标题栏可移、`×`／`Esc` 关闭、
+  正则默认不勾、范围默认「全文」、Enter 下一个／Shift+Enter 上一个）；导航窗格是**编辑器最左独立一栏**
+  （200px、有标题才出现、可折叠、顶栏另有「导航」开关）。
+- **高亮**走 CSS Custom Highlight（沿用既有 `keepSelection` 那一手），并且**一个匹配横跨两页时按分页片段
+  切成多个子 Range** —— 单个跨页 Range 会把页码与页间换页标记一并圈进去。正文 DOM 一个节点都不改，
+  「正常输入不得重排」因此不受影响（有断言：给片段打标记、查找／跳转后标记仍在）。
+- **修订模式下的替换**按 Word 语义写「原地标 `w:del` + 其后插入 `w:ins`」两份留痕；且**`del` 标记的文字
+  不参与查找与替换** —— 否则「替换一处」会反复命中同一处已删文字、不断叠加（这是收敛的前提，有断言）。
+- **打字不带动左栏**：大纲与匹配计数都在 `refreshLayout` 快照更新之后重算，且只在指纹／数字真的变了时
+  才 `emit`。
+- **验收**：`test-edit-model` 新增第 11–16 节；`verify-editor` 新增 P/P2/P3/Q 四节；全量
+  `npm run verify` 五阶段全绿（`type-check` / `verify:p1` / `verify:p2` / `verify:p3` / `verify:pages`），
+  另有 `verify:docx` 也过。独立验收代理 14 项定向证伪全过，只有一项判**不可接受**：
+  `replaceCurrent` / `replaceAll` 调 `refreshLayout({ force: true })` **没传 anchor**，替换后插入符丢、
+  接着敲字会插到段首甚至文档标题最前面 —— 而 `verify-editor` 的 P3 当时只验替换后的模型文字、不验插入符，
+  所以绿灯也漏过了。已改为两处都传锚点（`caretAfterReplace`：修订模式下新文字落在被删文字之后，所以从
+  `match.to` 起算，否则从 `match.from` 起算），并补三条断言（含「替换后接着敲字落点」的实测）；
+  聚焦复核（复核方另写探针专验修订模式那一路）结论**可接受**。
+- **本轮教训（已写进第 0 节）**：实现代理那个非交互 session **跑不了任何命令** —— `--approval-mode
+  auto-edit` 只自动批准写文件、不批准 shell，所以它交出过「代码写完、命令一条没跑」的成果，类型错误还留在
+  里面。凡任务含「跑 npm／起浏览器」一律给 `-y`；主 session 派发后要自己先跑一次 `type-check` 兜底。
+- 另外这次顺手查清了一个**既有的分页缺陷**（跨页段落页尾连按 Backspace 会让断点字符重复、越删越多），
+  机制与复现探针见第 8 节第 6 条，留待后续波次修。
 
 ---
 
@@ -442,6 +469,24 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    ③ 切模板的断言分散在 `verify-browser` 与 `verify-editor` 两个脚本里。
    ②③ 属整洁度问题，不影响结论。
 
+6. **页尾删除会让断点处的字符重复（分页缺陷，2026-09-13 复现并定位，未修）**。在一个跨页长段落
+   （demo 样本里那段「关于对外投资部分，…」正文）的**页尾**连按 Backspace，断点处的字符会被复制进模型、
+   越删越多（用户截图里是 `…被告的的民的的民…`），模型长度在 −1／+1 之间震荡。
+   **根因是三条叠在一起**：① 删除后新分页里这一格的 `from/to` 常常与上一轮**完全相同**（上一页末行让出的
+   字位正好被下一页首字顶上来）；② `retagFragments` 在 `input` 时**命令式改写** `data-from`／`data-to`
+   （值是重排前的），而 Vue 重渲染时按「新旧 prop 值相同」**跳过属性更新**，于是属性停在旧值、`v-html`
+   却按新分页重渲染 → **DOM 文字与坐标差一个字符**；③ 之后每次读回都把 919 字的 DOM 塞进 918 字的区间，
+   `replaceRange` 把多出的字符复制进模型。同一毛病的另一半：`retagFragments` 的
+   `data.to = cursor + prefix + text` 而 `textContent` 已含 `.wtp-num` 前缀，**前缀被算两遍** ——
+   编号段落跨页时表现为**丢字**（不是重复）。
+   **修的方向**：问题不在算术，而在「片段的 `data-from/to` 有两条权威」—— 让分页结果成为唯一权威
+   （重渲染后无条件把属性同步回 `pages.value`，或让 `retagFragments` 不再写属性），并确认按
+   `(blockId, from)` 编的 v-for key 不会让 Vue 复用错元素；验收要加一条「跨页段落页尾连按 N 次 Backspace，
+   模型长度必须恰好 −N（现在会少减甚至增加），且断点窗口不得出现重复」。
+   复现探针（只读、**临时件未提交**、产物在 `.qwen/tmp/`）：`probe-pagination.mjs`（逐步快照）、
+   `probe-pagination2.mjs`（`beforeinput`/`input`/mutation 事件时序）、`probe-pagination3.mjs`（dump 片段
+   DOM 文字，给出 919/918 的铁证）。更完整的机制说明见项目记忆 `pagination-boundary-duplication.md`。
+
 ---
 
 ## 9. 本机环境坑（踩过的，照做能省很多时间）
@@ -478,7 +523,7 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 | --- | --- | --- |
 | W1 | 快捷键组（ctrl+U / ctrl+shift+E / alt+4 / ctrl+P）+ 三种特殊空格；顺带把「列表段落」首行缩进改成 0 | **已完成**（2026-09-13，提交 `4ca96c8`；独立验收结论「可接受」，两处次要项见第 8 节第 4 条） |
 | W2 | 样式与页边距绑定（两套模板）+ 双页并排 | **已完成**（2026-09-13，提交 `734dc48`；独立验收结论「可接受」，次要项见第 8 节第 5 条） |
-| W3 | 查找替换 + 导航窗格 | 需求明确，设计为提案（第 5 节），未开工 |
+| W3 | 查找替换 + 导航窗格 | **已完成**（2026-09-13，本次提交；独立验收先判「不可接受」——替换后插入符锚点缺失，修完聚焦复核「可接受」，结论见第 5.3 节） |
 | W4a | 表格：模型 + 渲染 + 量测 + 分页 + 导出 + md 语法 | 模型设计已过用户闸门（第 6 节），未开工 |
 | W4b | 表格：编辑交互 | 同上，未开工 |
 | W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |

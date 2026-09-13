@@ -6,6 +6,8 @@ import { toMd } from './lib/md/serialize'
 import { BLOCK_KINDS, DOC_TEMPLATES, ptToPx, resolveSpec } from './lib/spec'
 import type { BlockKind, DeepPartial, Spec } from './lib/spec'
 import type { EditorSelection } from './lib/edit/model'
+import type { OutlineEntry } from './lib/edit/outline'
+import type { SearchScope } from './lib/edit/search'
 
 const SAMPLE = [
   '# 关于爱康光电资产核查情况的说明',
@@ -101,6 +103,40 @@ const toastText = ref('')
 /** 提示条的计时器；关掉页面时也要清掉，别留一个 setTimeout 在那里 */
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
+/** 导航窗格：大纲由组件按渲染快照推来（有标题才会出现），开关由 App 持有 */
+const outline = ref<OutlineEntry[]>([])
+const navOpen = ref(true)
+
+/* 查找替换面板。位置与开关都握在 App 手里，组件只管匹配与高亮。 */
+const searchOpen = ref(false)
+const searchMode = ref<'find' | 'replace'>('find')
+const searchQuery = ref('')
+const searchReplace = ref('')
+const searchRegex = ref(false)
+const searchScopeMode = ref<'all' | 'selection'>('all')
+/** 打开面板那一刻捕获的选区范围：焦点进面板以后实时选区就没了，只能提前记下来 */
+const searchScope = ref<SearchScope[]>([])
+const searchState = ref<{ total: number; current: number; error: string | null }>({
+  total: 0,
+  current: 0,
+  error: null,
+})
+const findInput = ref<HTMLInputElement | null>(null)
+const replaceInput = ref<HTMLInputElement | null>(null)
+const previewPane = ref<HTMLElement | null>(null)
+const searchPanel = ref<HTMLElement | null>(null)
+/** 拖动后的位置（相对预览窗格）。null = 还没拖过，贴右上角 */
+const panelPos = ref<{ x: number; y: number } | null>(null)
+/** 拖动起点：指针相对面板左上角的偏移，保证「抓住哪儿就从哪儿拖」 */
+let dragOffset: { x: number; y: number } | null = null
+
+/** 未拖过时贴右上角；两个分支给同一组键，免得推断出带 undefined 的联合类型 */
+const searchPanelStyle = computed<Record<string, string>>(() => {
+  const pos = panelPos.value
+  if (!pos) return { right: '12px', left: 'auto', top: '12px' }
+  return { left: `${pos.x}px`, top: `${pos.y}px`, right: 'auto' }
+})
+
 const specOverride = computed<DeepPartial<Spec>>(() => {
   const template = DOC_TEMPLATES.find((t) => t.key === templateKey.value) ?? DOC_TEMPLATES[0]
   return template.spec
@@ -166,10 +202,108 @@ function toggleTrackChanges(): void {
   trackChanges.value = !trackChanges.value
 }
 
+/* -------------------------------------------------------------------------- */
+/* 查找与替换面板                                                              */
+/* -------------------------------------------------------------------------- */
+
+function runSearch(): void {
+  paper.value?.setSearch(searchQuery.value, {
+    regex: searchRegex.value,
+    // 范围取「当前选中的文本」时把捕获到的区间传下去；空数组 = 没有任何区间，命中 0 处
+    ...(searchScopeMode.value === 'selection' ? { scope: searchScope.value } : {}),
+  })
+}
+
+/*
+ * 面板里的输入与选项一变就重跑。
+ * 用 watch 而不是在输入框上写 @input：那要依赖「v-model 的监听器先于 @input 跑」这个
+ * 顺序细节，写错会慢一个字符。
+ */
+watch([searchQuery, searchRegex, searchScopeMode], () => {
+  if (searchOpen.value) runSearch()
+})
+
+/** ctrl+F / ctrl+G 都开这一个面板，只是决定焦点落在哪个输入框 */
+async function onOpenSearch(next: 'find' | 'replace'): Promise<void> {
+  searchMode.value = next
+  // 焦点马上要进面板，实时选区到那时就没了 —— 必须在这一刻把范围记下来
+  searchScope.value = paper.value?.getSelectionScope() ?? []
+  searchScopeMode.value = 'all'
+  searchOpen.value = true
+  panelPos.value = null
+  await nextTick()
+  const input = next === 'replace' ? replaceInput.value : findInput.value
+  input?.focus()
+  input?.select()
+  if (searchQuery.value !== '') runSearch()
+}
+
+function closeSearch(): void {
+  searchOpen.value = false
+  panelPos.value = null
+  paper.value?.clearSearch()
+  searchState.value = { total: 0, current: 0, error: null }
+  void nextTick(() => {
+    // 焦点还给版面，接着敲字不用再点一次
+    document.querySelector<HTMLElement>('.wtp-content[contenteditable="true"]')?.focus()
+  })
+}
+
+function nextMatch(): void {
+  paper.value?.nextMatch()
+}
+
+function prevMatch(): void {
+  paper.value?.prevMatch()
+}
+
+function replaceOne(): void {
+  paper.value?.replaceCurrent(searchReplace.value)
+}
+
+function replaceAllMatches(): void {
+  paper.value?.replaceAll(searchReplace.value)
+}
+
+function startSearchDrag(event: PointerEvent): void {
+  const pane = previewPane.value
+  const panel = searchPanel.value
+  if (!pane || !panel) return
+  const paneRect = pane.getBoundingClientRect()
+  const panelRect = panel.getBoundingClientRect()
+  dragOffset = { x: event.clientX - panelRect.left, y: event.clientY - panelRect.top }
+  // 由 right 定位切成 left 定位：不先钉住，第一下 pointermove 会跳半个面板宽
+  panelPos.value = { x: panelRect.left - paneRect.left, y: panelRect.top - paneRect.top }
+  window.addEventListener('pointermove', onSearchDrag)
+  window.addEventListener('pointerup', endSearchDrag)
+  event.preventDefault()
+}
+
+function onSearchDrag(event: PointerEvent): void {
+  const pane = previewPane.value
+  const panel = searchPanel.value
+  if (!pane || !panel || !dragOffset) return
+  const paneRect = pane.getBoundingClientRect()
+  const maxX = Math.max(0, paneRect.width - panel.offsetWidth)
+  const maxY = Math.max(0, paneRect.height - panel.offsetHeight)
+  panelPos.value = {
+    x: Math.min(Math.max(0, event.clientX - paneRect.left - dragOffset.x), maxX),
+    y: Math.min(Math.max(0, event.clientY - paneRect.top - dragOffset.y), maxY),
+  }
+}
+
+function endSearchDrag(): void {
+  dragOffset = null
+  window.removeEventListener('pointermove', onSearchDrag)
+  window.removeEventListener('pointerup', endSearchDrag)
+}
+
 /** 切到源码视图前，把当前模型序列化成 md —— 所见即所得改完总要看得到「它长什么样」 */
 function switchMode(next: 'edit' | 'source'): void {
   if (next === mode.value) return
   if (next === 'source') {
+    // 源码视图用浏览器自带的查找；面板留着会和 props.source 的重新解析打架
+    if (searchOpen.value) closeSearch()
     source.value = paper.value ? toMd(paper.value.getModel()) : source.value
     mdView.value = source.value
   }
@@ -206,6 +340,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (toastTimer !== null) clearTimeout(toastTimer)
+  endSearchDrag()
 })
 </script>
 
@@ -221,6 +356,16 @@ onBeforeUnmount(() => {
           类 md 源码
         </button>
       </div>
+      <button
+        v-if="outline.length > 0"
+        type="button"
+        class="tool"
+        :class="{ 'is-on': navOpen }"
+        title="显示/隐藏左侧导航窗格"
+        @click="navOpen = !navOpen"
+      >
+        导航
+      </button>
       <label class="field">
         文件模板
         <select v-model="templateKey">
@@ -370,6 +515,27 @@ onBeforeUnmount(() => {
     </div>
 
     <main class="panes" :class="{ single: mode === 'edit' }">
+      <!-- 导航窗格：有标题才出现，挂在编辑器最左侧（不是塞在 WordPaper 里面） -->
+      <section v-if="outline.length > 0 && navOpen" class="pane nav-pane">
+        <div class="pane-head nav-head">
+          <span>导航</span>
+          <button type="button" class="nav-collapse" title="折叠导航窗格" @click="navOpen = false">
+            «
+          </button>
+        </div>
+        <ul class="nav-list">
+          <li v-for="entry in outline" :key="entry.blockId" :class="`nav-lv${entry.level}`">
+            <button
+              type="button"
+              :title="entry.prefix + entry.text"
+              @click="paper?.focusBlock(entry.blockId)"
+            >
+              <span class="nav-prefix">{{ entry.prefix }}</span>{{ entry.text }}
+            </button>
+          </li>
+        </ul>
+      </section>
+
       <section v-if="mode === 'source'" class="pane">
         <div class="pane-head">类 md 源码</div>
         <textarea v-model="source" spellcheck="false" />
@@ -399,7 +565,7 @@ onBeforeUnmount(() => {
         </details>
       </section>
 
-      <section class="pane">
+      <section ref="previewPane" class="pane preview-pane">
         <div v-if="mode === 'source'" class="pane-head">A4 预览（只读）</div>
         <div class="canvas">
           <WordPaper
@@ -413,7 +579,87 @@ onBeforeUnmount(() => {
             @selection-change="onSelectionChange"
             @toggle-track-changes="toggleTrackChanges"
             @toast="showToast"
+            @open-search="onOpenSearch"
+            @search-state="searchState = $event"
+            @outline-change="outline = $event"
           />
+        </div>
+
+        <!--
+          查找替换面板：浮在预览区之上（该 pane 是 position:relative），拖标题栏可移动、
+          拖不出窗格范围。面板本身两种功能都在，ctrl+F / ctrl+G 只决定焦点落在哪个框。
+        -->
+        <div v-if="searchOpen" ref="searchPanel" class="search-panel" :style="searchPanelStyle">
+          <div class="search-head" @pointerdown="startSearchDrag">
+            <span class="search-title">{{ searchMode === 'replace' ? '查找与替换' : '查找' }}</span>
+            <button
+              type="button"
+              class="search-close"
+              title="关闭（Esc）"
+              @pointerdown.stop
+              @click="closeSearch"
+            >
+              ×
+            </button>
+          </div>
+          <div class="search-body">
+            <label class="search-row">
+              <span>查找</span>
+              <input
+                ref="findInput"
+                v-model="searchQuery"
+                type="text"
+                spellcheck="false"
+                @keydown.enter.exact.prevent="nextMatch"
+                @keydown.enter.shift.prevent="prevMatch"
+                @keydown.esc.prevent="closeSearch"
+              />
+            </label>
+            <label class="search-row">
+              <span>替换</span>
+              <input
+                ref="replaceInput"
+                v-model="searchReplace"
+                type="text"
+                spellcheck="false"
+                @keydown.enter.prevent="replaceOne"
+                @keydown.esc.prevent="closeSearch"
+              />
+            </label>
+            <div class="search-meta">
+              <span class="search-count">{{
+                searchState.total === 0
+                  ? '共 0 处'
+                  : `第 ${searchState.current} / 共 ${searchState.total} 处`
+              }}</span>
+              <span v-if="searchState.error" class="search-error">{{ searchState.error }}</span>
+            </div>
+            <div class="search-actions">
+              <button type="button" @mousedown.prevent @click="prevMatch">上一个</button>
+              <button type="button" @mousedown.prevent @click="nextMatch">下一个</button>
+              <button type="button" @mousedown.prevent @click="replaceOne">替换</button>
+              <button type="button" @mousedown.prevent @click="replaceAllMatches">全部替换</button>
+            </div>
+            <label class="search-toggle">
+              <input v-model="searchRegex" name="search-regex" type="checkbox" />
+              使用正则表达式
+            </label>
+            <div class="search-scope">
+              <label>
+                <input v-model="searchScopeMode" name="search-scope" type="radio" value="all" />
+                全文
+              </label>
+              <label>
+                <input
+                  v-model="searchScopeMode"
+                  name="search-scope"
+                  type="radio"
+                  value="selection"
+                />
+                当前选中的文本
+              </label>
+            </div>
+          </div>
         </div>
         <details v-if="mode === 'source'" class="legend md-mirror">
           <summary>当前模型的 md 形态（只读镜像）</summary>
@@ -647,6 +893,170 @@ button.primary:disabled {
   border-left: 1px solid #d8dade;
 }
 
+/* 预览窗格是浮动查找面板的定位父级 */
+.preview-pane {
+  position: relative;
+}
+
+/*
+ * 导航窗格固定 200px。这个宽度不是随便定的：预览区还要放得下两页并排的 A4
+ * （约 1605px），窗格再宽就会把并排挤掉（verify:p2 直接验这件事）。
+ */
+.nav-pane {
+  flex: 0 0 200px;
+  background: #fbfbfc;
+}
+.nav-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.nav-collapse {
+  padding: 0 6px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  background: #fff;
+  color: #5a5f66;
+  font: inherit;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.nav-collapse:hover {
+  border-color: #8a9099;
+}
+.nav-list {
+  flex: 1;
+  margin: 0;
+  padding: 6px 0;
+  overflow: auto;
+  list-style: none;
+}
+.nav-list li button {
+  display: block;
+  width: 100%;
+  padding: 4px 10px;
+  border: 0;
+  background: transparent;
+  color: #33383f;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+.nav-list li button:hover {
+  background: #eef2f8;
+}
+.nav-lv2 button {
+  padding-left: 22px;
+}
+.nav-lv3 button {
+  padding-left: 34px;
+}
+.nav-prefix {
+  color: #8a9099;
+}
+
+/* 浮动查找替换面板 */
+.search-panel {
+  position: absolute;
+  z-index: 12;
+  width: 272px;
+  border: 1px solid #c8ccd2;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(20, 24, 30, 0.18);
+  font-size: 12px;
+  color: #33383f;
+}
+.search-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid #e4e6ea;
+  border-radius: 7px 7px 0 0;
+  background: #f6f7f9;
+  cursor: move;
+  user-select: none;
+}
+.search-title {
+  font-weight: 600;
+}
+.search-close {
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: #8a9099;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.search-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 10px;
+}
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.search-row span {
+  flex: 0 0 28px;
+  color: #5a5f66;
+}
+.search-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  font: inherit;
+}
+.search-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+}
+.search-count {
+  color: #5a5f66;
+  font-variant-numeric: tabular-nums;
+}
+.search-error {
+  color: #b3261e;
+}
+.search-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.search-actions button {
+  padding: 3px 8px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.search-actions button:hover {
+  border-color: #8a9099;
+}
+.search-toggle,
+.search-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #5a5f66;
+}
+.search-scope {
+  display: flex;
+  gap: 12px;
+}
+
 .pane-head {
   padding: 6px 12px;
   border-bottom: 1px solid #e4e6ea;
@@ -741,7 +1151,9 @@ textarea {
   .pane-head,
   .legend,
   textarea,
-  .toast {
+  .toast,
+  .nav-pane,
+  .search-panel {
     display: none !important;
   }
 

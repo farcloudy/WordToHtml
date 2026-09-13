@@ -19,15 +19,18 @@ import {
   addComment,
   applyFormat,
   blockLength,
+  buildOutline,
   cloneDoc,
   commentScopes,
   deleteRange,
   findBlock,
+  findMatches,
   formatAmount,
   insertBreakAfter,
   insertText,
   mergeIntoPrevious,
   normalizeBlocks,
+  outlineSignature,
   parseMd,
   plainText,
   rangeColor,
@@ -36,6 +39,7 @@ import {
   removeBreak,
   removeComment,
   replyComment,
+  replaceMatches,
   replaceRange,
   resolveSpec,
   setBlockKind,
@@ -43,6 +47,7 @@ import {
   toBase64,
   toMd,
   updateComment,
+  validateQuery,
 } from '../dist-lib/wordtohtml.mjs'
 
 let failed = 0
@@ -422,6 +427,301 @@ console.log('\n=== 10. 特殊空格能原样写进 docx ===')
   ok(
     '三个空格按顺序留在同一段文字里',
     xml.includes(`前${spaces[0]}中${spaces[1]}后${spaces[2]}末`),
+  )
+}
+
+console.log('\n=== 11. findMatches：字面量 / 正则 / 非法正则 / 大小写 ===')
+{
+  const dotted = docFrom('xa.by', 'axb')
+  eq(
+    '字面量模式下 . 只当普通字符',
+    JSON.stringify(findMatches(dotted, 'a.b')),
+    JSON.stringify([{ blockId: 't0', from: 1, to: 4 }]),
+  )
+  eq(
+    '正则模式下 . 是通配符',
+    JSON.stringify(findMatches(dotted, 'a.b', { regex: true })),
+    JSON.stringify([
+      { blockId: 't0', from: 1, to: 4 },
+      { blockId: 't1', from: 0, to: 3 },
+    ]),
+  )
+  eq('空查询返回 []', JSON.stringify(findMatches(dotted, '')), '[]')
+  eq('匹配不到返回 []', JSON.stringify(findMatches(dotted, 'zzz')), '[]')
+
+  eq('合法正则 validateQuery 返回 null', validateQuery('[a-z]+', true), null)
+  eq('字面量模式不做正则校验', validateQuery('[', false), null)
+  ok('非法正则有错误文案', typeof validateQuery('[', true) === 'string' && validateQuery('[', true).length > 0)
+  eq('非法正则 findMatches 返回 []（不抛异常）', JSON.stringify(findMatches(dotted, '[', { regex: true })), '[]')
+
+  const multi = docFrom('债务人甲，债务人乙，债务人丙')
+  eq('同一段里三处都命中', findMatches(multi, '债务人').length, 3)
+  const cased = docFrom('Abc abc')
+  eq(
+    '默认大小写敏感',
+    JSON.stringify(findMatches(cased, 'abc')),
+    JSON.stringify([{ blockId: 't0', from: 4, to: 7 }]),
+  )
+}
+
+console.log('\n=== 12. 跨 inline 片段匹配；跳过删除修订 ===')
+{
+  const anchored = {
+    blocks: [
+      {
+        t: 'textBlock',
+        id: 't0',
+        kind: 'body',
+        inlines: [
+          { t: 'text', text: 'ab' },
+          { t: 'commentStart', commentId: 0 },
+          { t: 'text', text: 'cd' },
+          { t: 'commentEnd', commentId: 0 },
+          { t: 'text', text: 'ef', bold: true },
+        ],
+      },
+    ],
+    comments: [{ id: 0, author: '甲', date: '2026-01-01T00:00:00.000Z', text: '注' }],
+  }
+  eq(
+    '批注锚点不占字符，匹配照样跨过去',
+    JSON.stringify(findMatches(anchored, 'cde')),
+    JSON.stringify([{ blockId: 't0', from: 2, to: 5 }]),
+  )
+  eq(
+    '加粗边界不挡匹配',
+    JSON.stringify(findMatches(anchored, 'def')),
+    JSON.stringify([{ blockId: 't0', from: 3, to: 6 }]),
+  )
+
+  // 删除修订的文字仍留在模型里，但查找不该再命中它 —— 否则反复替换会不断叠加插入
+  const removed = {
+    blocks: [
+      {
+        t: 'textBlock',
+        id: 't0',
+        kind: 'body',
+        inlines: [
+          { t: 'text', text: 'ab' },
+          {
+            t: 'text',
+            text: 'XY',
+            rev: { kind: 'del', id: 1, author: '甲', date: '2026-01-01T00:00:00.000Z' },
+          },
+          { t: 'text', text: 'cd' },
+        ],
+      },
+    ],
+    comments: [],
+  }
+  eq('被标成 del 的文字不参与查找', JSON.stringify(findMatches(removed, 'XY')), '[]')
+  eq(
+    'del 之前的文字照常命中',
+    JSON.stringify(findMatches(removed, 'ab')),
+    JSON.stringify([{ blockId: 't0', from: 0, to: 2 }]),
+  )
+  eq(
+    'del 之后的文字坐标仍是模型坐标（跳过的两字不进坐标）',
+    JSON.stringify(findMatches(removed, 'cd')),
+    JSON.stringify([{ blockId: 't0', from: 4, to: 6 }]),
+  )
+  eq('del 把前后断开，不跨过它匹配', JSON.stringify(findMatches(removed, 'abcd')), '[]')
+
+  const inserted = {
+    blocks: [
+      {
+        t: 'textBlock',
+        id: 't0',
+        kind: 'body',
+        inlines: [
+          { t: 'text', text: 'ab' },
+          {
+            t: 'text',
+            text: 'XY',
+            rev: { kind: 'ins', id: 2, author: '甲', date: '2026-01-01T00:00:00.000Z' },
+          },
+        ],
+      },
+    ],
+    comments: [],
+  }
+  eq('插入修订的文字照常参与查找', JSON.stringify(findMatches(inserted, 'abXY')), JSON.stringify([{ blockId: 't0', from: 0, to: 4 }]))
+}
+
+console.log('\n=== 13. 范围限定（不许跨区间）===')
+{
+  const model = docFrom('债务人甲', '债务人乙')
+  eq(
+    '只在给的区间里找',
+    JSON.stringify(findMatches(model, '债务人', { scope: [{ blockId: 't0', from: 0, to: 3 }] })),
+    JSON.stringify([{ blockId: 't0', from: 0, to: 3 }]),
+  )
+  eq(
+    '多个区间时各自找',
+    findMatches(model, '债务人', {
+      scope: [
+        { blockId: 't0', from: 0, to: 3 },
+        { blockId: 't1', from: 0, to: 3 },
+      ],
+    }).length,
+    2,
+  )
+  eq(
+    '匹配必须完整落在区间内（跨出边界就不算）',
+    JSON.stringify(findMatches(model, '债务人', { scope: [{ blockId: 't0', from: 1, to: 3 }] })),
+    '[]',
+  )
+  eq(
+    '区间不能跨块拼起来',
+    JSON.stringify(
+      findMatches(model, '人甲债务人', {
+        scope: [
+          { blockId: 't0', from: 0, to: 3 },
+          { blockId: 't1', from: 0, to: 3 },
+        ],
+      }),
+    ),
+    '[]',
+  )
+  eq('空范围列表 = 一处都不命中', JSON.stringify(findMatches(model, '债务人', { scope: [] })), '[]')
+}
+
+console.log('\n=== 14. 零宽正则不会死循环 ===')
+{
+  const model = docFrom('aaa', 'bbb')
+  eq('^ 只产生零宽匹配 → 不算命中', JSON.stringify(findMatches(model, '^', { regex: true })), '[]')
+  eq(
+    'a* 只取非空那一段',
+    JSON.stringify(findMatches(model, 'a*', { regex: true })),
+    JSON.stringify([{ blockId: 't0', from: 0, to: 3 }]),
+  )
+  const started = Date.now()
+  const hits = findMatches(model, 'a*', { regex: true })
+  eq('零宽全部替换会终止并替换掉真正的匹配', replaceMatches(model, hits, 'X'), 1)
+  eq('替换后文字正确', plainText(findBlock(model, 't0')), 'X')
+  ok('零宽扫描耗时正常（不死循环）', Date.now() - started < 1000)
+  eq('零宽匹配集为空时替换返回 0', replaceMatches(model, [], 'X'), 0)
+
+  const caretOnly = docFrom('bbb')
+  eq('^ 之下没有可替换的区间', replaceMatches(caretOnly, findMatches(caretOnly, '^', { regex: true }), 'X'), 0)
+  eq('文档没被改', plainText(findBlock(caretOnly, 't0')), 'bbb')
+}
+
+console.log('\n=== 15. replaceMatches：从后往前、格式继承、修订留痕 ===')
+{
+  const model = docFrom('abcabc')
+  const hits = findMatches(model, 'abc')
+  eq('先找出两处', hits.length, 2)
+  eq('替换处数', replaceMatches(model, hits, 'X'), 2)
+  eq('从后往前替换后文字正确', plainText(findBlock(model, 't0')), 'XX')
+
+  const grow = docFrom('abXab')
+  replaceMatches(grow, findMatches(grow, 'ab'), 'ZZZ')
+  eq('新文字比原文长也不会串位', plainText(findBlock(grow, 't0')), 'ZZZXZZZ')
+
+  const shrink = docFrom('1234512345')
+  replaceMatches(shrink, findMatches(shrink, '12345'), '')
+  eq('替换成空串等于删除', plainText(findBlock(shrink, 't0')), '')
+
+  const multiBlock = docFrom('旧旧', '旧旧')
+  eq('跨块一起替换', replaceMatches(multiBlock, findMatches(multiBlock, '旧'), '新'), 4)
+  eq('第一块', plainText(findBlock(multiBlock, 't0')), '新新')
+  eq('第二块', plainText(findBlock(multiBlock, 't1')), '新新')
+
+  // 格式继承：换掉一段加粗文字不该静默丢格式
+  const formatted = {
+    blocks: [
+      {
+        t: 'textBlock',
+        id: 't0',
+        kind: 'body',
+        inlines: [
+          { t: 'text', text: 'abc', bold: true, color: 'FF0000' },
+          { t: 'text', text: 'def' },
+        ],
+      },
+    ],
+    comments: [],
+  }
+  const spanHits = findMatches(formatted, 'bcd')
+  eq('跨格式边界命中一处', spanHits.length, 1)
+  replaceMatches(formatted, spanHits, 'Q')
+  const spanBlock = findBlock(formatted, 't0')
+  eq('替换后文字', plainText(spanBlock), 'aQef')
+  const piece = spanBlock.inlines.find((i) => i.t === 'text' && i.text === 'Q')
+  ok(
+    '替换结果继承区间内第一个 text 片段的格式',
+    piece !== undefined && piece.bold === true && piece.color === 'FF0000',
+    JSON.stringify(piece ?? null),
+  )
+  const trailing = spanBlock.inlines.find((i) => i.t === 'text' && i.text === 'ef')
+  ok('没被替换的部分保持原格式', trailing !== undefined && trailing.bold === undefined)
+
+  // 修订模式：旧文字标 del 留着，新文字标 ins 接在后面
+  const tracked = docFrom('abc')
+  let seq = 0
+  const makeRev = () => ({
+    kind: 'ins',
+    id: seq++,
+    author: '张三',
+    date: '2026-09-13T10:00:00.000Z',
+  })
+  eq('修订模式替换一处', replaceMatches(tracked, findMatches(tracked, 'b'), 'Z', makeRev), 1)
+  const trackBlock = findBlock(tracked, 't0')
+  eq('旧文字没被真删，新文字接在后面', plainText(trackBlock), 'abZc')
+  const dels = trackBlock.inlines.filter((i) => i.t === 'text' && i.rev?.kind === 'del')
+  const inss = trackBlock.inlines.filter((i) => i.t === 'text' && i.rev?.kind === 'ins')
+  eq('留下一个删除标记', dels.map((i) => i.text).join(''), 'b')
+  eq('留下一个插入标记', inss.map((i) => i.text).join(''), 'Z')
+  eq('删除与插入用不同的修订 id', dels[0].rev.id !== inss[0].rev.id, true)
+  eq('再查同一处不会再命中（替换会收敛）', JSON.stringify(findMatches(tracked, 'b')), '[]')
+}
+
+console.log('\n=== 16. buildOutline / outlineSignature ===')
+{
+  const model = {
+    blocks: [
+      { t: 'textBlock', id: 'a', kind: 'title', inlines: [{ t: 'text', text: '文件标题' }] },
+      { t: 'textBlock', id: 'b', kind: 'h1', inlines: [{ t: 'text', text: '一级' }] },
+      { t: 'textBlock', id: 'c', kind: 'body', inlines: [{ t: 'text', text: '正文' }] },
+      { t: 'textBlock', id: 'd', kind: 'h2', inlines: [{ t: 'text', text: '二级' }] },
+      { t: 'textBlock', id: 'e', kind: 'h3', inlines: [{ t: 'text', text: '三级' }] },
+    ],
+    comments: [],
+  }
+  const numbering = new Map([
+    ['b', '一、'],
+    ['d', '（一）'],
+    ['e', '1、'],
+  ])
+  const entries = buildOutline(model, numbering)
+  eq('只收 h1/h2/h3（title 与正文都不进）', entries.length, 3)
+  eq(
+    '层级、顺序与编号前缀',
+    entries.map((e) => `${e.blockId}:${e.level}:${e.prefix}${e.text}`).join('|'),
+    'b:1:一、一级|d:2:（一）二级|e:3:1、三级',
+  )
+
+  const noNumber = {
+    blocks: [{ t: 'textBlock', id: 'h', kind: 'h1', inlines: [{ t: 'text', text: '标题' }] }],
+    comments: [],
+  }
+  eq('没有编号时前缀是空串', buildOutline(noNumber, new Map())[0]?.prefix, '')
+
+  const sig = outlineSignature(entries)
+  eq('同一份大纲指纹相同', outlineSignature(buildOutline(model, numbering)), sig)
+  eq('空大纲指纹为空串', outlineSignature([]), '')
+  ok(
+    '改了标题文字指纹就变',
+    outlineSignature(entries.map((e, i) => (i === 0 ? { ...e, text: '改了' } : e))) !== sig,
+  )
+  ok(
+    '编号前缀变了指纹也变',
+    outlineSignature(entries.map((e, i) => (i === 0 ? { ...e, prefix: '二、' } : e))) !== sig,
+  )
+  ok(
+    '多了/少了一条也变',
+    outlineSignature(entries.slice(0, 2)) !== sig && outlineSignature([...entries, { ...entries[0], blockId: 'z' }]) !== sig,
   )
 }
 

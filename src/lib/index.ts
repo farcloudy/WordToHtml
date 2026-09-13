@@ -93,6 +93,12 @@ export type { BlockPoint, EditorSelection } from './edit/model'
 
 export { formatAmount } from './edit/amount'
 
+export { findMatches, replaceMatches, validateQuery } from './edit/search'
+export type { Match, SearchOptions, SearchScope } from './edit/search'
+
+export { buildOutline, outlineSignature } from './edit/outline'
+export type { OutlineEntry } from './edit/outline'
+
 export {
   cssColorToHex,
   currentRange,
@@ -118,7 +124,14 @@ export type { ExportMeta } from './docx/export'
 export { lineUnitPlan, patchStylesXml } from './docx/lineUnits'
 export type { LineUnit, LineUnitPlan } from './docx/lineUnits'
 
-export { WTP, buildCss, injectCss } from './render/css'
+export {
+  KEEP_SELECTION_HIGHLIGHT,
+  SEARCH_CURRENT_HIGHLIGHT,
+  SEARCH_HIGHLIGHT,
+  WTP,
+  buildCss,
+  injectCss,
+} from './render/css'
 export { escapeHtml, renderInlinesHtml } from './render/html'
 export { clearMeasureCache, measureDocument } from './render/measure'
 export type { MeasureCache, MeasureCacheEntry } from './render/measure'

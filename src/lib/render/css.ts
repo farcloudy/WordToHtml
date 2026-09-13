@@ -17,6 +17,14 @@ export const WTP = 'wtp'
  */
 export const KEEP_SELECTION_HIGHLIGHT = `${WTP}-keep-selection`
 
+/**
+ * 查找命中与「当前命中」两层高亮的名字，同样走 CSS Custom Highlight API。
+ * 匹配高亮绝不动 DOM —— 一个节点都不许改，否则就会违反「正常输入不得重排」。
+ * 名字在这里定义，组件里注册与清除时引用同一份常量。
+ */
+export const SEARCH_HIGHLIGHT = `${WTP}-search-match`
+export const SEARCH_CURRENT_HIGHLIGHT = `${WTP}-search-current`
+
 function quote(name: string): string {
   return `"${name.replace(/"/g, '')}"`
 }
@@ -91,6 +99,9 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     // 选区看起来就「丢了」。这里用 Custom Highlight 单独画一层：不动 DOM，
     // 因此不会碰坏正在编辑的内容，选区回到正文时再撤掉。
     `::highlight(${KEEP_SELECTION_HIGHLIGHT}) { background: rgba(31, 111, 235, 0.32); }`,
+    // 查找命中：一层淡黄把所有命中铺出来，当前那一处再压一层更重的橙
+    `::highlight(${SEARCH_HIGHLIGHT}) { background: rgba(255, 213, 0, 0.45); }`,
+    `::highlight(${SEARCH_CURRENT_HIGHLIGHT}) { background: rgba(255, 145, 0, 0.75); }`,
   )
 
   /*

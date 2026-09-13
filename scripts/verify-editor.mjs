@@ -25,6 +25,13 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { createServer } from 'vite'
 
+import {
+  SEARCH_CURRENT_HIGHLIGHT,
+  SEARCH_HIGHLIGHT,
+  computeNumbering,
+  resolveSpec,
+} from '../dist-lib/wordtohtml.mjs'
+
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
@@ -46,11 +53,20 @@ function eq(label, actual, expected) {
   return ok(label, actual === expected, `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`)
 }
 
-/** 页面里装一组测试用的小工具 */
-const TEST_HELPERS = () => {
+/** 页面里装一组测试用的小工具。names 是两层查找高亮的名字（从 lib 导出的常量） */
+const TEST_HELPERS = (names) => {
+  window.__wtpHighlightNames = names
   const helpers = {
     fragments() {
       return Array.from(document.querySelectorAll('[data-block-id]'))
+    },
+    /** 查找高亮的 Range 数。normal = 全部命中，current = 当前那一处。 */
+    highlights() {
+      const registry = typeof CSS !== 'undefined' ? CSS.highlights : undefined
+      if (!registry) return { supported: false, normal: 0, current: 0 }
+      const all = registry.get(window.__wtpHighlightNames.normal)
+      const cur = registry.get(window.__wtpHighlightNames.current)
+      return { supported: true, normal: all ? all.size : 0, current: cur ? cur.size : 0 }
     },
     textOf(el) {
       return el.textContent ?? ''
@@ -168,7 +184,10 @@ async function openApp() {
     await document.fonts.ready
   })
   await page.waitForTimeout(600)
-  await page.evaluate(TEST_HELPERS)
+  await page.evaluate(TEST_HELPERS, {
+    normal: SEARCH_HIGHLIGHT,
+    current: SEARCH_CURRENT_HIGHLIGHT,
+  })
 }
 
 const getModel = () => page.evaluate(() => window.__wtpPaper.getModel())
@@ -178,6 +197,107 @@ const textOfBlock = (block) =>
     .filter((i) => i.t === 'text')
     .map((i) => i.text)
     .join('')
+
+/**
+ * 按模型的「可搜索文字」数一处查询出现几次 —— 期望值从模型推导，不从界面反推。
+ * 删除修订的文字不参与，且它会把前后断开（与 lib/edit/search.ts 同一套口径）。
+ */
+function countInModel(model, needle) {
+  let total = 0
+  for (const block of heroBlocks(model)) {
+    let text = ''
+    for (const inline of block.inlines) {
+      if (inline.t !== 'text') continue
+      if (inline.rev && inline.rev.kind === 'del') {
+        text += '\u0000'
+        continue
+      }
+      text += inline.text
+    }
+    let at = text.indexOf(needle)
+    while (at >= 0) {
+      total += 1
+      at = text.indexOf(needle, at + needle.length)
+    }
+  }
+  return total
+}
+
+/** 从模型推导导航窗格该有的条目（编号按规格表的 numbering 现算，不硬编码） */
+function expectedOutline(model) {
+  const spec = resolveSpec()
+  const numbering = computeNumbering(model.blocks, (block) =>
+    block.t === 'textBlock' ? spec.styles[block.kind].numbering : 'none',
+  )
+  const out = []
+  for (const block of heroBlocks(model)) {
+    const level = { h1: 1, h2: 2, h3: 3 }[block.kind]
+    if (level === undefined) continue
+    out.push({
+      blockId: block.id,
+      level,
+      prefix: numbering.get(block.id) ?? '',
+      text: textOfBlock(block),
+    })
+  }
+  return out
+}
+
+/**
+ * 版面每一块的文字（含自动编号）是否等于模型 —— 替换之后用它证明「界面改了、模型也改了」。
+ * 同一块被分页切开时会渲染成多片，按 data-block-id 把各片拼起来才是整块文字。
+ */
+async function checkDomMatchesModel(label) {
+  const model = await getModel()
+  const spec = resolveSpec()
+  const numbering = computeNumbering(model.blocks, (block) =>
+    block.t === 'textBlock' ? spec.styles[block.kind].numbering : 'none',
+  )
+  const want = new Map(
+    heroBlocks(model).map((block) => [
+      block.id,
+      (numbering.get(block.id) ?? '') + textOfBlock(block),
+    ]),
+  )
+  const got = await page.evaluate(() => {
+    const map = {}
+    for (const frag of document.querySelectorAll('.wtp-pages [data-block-id]')) {
+      const id = frag.dataset.blockId ?? ''
+      map[id] = (map[id] ?? '') + (frag.textContent ?? '')
+    }
+    return map
+  })
+  let bad = null
+  for (const [id, text] of want) {
+    if (got[id] !== text) {
+      bad = { id, want: text.slice(0, 40), got: (got[id] ?? '(缺失)').slice(0, 40) }
+      break
+    }
+  }
+  ok(label, bad === null, JSON.stringify(bad))
+}
+
+/**
+ * 插入符「应该」落在哪里：模型里第一个含 needle 的块、needle 末尾处（显示坐标，含自动编号前缀）。
+ * 替换会 force 重排并重建 DOM，锚点没给对的话插入符会丢，所以这条要靠断言守住。
+ */
+async function expectedCaretAtEndOf(needle) {
+  const model = await getModel()
+  const spec = resolveSpec()
+  const numbering = computeNumbering(model.blocks, (block) =>
+    block.t === 'textBlock' ? spec.styles[block.kind].numbering : 'none',
+  )
+  const host = heroBlocks(model).find((block) => textOfBlock(block).includes(needle))
+  if (!host) return null
+  return {
+    blockId: host.id,
+    offset: (numbering.get(host.id) ?? '').length + textOfBlock(host).indexOf(needle) + needle.length,
+  }
+}
+
+function sameCaret(a, b) {
+  return a !== null && b !== null && a.blockId === b.blockId && a.offset === b.offset
+}
 
 /** 编辑后每页都不得溢出 —— 重排算术与真实布局必须仍然对得上 */
 async function checkNoOverflow(label) {
@@ -970,6 +1090,10 @@ try {
   /* ------------------------------------------------------------------ */
   console.log('\n=== O. 打印：只出 A4 纸，且不多不少 ===')
   await openApp()
+  // 打开查找面板：打印时它和导航窗格都必须一起消失
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+f')
+  await page.waitForSelector('.search-panel', { timeout: 3000 })
 
   /** 打印媒体下这些选择器的 display（元素不存在时给 'missing'，别把「没有」当成「隐藏了」） */
   const printDisplay = () =>
@@ -984,6 +1108,8 @@ try {
         '.wtp-comments',
         '.wtp-measure-root',
         '.wtp-break',
+        '.nav-pane',
+        '.search-panel',
       ]
       const out = {}
       for (const sel of sels) {
@@ -1023,7 +1149,16 @@ try {
 
   await page.emulateMedia({ media: 'print' })
   const printEdit = await printDisplay()
-  for (const sel of ['.bar', '.styles', '.toolbar', '.wtp-comments', '.wtp-measure-root', '.wtp-break']) {
+  for (const sel of [
+    '.bar',
+    '.styles',
+    '.toolbar',
+    '.wtp-comments',
+    '.wtp-measure-root',
+    '.wtp-break',
+    '.nav-pane',
+    '.search-panel',
+  ]) {
     eq(`打印时隐藏 ${sel}`, printEdit[sel], 'none')
   }
   eq('第一张纸前面不再断页', printEdit.firstBreak, 'auto')
@@ -1070,6 +1205,277 @@ try {
     eq(`源码视图下打印也隐藏 ${sel}`, printSource[sel], 'none')
   }
   await page.emulateMedia({ media: 'screen' })
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== P. Ctrl+F 查找：面板、高亮、不重排、上一处/下一处 ===')
+  await openApp()
+  await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('我方于2026年9月1日')
+    frag.__wtpKeep = true
+    window.__wtpTest.caretAtEndOf('我方于2026年9月1日')
+  })
+  await page.keyboard.press('Control+f')
+  await page.waitForSelector('.search-panel', { timeout: 3000 })
+  await page.waitForTimeout(200)
+  eq(
+    'ctrl+F 打开面板后焦点在查找框',
+    await page.evaluate(
+      () =>
+        document.activeElement === document.querySelectorAll('.search-panel input[type="text"]')[0],
+    ),
+    true,
+  )
+
+  const findBox = page.locator('.search-panel input[type="text"]').first()
+  const replaceBox = page.locator('.search-panel input[type="text"]').nth(1)
+  const countText = async () => (await page.locator('.search-count').textContent()).trim()
+  const panelButton = (name) =>
+    page.locator('.search-panel').getByRole('button', { name, exact: true })
+
+  const hitsP = countInModel(await getModel(), '债务人')
+  ok('样本里「债务人」出现多处，够验上下移动', hitsP >= 2, String(hitsP))
+  await findBox.fill('债务人')
+  await page.waitForTimeout(250)
+  eq('计数器与模型算出来的命中数一致', await countText(), `第 1 / 共 ${hitsP} 处`)
+
+  const paintedP = await page.evaluate(() => window.__wtpTest.highlights())
+  ok('命中有高亮（Custom Highlight API）', paintedP.normal + paintedP.current > 0, JSON.stringify(paintedP))
+  ok('当前那一处单独一层高亮', paintedP.current >= 1, JSON.stringify(paintedP))
+
+  const keptP = await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('我方于2026年9月1日')
+    return {
+      same: frag ? frag.__wtpKeep === true : false,
+      connected: frag ? frag.isConnected : false,
+    }
+  })
+  ok('查找没有重建版面 DOM（片段还是同一个节点）', keptP.same && keptP.connected)
+
+  await panelButton('下一个').click()
+  await page.waitForTimeout(250)
+  eq('「下一个」走到第 2 处', await countText(), `第 2 / 共 ${hitsP} 处`)
+  await panelButton('上一个').click()
+  await page.waitForTimeout(250)
+  eq('「上一个」回到第 1 处', await countText(), `第 1 / 共 ${hitsP} 处`)
+
+  // 面板可拖动，且拖不出预览窗格
+  const beforeDrag = await page.evaluate(() => {
+    const rect = document.querySelector('.search-panel').getBoundingClientRect()
+    return { left: Math.round(rect.left), top: Math.round(rect.top) }
+  })
+  const headBox = await page.locator('.search-head').boundingBox()
+  await page.mouse.move(headBox.x + 40, headBox.y + 10)
+  await page.mouse.down()
+  await page.mouse.move(headBox.x + 40 - 140, headBox.y + 10 + 70, { steps: 5 })
+  await page.mouse.up()
+  await page.waitForTimeout(200)
+  const dragResult = await page.evaluate(() => {
+    const panel = document.querySelector('.search-panel').getBoundingClientRect()
+    const pane = document.querySelector('.preview-pane').getBoundingClientRect()
+    return {
+      left: Math.round(panel.left),
+      top: Math.round(panel.top),
+      inside:
+        panel.left >= pane.left - 1 &&
+        panel.top >= pane.top - 1 &&
+        panel.right <= pane.right + 1 &&
+        panel.bottom <= pane.bottom + 1,
+    }
+  })
+  ok(
+    '拖标题栏能把面板挪走',
+    dragResult.left !== beforeDrag.left || dragResult.top !== beforeDrag.top,
+    `${JSON.stringify(beforeDrag)} → ${JSON.stringify(dragResult)}`,
+  )
+  ok('面板被夹在预览窗格范围内', dragResult.inside, JSON.stringify(dragResult))
+
+  await findBox.press('Escape')
+  await page.waitForTimeout(250)
+  eq('Esc 关掉面板', await page.locator('.search-panel').count(), 0)
+  const hlClosed = await page.evaluate(() => window.__wtpTest.highlights())
+  eq('关闭后高亮清掉', hlClosed.normal + hlClosed.current, 0)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== P2. 非法正则只提示；范围「当前选中的文本」只命中选区内 ===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+f')
+  await page.waitForSelector('.search-panel', { timeout: 3000 })
+  const modelBad = JSON.stringify(await getModel())
+  await page.locator('.search-panel input[name="search-regex"]').check()
+  await findBox.fill('[')
+  await page.waitForTimeout(250)
+  const errCount = await page.locator('.search-panel .search-error').count()
+  const errText =
+    errCount > 0
+      ? ((await page.locator('.search-panel .search-error').textContent()) ?? '').trim()
+      : ''
+  ok('非法正则弹出提示条', errText !== '', errText || '没有提示')
+  const hlBad = await page.evaluate(() => window.__wtpTest.highlights())
+  eq('非法正则不高亮', hlBad.normal + hlBad.current, 0)
+  eq('非法正则不改模型', JSON.stringify(await getModel()), modelBad)
+
+  // 复原，再做范围那一条
+  await page.locator('.search-panel input[name="search-regex"]').uncheck()
+  await findBox.fill('')
+  await page.waitForTimeout(150)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+
+  const picked = await page.evaluate(() =>
+    window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6),
+  )
+  eq('先选中一段文字', picked, '债务人爱康光')
+  await page.keyboard.press('Control+f')
+  await page.waitForSelector('.search-panel', { timeout: 3000 })
+  const hitsAll = countInModel(await getModel(), '债务人')
+  ok('全文里「债务人」不止一处（对照用）', hitsAll > 1, String(hitsAll))
+  await page.locator('.search-panel input[name="search-scope"][value="selection"]').check()
+  await findBox.fill('债务人')
+  await page.waitForTimeout(250)
+  eq('范围限定后只命中选区内那一处', await countText(), '第 1 / 共 1 处')
+  await page.locator('.search-panel input[name="search-scope"][value="all"]').check()
+  await page.waitForTimeout(250)
+  eq('切回「全文」命中数恢复', await countText(), `第 1 / 共 ${hitsAll} 处`)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== P3. Ctrl+G：替换一处与全部替换（模型与 DOM 都要看）===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+g')
+  await page.waitForSelector('.search-panel', { timeout: 3000 })
+  await page.waitForTimeout(200)
+  eq(
+    'ctrl+G 打开时焦点在替换框',
+    await page.evaluate(
+      () =>
+        document.activeElement === document.querySelectorAll('.search-panel input[type="text"]')[1],
+    ),
+    true,
+  )
+
+  const beforeOne = heroBlocks(await getModel()).map(textOfBlock)
+  await findBox.fill('《调取证据通知书》')
+  await page.waitForTimeout(250)
+  eq('替换前命中一处', await countText(), '第 1 / 共 1 处')
+  await replaceBox.fill('《调取证据通知书（补）》')
+  await panelButton('替换').click()
+  await page.waitForTimeout(400)
+  const expectedOne = beforeOne.map((t) =>
+    t.replace('《调取证据通知书》', '《调取证据通知书（补）》'),
+  )
+  eq(
+    '替换一处后模型文字与预期一致',
+    JSON.stringify(heroBlocks(await getModel()).map(textOfBlock)),
+    JSON.stringify(expectedOne),
+  )
+  await checkDomMatchesModel('替换一处后版面上每一块的文字都等于模型（含自动编号）')
+  eq('替换后不再命中', await countText(), '共 0 处')
+
+  // 插入符必须停在「新文字的末尾」：force 重排会重建 DOM，锚点给错插入符就丢，
+  // 接着敲字会插到段首甚至文档开头（验收时正是这么抓到的）。
+  const wantOneCaret = await expectedCaretAtEndOf('《调取证据通知书（补）》')
+  const gotOneCaret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  ok(
+    '替换后插入符落在新文字末尾',
+    sameCaret(gotOneCaret, wantOneCaret),
+    `实际 ${JSON.stringify(gotOneCaret)}，期望 ${JSON.stringify(wantOneCaret)}`,
+  )
+  await page.keyboard.type('X')
+  await page.waitForTimeout(400)
+  ok(
+    '替换后接着敲字落在替换处之后（不是段首）',
+    heroBlocks(await getModel())
+      .map(textOfBlock)
+      .some((t) => t.includes('《调取证据通知书（补）》X')),
+    JSON.stringify((await heroBlocks(await getModel()).map(textOfBlock)).slice(0, 2)),
+  )
+
+  // 全部替换
+  const beforeAll = countInModel(await getModel(), '债务人')
+  ok('「债务人」有不止一处可换', beforeAll >= 2, String(beforeAll))
+  eq('替换词原本不存在', countInModel(await getModel(), '义务人'), 0)
+  await findBox.fill('债务人')
+  await page.waitForTimeout(250)
+  eq('全部替换前计数正确', await countText(), `第 1 / 共 ${beforeAll} 处`)
+  await replaceBox.fill('义务人')
+  await panelButton('全部替换').click()
+  await page.waitForTimeout(500)
+  const afterAll = await getModel()
+  eq('全部替换后旧词一个不剩（删除修订里的不算）', countInModel(afterAll, '债务人'), 0)
+  eq('新词数量等于旧词原数量', countInModel(afterAll, '义务人'), beforeAll)
+  await checkDomMatchesModel('全部替换后版面上每一块的文字都等于模型（含自动修订与编号）')
+
+  // 全部替换同样要还原插入符：停在第一处新文字的末尾（与 searchIndex 归零一致）
+  const wantAllCaret = await expectedCaretAtEndOf('义务人')
+  const gotAllCaret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  ok(
+    '全部替换后插入符落在第一处新文字末尾',
+    sameCaret(gotAllCaret, wantAllCaret),
+    `实际 ${JSON.stringify(gotAllCaret)}，期望 ${JSON.stringify(wantAllCaret)}`,
+  )
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== Q. 导航窗格：条目与模型一致、点击跳转、折叠 ===')
+  await openApp()
+  await page.waitForSelector('.nav-pane', { timeout: 10000 })
+  const want = expectedOutline(await getModel())
+  ok('模型里确实有标题', want.length > 0, String(want.length))
+
+  const navItems = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.nav-pane .nav-list li')).map((li) => {
+      const button = li.querySelector('button')
+      const prefix = button?.querySelector('.nav-prefix')?.textContent ?? ''
+      return {
+        prefix,
+        text: (button?.textContent ?? '').slice(prefix.length).trim(),
+        level: Array.from(li.classList).find((c) => c.startsWith('nav-lv')) ?? '',
+      }
+    }),
+  )
+  eq('条目数 = 模型里的 h1/h2/h3 数', navItems.length, want.length)
+  eq(
+    '每条的前缀/文字/层级都与模型一致',
+    JSON.stringify(navItems),
+    JSON.stringify(
+      want.map((e) => ({ prefix: e.prefix, text: e.text, level: `nav-lv${e.level}` })),
+    ),
+  )
+  const navWidth = await page.evaluate(() =>
+    Math.round(document.querySelector('.nav-pane').getBoundingClientRect().width),
+  )
+  ok('导航窗格宽约 200px', Math.abs(navWidth - 200) <= 1, `${navWidth}px`)
+
+  // 点击跳转：插入符落在该块自动编号之后
+  const targetIndex = 1
+  await page.locator('.nav-pane .nav-list li button').nth(targetIndex).click()
+  await page.waitForTimeout(300)
+  const caretQ = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符落在被点的标题块里', caretQ?.blockId, want[targetIndex].blockId)
+  eq('插入符落在自动编号之后', caretQ?.offset, want[targetIndex].prefix.length)
+
+  // 在正文段落里打字不该重建左栏（大纲指纹没变）
+  await page.evaluate(() => {
+    const item = document.querySelector('.nav-pane .nav-list li button')
+    item.__wtpKeep = true
+    window.__wtpTest.caretAtEndOf('我方于2026年9月1日')
+  })
+  await page.keyboard.insertText('（导航探针）')
+  await page.waitForTimeout(300)
+  ok(
+    '正文打字不重建导航窗格',
+    await page.evaluate(() => {
+      const item = document.querySelector('.nav-pane .nav-list li button')
+      return item ? item.__wtpKeep === true : false
+    }),
+  )
+
+  await page.locator('.nav-pane .nav-collapse').click()
+  await page.waitForTimeout(250)
+  eq('窗格里的折叠按钮把它收起来', await page.locator('.nav-pane').count(), 0)
+  await page.locator('.bar button', { hasText: '导航' }).click()
+  await page.waitForTimeout(250)
+  eq('顶栏的导航开关把它放回来', await page.locator('.nav-pane').count(), 1)
 } finally {
   await browser?.close()
   await server.close()
@@ -1081,4 +1487,8 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`)
   process.exit(1)
 }
-console.log('[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、金额格式、特殊空格、切文件模板、打印均落到模型。')
+console.log(
+  '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
+    '金额格式、特殊空格、切文件模板、打印、查找替换（面板/高亮/范围/替换一处与全部）、' +
+    '导航窗格（条目与模型一致、点击跳转、折叠）均落到模型。',
+)
