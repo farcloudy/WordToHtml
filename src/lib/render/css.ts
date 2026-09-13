@@ -49,6 +49,10 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     `.${ns}-page-number { position: absolute; left: 0; right: 0; bottom: ${spec.page.footer}; color: #000; }`,
     // 测量容器：必须参与布局（不能用 display:none），否则量不到行盒
     `.${ns}-probe { position: absolute; left: -100000px; top: 0; visibility: hidden; pointer-events: none; }`,
+    // 编辑态：版面本身就是编辑区，去掉浏览器默认的聚焦描边
+    `.${ns}-content[contenteditable='true'] { outline: none; caret-color: #1f6feb; }`,
+    // 自动编号是生成物，不该被选中或改到
+    `.${ns}-num { -webkit-user-select: none; user-select: none; }`,
   )
 
   for (const kind of STYLE_KEYS) {

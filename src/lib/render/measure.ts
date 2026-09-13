@@ -63,11 +63,7 @@ function topOfChar(range: Range, positions: readonly TextPos[], offset: number):
  * 用二分查找定位每一行的起始字符。
  * 逐字符线性扫描太慢（长段落几千个字符会卡住），二分是 O(行数 × log 字数)。
  */
-function findRowStarts(
-  el: HTMLElement,
-  rowTops: readonly number[],
-  total: number,
-): number[] {
+function findRowStarts(el: HTMLElement, rowTops: readonly number[], total: number): number[] {
   const positions = collectTextPositions(el)
   if (positions.length === 0 || total === 0) return [0]
 
@@ -110,7 +106,13 @@ function groupLineTops(rects: readonly DOMRect[]): number[] {
   return tops
 }
 
-function measureElement(el: HTMLElement, spec: Spec, kind: MeasuredBlock['kind'], blockId: string, displayLength: number): MeasuredBlock {
+function measureElement(
+  el: HTMLElement,
+  spec: Spec,
+  kind: MeasuredBlock['kind'],
+  blockId: string,
+  displayLength: number,
+): MeasuredBlock {
   const s = spec.styles[kind]
   const height = el.getBoundingClientRect().height
 
@@ -122,9 +124,7 @@ function measureElement(el: HTMLElement, spec: Spec, kind: MeasuredBlock['kind']
 
   // 多行时用首末行顶端的平均间距，比取相邻两行更稳（atLeast 行距下各行可能微异）
   const lineHeight =
-    rows > 1
-      ? ((lineTops[rows - 1] ?? 0) - (lineTops[0] ?? 0)) / (rows - 1)
-      : height
+    rows > 1 ? ((lineTops[rows - 1] ?? 0) - (lineTops[0] ?? 0)) / (rows - 1) : height
 
   const rowStarts = rows > 1 ? findRowStarts(el, lineTops, displayLength) : [0]
 
@@ -142,12 +142,38 @@ function measureElement(el: HTMLElement, spec: Spec, kind: MeasuredBlock['kind']
 }
 
 /**
- * 测量整篇文档。
+ * 量测缓存：块 id → 上次的签名与结果。
+ *
+ * 编辑时每次敲键都要重排判断「分页有没有变」，但整篇重新量测太贵
+ * （长段落要跑二分找行首，每次 getClientRects 都会触发布局）。
+ * 块的排版只取决于「排版宽度（全局固定）+ 本块内容 + 本块样式」，
+ * 所以内容没变的块可以直接复用上次的结果，只量改过的那一块。
+ * 签名里带上渲出来的 HTML，等于把「文字、加粗、颜色、修订、编号」一起算了进去。
+ */
+export interface MeasureCacheEntry {
+  signature: string
+  measured: MeasuredBlock
+}
+
+export type MeasureCache = Map<string, MeasureCacheEntry>
+
+/** 清空缓存（规格表换了一套样式时必须调用，否则会拿旧样式的量测值） */
+export function clearMeasureCache(cache: MeasureCache): void {
+  cache.clear()
+}
+
+/**
+ * 测量整篇文档（带增量缓存）。
  *
  * root 只需是一个已挂载在文档里的元素（用来挂载测量容器）；
  * 测量容器的宽度由版心尺寸决定，与预览页的版心一致。
  */
-export function measureDocument(doc: DocModel, spec: Spec, root: HTMLElement): MeasuredItem[] {
+export function measureDocument(
+  doc: DocModel,
+  spec: Spec,
+  root: HTMLElement,
+  cache?: MeasureCache,
+): MeasuredItem[] {
   const numbering = computeNumbering(doc.blocks, (b) =>
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
@@ -156,39 +182,67 @@ export function measureDocument(doc: DocModel, spec: Spec, root: HTMLElement): M
   probe.className = 'wtp-probe'
   probe.style.width = `${contentBoxPx(spec).width}px`
 
-  const pending: { el: HTMLElement; kind: MeasuredBlock['kind']; id: string; length: number }[] = []
+  const pending: {
+    el: HTMLElement
+    kind: MeasuredBlock['kind']
+    id: string
+    length: number
+    signature: string
+  }[] = []
+
+  const resolved = new Map<string, MeasuredBlock>()
+  const alive = new Set<string>()
 
   for (const block of doc.blocks) {
     if (block.t === 'sectionBreak') continue
+    alive.add(block.id)
     const prefix = numbering.get(block.id) ?? ''
-    const el = document.createElement('div')
-    el.className = `wtp-${block.kind}`
-    el.innerHTML = renderInlinesHtml(block.inlines, prefix)
-    probe.appendChild(el)
+    const html = renderInlinesHtml(block.inlines, prefix)
+    const signature = `${block.kind}\u0000${html}`
 
     let length = prefix.length
     for (const inline of block.inlines) {
       if (inline.t === 'text') length += inline.text.length
     }
-    pending.push({ el, kind: block.kind, id: block.id, length })
+
+    const cached = cache?.get(block.id)
+    if (cached && cached.signature === signature) {
+      resolved.set(block.id, cached.measured)
+      continue
+    }
+
+    const el = document.createElement('div')
+    el.className = `wtp-${block.kind}`
+    el.innerHTML = html
+    probe.appendChild(el)
+    pending.push({ el, kind: block.kind, id: block.id, length, signature })
   }
 
-  root.appendChild(probe)
-  // 强制一次布局，后面读 rect 就不会反复触发回流
-  void probe.getBoundingClientRect()
-
-  const measured = new Map<string, MeasuredBlock>()
-  for (const item of pending) {
-    measured.set(item.id, measureElement(item.el, spec, item.kind, item.id, item.length))
+  if (cache) {
+    for (const id of cache.keys()) {
+      if (!alive.has(id)) cache.delete(id)
+    }
   }
 
-  root.removeChild(probe)
+  if (pending.length > 0) {
+    root.appendChild(probe)
+    // 强制一次布局，后面读 rect 就不会反复触发回流
+    void probe.getBoundingClientRect()
+
+    for (const item of pending) {
+      const measured = measureElement(item.el, spec, item.kind, item.id, item.length)
+      resolved.set(item.id, measured)
+      cache?.set(item.id, { signature: item.signature, measured })
+    }
+
+    root.removeChild(probe)
+  }
 
   return doc.blocks.flatMap<MeasuredItem>((block) => {
     if (block.t === 'sectionBreak') {
       return [{ t: 'break', restartNumbering: block.restartNumbering }]
     }
-    const m = measured.get(block.id)
+    const m = resolved.get(block.id)
     return m ? [m] : []
   })
 }

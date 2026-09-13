@@ -11,8 +11,9 @@
     "build:lib": "vite build --config vite.lib.config.ts",
     "verify:p1": "npm run build:lib && node scripts/verify-p1.mjs",
     "verify:p2": "npm run build:lib && node scripts/test-paginate.mjs && node scripts/verify-browser.mjs",
+    "verify:p3": "npm run build:lib && node scripts/test-edit-model.mjs && node scripts/verify-editor.mjs",
     "verify:pages": "node scripts/verify-page-count.mjs",
-    "verify": "npm run type-check && npm run verify:p1 && npm run verify:p2 && npm run verify:pages",
+    "verify": "npm run type-check && npm run verify:p1 && npm run verify:p2 && npm run verify:p3 && npm run verify:pages",
     "verify:docx": "node scripts/verify-docx.mjs",
     "type-check": "vue-tsc --build",
     "format": "prettier --write --experimental-cli src/"

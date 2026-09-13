@@ -61,6 +61,44 @@ export type {
 
 export { chineseNum, computeNumbering, numberingPrefix, stripAutoNumber } from './numbering'
 
+export {
+  addComment,
+  applyFormat,
+  blockLength,
+  cloneDoc,
+  deleteRange,
+  findBlock,
+  findBlockIndex,
+  insertText,
+  mergeIntoPrevious,
+  rangeColor,
+  rangeIsBold,
+  removeBlock,
+  removeComment,
+  replyComment,
+  replaceRange,
+  setBlockKind,
+  sliceStrict,
+  splitBlock,
+} from './edit/model'
+export type { BlockPoint, EditorSelection } from './edit/model'
+
+export {
+  cssColorToHex,
+  currentRange,
+  displayPointOf,
+  fragmentAt,
+  fragmentOf,
+  offsetToPoint,
+  placeCaret,
+  placeRange,
+  pointToOffset,
+  prefixLengthOf,
+  readInlines,
+  selectedRanges,
+} from './edit/dom'
+export type { DisplayPoint, DisplayRange } from './edit/dom'
+
 export { parseMd } from './md/parse'
 export type { ParseOptions } from './md/parse'
 export { normalizeBlocks, toMd } from './md/serialize'
@@ -70,7 +108,8 @@ export type { ExportMeta } from './docx/export'
 
 export { WTP, buildCss, injectCss } from './render/css'
 export { escapeHtml, renderInlinesHtml } from './render/html'
-export { measureDocument } from './render/measure'
+export { clearMeasureCache, measureDocument } from './render/measure'
+export type { MeasureCache, MeasureCacheEntry } from './render/measure'
 export { paginate } from './render/paginate'
 export type {
   MeasuredBlock,

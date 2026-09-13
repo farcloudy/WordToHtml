@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { createServer } from 'vite'
 
-import { STYLE_KEYS, commentScopes, parseMd, ptToPx, resolveSpec } from '../dist-lib/wordtohtml.mjs'
+import { STYLE_KEYS, commentScopes, parseMd, ptToPx, resolveSpec, toMd } from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -144,6 +144,9 @@ try {
     })
 
     const textarea = document.querySelector('textarea')
+    // 编辑层成了主界面以后，源码不再从 textarea 反推 —— 直接从组件拿模型，
+    // 它才是「导出 docx 的依据」。textarea 只在源码模式下存在，取到就顺带带上。
+    const model = window.__wtpPaper?.getModel?.() ?? null
     // 批注：侧栏条目 + 正文锚点。侧栏内容必须与正文锚点对得上，
     // 否则「看得到底色、看不到内容」那个缺陷会以另一种形式回来。
     const commentAside = document.querySelector('.wtp-comments')
@@ -168,6 +171,7 @@ try {
       continuations,
       commentSidebar,
       commentAnchors,
+      model,
       source: textarea ? textarea.value : '',
     }
   }, STYLE_KEYS)
@@ -226,9 +230,9 @@ try {
   }
 
   console.log('\n=== 3. 批注侧栏（侧栏、正文锚点、模型三者必须一致）===')
-  // 期望值不从 DOM 反推，而是把界面里的源码重新解析一遍 —— 从 DOM 反推只能证明
+  // 期望值不从 DOM 反推，而是拿组件的模型 —— 从 DOM 反推只能证明
   // 「DOM 与 DOM 自洽」，证明不了它跟模型一致，而模型才是导出 docx 的依据。
-  const commentModel = parseMd(report.source)
+  const commentModel = report.model ?? parseMd(report.source)
   const expectedScopes = commentScopes(commentModel)
   const hasComments = commentModel.comments.length > 0
   eq('侧栏按有无批注出现', report.commentSidebar.present, hasComments)
@@ -347,7 +351,11 @@ try {
   const tmpDir = join(root, '.qwen', 'tmp')
   mkdirSync(tmpDir, { recursive: true })
   const sourcePath = join(tmpDir, 'demo-source.md')
-  writeFileSync(sourcePath, report.source, 'utf8')
+  const sourceMd = report.model ? toMd(report.model) : report.source
+  if (!report.model && !report.source) {
+    failures.push('拿不到文档模型也拿不到源码，无法产出 demo-source.md')
+  }
+  writeFileSync(sourcePath, sourceMd, 'utf8')
   console.log(`  ok   界面源码已导出：${sourcePath}`)
 
   // 供 verify-page-count.mjs 与 Word 的页数对账

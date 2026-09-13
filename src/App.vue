@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
-import { MARGIN_PRESETS } from './lib/spec'
-import type { DeepPartial, Spec } from './lib/spec'
+import { toMd } from './lib/md/serialize'
+import { BLOCK_KINDS, MARGIN_PRESETS } from './lib/spec'
+import type { BlockKind, DeepPartial, Spec } from './lib/spec'
+import type { EditorSelection } from './lib/edit/model'
 
 const SAMPLE = [
   '# 关于爱康光电资产核查情况的说明',
@@ -47,18 +49,73 @@ const SAMPLE = [
   '>> 2026年9月12日',
 ].join('\n')
 
+const KIND_LABEL: Record<BlockKind, string> = {
+  title: '标题',
+  h1: '一级标题（一、）',
+  h2: '二级标题（（一））',
+  h3: '三级标题（1、）',
+  body: '正文',
+  salutation: '抬头',
+  signature: '落款',
+  listTitle: '列表标题',
+  listItem: '列表段落',
+}
+
+const COLORS: { label: string; value: string }[] = [
+  { label: '红', value: 'FF0000' },
+  { label: '黑', value: '000000' },
+  { label: '蓝', value: '0000FF' },
+  { label: '绿', value: '008000' },
+  { label: '紫', value: '800080' },
+  { label: '橙', value: 'FF8C00' },
+  { label: '灰', value: '808080' },
+]
+
+/** edit = 直接在 A4 版面上写（面向用户）；source = 类 md 源码（给开发/排错用） */
+const mode = ref<'edit' | 'source'>('edit')
 const source = ref(SAMPLE)
 const author = ref('张三')
 const marginPreset = ref(MARGIN_PRESETS[0].key)
+const trackChanges = ref(false)
 const pageCount = ref(0)
 const exporting = ref(false)
 const paper = ref<InstanceType<typeof WordPaper> | null>(null)
+const selection = ref<EditorSelection | null>(null)
+const commentDraft = ref('')
+const mdView = ref('')
 
-/** 页边距整组按预设切换（四边各自取值），演示规格表可覆盖：默认值不是写死的 */
 const specOverride = computed<DeepPartial<Spec>>(() => {
   const preset = MARGIN_PRESETS.find((p) => p.key === marginPreset.value) ?? MARGIN_PRESETS[0]
   return { page: { margin: { ...preset.margin } } }
 })
+
+const kind = computed<BlockKind>(() => selection.value?.kind ?? 'body')
+
+function onSelectionChange(value: EditorSelection | null): void {
+  selection.value = value
+}
+
+function onKindChange(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value as BlockKind
+  paper.value?.setBlockKind(value)
+}
+
+function insertComment(): void {
+  const text = commentDraft.value.trim()
+  if (text === '') return
+  const id = paper.value?.addCommentOnSelection(text) ?? -1
+  if (id >= 0) commentDraft.value = ''
+}
+
+/** 切到源码视图前，把当前模型序列化成 md —— 所见即所得改完总要看得到「它长什么样」 */
+function switchMode(next: 'edit' | 'source'): void {
+  if (next === mode.value) return
+  if (next === 'source') {
+    source.value = paper.value ? toMd(paper.value.getModel()) : source.value
+    mdView.value = source.value
+  }
+  mode.value = next
+}
 
 async function onExport(): Promise<void> {
   exporting.value = true
@@ -68,6 +125,18 @@ async function onExport(): Promise<void> {
     exporting.value = false
   }
 }
+
+/** 源码视图跟着模型走（只读镜像），编辑结果随时能看到它的 md 形态 */
+function refreshMdView(): void {
+  mdView.value = paper.value ? toMd(paper.value.getModel()) : ''
+}
+
+watch(
+  () => [pageCount.value, mode.value],
+  () => {
+    if (mode.value === 'source') void nextTick(refreshMdView)
+  },
+)
 
 // 开发期把组件实例挂到 window，供浏览器端验收脚本读取量测值对账
 onMounted(() => {
@@ -80,7 +149,15 @@ onMounted(() => {
 <template>
   <div class="app">
     <header class="bar">
-      <strong>WordToHtml · 公文 A4 预览</strong>
+      <strong>WordToHtml · 公文 A4 编辑器</strong>
+      <div class="tabs">
+        <button type="button" :class="{ 'is-on': mode === 'edit' }" @click="switchMode('edit')">
+          所见即所得
+        </button>
+        <button type="button" :class="{ 'is-on': mode === 'source' }" @click="switchMode('source')">
+          类 md 源码
+        </button>
+      </div>
       <label class="field">
         页边距
         <select v-model="marginPreset">
@@ -93,24 +170,123 @@ onMounted(() => {
         修订作者
         <input v-model="author" type="text" size="6" />
       </label>
+      <label class="field checkbox">
+        <input v-model="trackChanges" type="checkbox" />
+        修订模式
+      </label>
       <span class="spacer" />
       <span class="count">{{ pageCount }} 页</span>
-      <button type="button" :disabled="exporting" @click="onExport">
+      <button type="button" class="primary" :disabled="exporting" @click="onExport">
         {{ exporting ? '导出中…' : '导出 docx' }}
       </button>
     </header>
 
-    <main class="panes">
-      <section class="pane">
+    <div v-if="mode === 'edit'" class="toolbar">
+      <label class="field">
+        段落样式
+        <select :value="kind" @change="onKindChange">
+          <option v-for="k in BLOCK_KINDS" :key="k" :value="k">
+            {{ KIND_LABEL[k] }}
+          </option>
+        </select>
+      </label>
+
+      <span class="sep" />
+
+      <button
+        type="button"
+        class="tool"
+        :class="{ 'is-on': selection?.bold }"
+        title="加粗（Ctrl+B）"
+        @mousedown.prevent
+        @click="paper?.toggleBold()"
+      >
+        <b>B</b>
+      </button>
+
+      <span class="field">
+        颜色
+        <span class="swatches">
+          <button
+            v-for="c in COLORS"
+            :key="c.value"
+            type="button"
+            class="swatch"
+            :style="{ background: `#${c.value}` }"
+            :title="c.label"
+            @mousedown.prevent
+            @click="paper?.setColor(c.value)"
+          />
+          <button
+            type="button"
+            class="swatch clear"
+            title="默认颜色"
+            @mousedown.prevent
+            @click="paper?.setColor(null)"
+          >
+            ×
+          </button>
+        </span>
+      </span>
+
+      <span class="sep" />
+
+      <button
+        type="button"
+        class="tool"
+        title="撤销（Ctrl+Z）"
+        @mousedown.prevent
+        @click="paper?.undo()"
+      >
+        ↺
+      </button>
+      <button
+        type="button"
+        class="tool"
+        title="重做（Ctrl+Y）"
+        @mousedown.prevent
+        @click="paper?.redo()"
+      >
+        ↻
+      </button>
+
+      <span class="sep" />
+
+      <span class="field comment-field">
+        批注
+        <input
+          v-model="commentDraft"
+          type="text"
+          placeholder="选中文字后填写"
+          @keydown.enter.prevent="insertComment"
+        />
+        <button type="button" @mousedown.prevent @click="insertComment">添加</button>
+      </span>
+    </div>
+
+    <main class="panes" :class="{ single: mode === 'edit' }">
+      <section v-if="mode === 'source'" class="pane">
         <div class="pane-head">类 md 源码</div>
         <textarea v-model="source" spellcheck="false" />
         <details class="legend">
           <summary>语法说明</summary>
           <ul>
-            <li><code>#</code> 文本标题；<code>##</code>／<code>###</code>／<code>####</code> 对应 一、／（一）／1、三级标题（编号自动生成）</li>
-            <li><code>@</code> 抬头（取消首行缩进）；<code>&gt;&gt;</code> 落款（右对齐）</li>
-            <li><code>-</code> 列表段落；<code>!</code> 列表标题；<code>---</code> 单独一行表示分节（新起一页、页码从 1 重排）</li>
-            <li><code>**文字**</code> 加粗；<code>{红|文字}</code> 改色（中文色名或 <code>#RRGGBB</code>）</li>
+            <li>
+              <code>#</code> 文本标题；<code>##</code>／<code>###</code>／<code>####</code>
+              对应 一、／（一）／1、三级标题（编号自动生成）
+            </li>
+            <li>
+              <code>@</code> 抬头（取消首行缩进）；<code>&gt;&gt;</code>
+              落款（右对齐）
+            </li>
+            <li>
+              <code>-</code> 列表段落；<code>!</code> 列表标题；<code>---</code>
+              单独一行表示分节（新起一页、页码从 1 重排）
+            </li>
+            <li>
+              <code>**文字**</code> 加粗；<code>{红|文字}</code> 改色（中文色名或
+              <code>#RRGGBB</code>）
+            </li>
             <li><code>{+新增}</code> 插入修订；<code>{-删除}</code> 删除修订</li>
             <li><code>[[文字|批注内容]]</code> 批注</li>
             <li>一个非空行就是一段；空行只作分隔，不产出内容</li>
@@ -119,16 +295,23 @@ onMounted(() => {
       </section>
 
       <section class="pane">
-        <div class="pane-head">A4 预览（与导出 docx 同源，改左边即时重排）</div>
+        <div v-if="mode === 'source'" class="pane-head">A4 预览（只读）</div>
         <div class="canvas">
           <WordPaper
             ref="paper"
             :source="source"
             :spec="specOverride"
             :author="author"
+            :editable="mode === 'edit'"
+            :track-changes="trackChanges"
             @paginated="pageCount = $event"
+            @selection-change="onSelectionChange"
           />
         </div>
+        <details v-if="mode === 'source'" class="legend md-mirror">
+          <summary>当前模型的 md 形态（只读镜像）</summary>
+          <pre>{{ mdView }}</pre>
+        </details>
       </section>
     </main>
   </div>
@@ -156,6 +339,27 @@ onMounted(() => {
   font-size: 14px;
 }
 
+.tabs {
+  display: inline-flex;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.tabs button {
+  padding: 4px 12px;
+  border: 0;
+  background: #fff;
+  color: #4a4f56;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tabs button.is-on {
+  background: #1f6feb;
+  color: #fff;
+}
+
 .field {
   display: inline-flex;
   align-items: center;
@@ -172,11 +376,15 @@ onMounted(() => {
 }
 
 .field input {
-  width: 56px;
+  width: 120px;
 }
 
 .field select {
   max-width: 230px;
+}
+
+.field.checkbox input {
+  width: auto;
 }
 
 .spacer {
@@ -188,7 +396,7 @@ onMounted(() => {
   font-variant-numeric: tabular-nums;
 }
 
-button {
+button.primary {
   padding: 6px 14px;
   border: 1px solid #1f6feb;
   border-radius: 4px;
@@ -198,15 +406,86 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+button.primary:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid #d8dade;
+  background: #fff;
+  font-size: 13px;
+}
+
+.sep {
+  width: 1px;
+  height: 20px;
+  background: #e0e2e6;
+}
+
+.tool {
+  min-width: 30px;
+  padding: 4px 8px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  background: #fff;
+  color: #33383f;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tool.is-on {
+  border-color: #1f6feb;
+  background: #e8f0fe;
+  color: #1f6feb;
+}
+
+.swatches {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #c8ccd2;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.swatch.clear {
+  background: #fff;
+  color: #8a9099;
+  line-height: 1;
+}
+
+.comment-field input {
+  width: 200px;
+}
+
+.comment-field button {
+  padding: 4px 10px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
 }
 
 .panes {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+
+.panes.single .pane {
+  justify-content: flex-start;
 }
 
 .pane {
@@ -263,6 +542,17 @@ textarea {
   border-radius: 3px;
   background: #eef0f3;
   font-family: Consolas, 'Courier New', monospace;
+}
+
+.md-mirror pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 0 14px 12px;
+  overflow: auto;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
 }
 
 .canvas {
