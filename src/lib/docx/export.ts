@@ -19,9 +19,11 @@ import {
   CommentReference,
   DeletedTextRun,
   Document,
+  DocumentGridType,
   Footer,
   InsertedTextRun,
   LineRuleType,
+  PageBreak,
   PageNumber,
   Packer,
   Paragraph,
@@ -33,11 +35,13 @@ import type {
   ISectionOptions,
   ParagraphChild,
 } from 'docx'
+import JSZip from 'jszip'
 
-import { STYLE_KEYS, ptToHalfPoints, ptToTwips } from '../spec'
+import { STYLE_KEYS, lineSpacePt, ptToHalfPoints, ptToTwips } from '../spec'
 import type { Align, LineRule, Spec, TextStyleSpec } from '../spec'
-import type { Block, DocModel, TextBlock } from '../types'
+import type { Block, DocModel, PageBreakBlock, TextBlock } from '../types'
 import { computeNumbering } from '../numbering'
+import { lineUnitPlan, patchStylesXml } from './lineUnits'
 
 export interface ExportMeta {
   title?: string
@@ -82,21 +86,27 @@ function lineRuleOf(r: LineRule): (typeof LineRuleType)[keyof typeof LineRuleTyp
 
 /**
  * 段前/段后按「行」换算成 twips。
- * docx 库没有暴露 Word 的 w:beforeLines（按行计的动态段距），所以这里按
- * 本段行距换算成固定磅值，视觉等价但不是随行距联动的动态值。
+ *
+ * 基准是**文档网格行高**而不是本段行距（见 spec.ts 的 lineSpacePt）。这里的
+ * before/after 是后备值：Word 认 beforeLines/afterLines（由 lineUnits.ts 补写），
+ * 不支持这对属性的渲染器才退回到这里的磅值 —— 两者必须同源，否则「谁在用什么」
+ * 会变成一个看不出来的分叉。
  *
  * 行距一律显式写出（含 auto → 单倍 240 twips）：正文的默认行距被定义成了
  * 固定值，样式若不写就会继承它 —— 页脚那类要单倍行距的样式会被撑高。
  */
-function spacingOf(s: TextStyleSpec): {
+function spacingOf(
+  s: TextStyleSpec,
+  spec: Spec,
+): {
   before: number
   after: number
   line: number
   lineRule: (typeof LineRuleType)[keyof typeof LineRuleType]
 } {
   return {
-    before: ptToTwips(s.spaceBeforeLines * s.linePt),
-    after: ptToTwips(s.spaceAfterLines * s.linePt),
+    before: ptToTwips(lineSpacePt(s.spaceBeforeLines, spec)),
+    after: ptToTwips(lineSpacePt(s.spaceAfterLines, spec)),
     line: s.lineRule === 'auto' ? 240 : ptToTwips(s.linePt),
     lineRule: lineRuleOf(s.lineRule),
   }
@@ -123,7 +133,7 @@ export function paragraphStyles(spec: Spec): IParagraphStyleOptions[] {
       },
       paragraph: {
         alignment: alignmentOf(s.align),
-        spacing: spacingOf(s),
+        spacing: spacingOf(s, spec),
         // 必须显式写，哪怕为 0：正文的默认首行缩进会被基于它的样式继承，
         // 抬头/落款/页脚这类不该有缩进的样式会被静默缩进 2 字符。
         indent: { firstLineChars: s.firstLineChars * 100 },
@@ -144,6 +154,7 @@ function textBlockParagraph(
   block: TextBlock,
   spec: Spec,
   numbering: Map<string, string>,
+  pageBreakBefore = false,
 ): Paragraph {
   const children: ParagraphChild[] = []
 
@@ -191,13 +202,15 @@ function textBlockParagraph(
   const styleId = block.kind === 'body' ? undefined : spec.styles[block.kind].id
   return new Paragraph({
     ...(styleId ? { style: styleId } : {}),
+    ...(pageBreakBefore ? { pageBreakBefore: true } : {}),
     children,
   })
 }
 
 interface SectionGroup {
   restartNumbering: boolean
-  blocks: TextBlock[]
+  /** 本节里的块，含分页符（分节符本身不进组，它只负责切组） */
+  blocks: (TextBlock | PageBreakBlock)[]
 }
 
 /** 按分节符把内容切成若干节。分节符在 Word 里意味着新起一页 + 独立的页码序列。 */
@@ -213,6 +226,35 @@ function groupSections(doc: DocModel): SectionGroup[] {
   return groups
 }
 
+/**
+ * 把一节里的块变成段落。
+ *
+ * 分页符优先写成「段前分页」挂在它后面那一段上（`w:pageBreakBefore`）——
+ * 这样不会像插一个空段落那样在页顶多留一个空行。
+ *
+ * 后面没有段落可挂时（紧跟分节符，或者干脆在节末/文末）必须退回到独立段落里
+ * 写一个 `w:br w:type="page"`：**换页这件事不能丢**。否则「分页符 + 分节符」
+ * 连在一起时，只剩分节符的换页生效，看上去就是「只分了一次页」。
+ */
+function sectionParagraphs(
+  group: SectionGroup,
+  spec: Spec,
+  numbering: Map<string, string>,
+): Paragraph[] {
+  const children: Paragraph[] = []
+  let breakBefore = false
+  for (const block of group.blocks) {
+    if (block.t === 'pageBreak') {
+      breakBefore = true
+      continue
+    }
+    children.push(textBlockParagraph(block, spec, numbering, breakBefore))
+    breakBefore = false
+  }
+  if (breakBefore) children.push(new Paragraph({ children: [new PageBreak()] }))
+  return children
+}
+
 export function buildDocument(
   doc: DocModel,
   spec: Spec,
@@ -222,9 +264,7 @@ export function buildDocument(
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
   const sections: ISectionOptions[] = groupSections(doc).map((group) => {
-    const children: Paragraph[] = group.blocks.map((block) =>
-      textBlockParagraph(block, spec, numbering),
-    )
+    const children: Paragraph[] = sectionParagraphs(group, spec, numbering)
     if (children.length === 0) children.push(new Paragraph({}))
 
     return {
@@ -240,6 +280,14 @@ export function buildDocument(
             footer: spec.page.footer,
           },
           ...(group.restartNumbering ? { pageNumbers: { start: 1 } } : {}),
+        },
+        // 文档网格。Word 的「行」单位段距（w:beforeLines）以它的 linePitch 为基准，
+        // 没有它 Word 会按一套我们控制不了的行高去算，段间距就对不上了。
+        // 网格类型取 lines（对齐行网格）：行距写成固定值的段落不受网格影响，
+        // 量出来的行盒仍与预览一致 —— 它在这里的作用只是给「1 行」定一个磅值。
+        grid: {
+          type: DocumentGridType.LINES,
+          linePitch: ptToTwips(spec.page.gridLinePt),
         },
       },
       footers: { default: new Footer({ children: [pageNumberParagraph(spec)] }) },
@@ -263,7 +311,7 @@ export function buildDocument(
           },
           paragraph: {
             alignment: alignmentOf(spec.styles.body.align),
-            spacing: spacingOf(spec.styles.body),
+            spacing: spacingOf(spec.styles.body, spec),
             indent: { firstLineChars: spec.styles.body.firstLineChars * 100 },
           },
         },
@@ -290,13 +338,41 @@ export function buildDocument(
   })
 }
 
+const DOCX_MIME =
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+/**
+ * 打包成 docx，并补写「行」单位段距。
+ *
+ * 必须再过一遍 JSZip：docx 库不暴露 w:beforeLines / w:afterLines，只能在它
+ * 序列化好的 styles.xml 上补（见 lineUnits.ts）。两个坑都实测过：
+ *
+ *   1. 改写内容时必须传 `createFolders: false` —— 默认会往包里塞一个目录条目
+ *      （形如 `word/`），Word 打开带这种条目的 docx 会**卡死在打开动作上不返回**
+ *      （2026-09-13，用 Word COM 复现）。纯解包再打包不受影响。
+ *   2. 整包重新生成不改变「Word 能不能打开」这件事，纯解包再打包已实测通过。
+ */
+async function buildZip(doc: DocModel, spec: Spec, meta: ExportMeta): Promise<JSZip> {
+  const raw = await Packer.toArrayBuffer(buildDocument(doc, spec, meta))
+  const zip = await JSZip.loadAsync(raw)
+  const styles = zip.file('word/styles.xml')
+  if (styles) {
+    const xml = await styles.async('string')
+    zip.file('word/styles.xml', patchStylesXml(xml, lineUnitPlan(spec)), {
+      createFolders: false,
+    })
+  }
+  return zip
+}
+
 /** 打包成 Blob，浏览器里直接下载用 */
 export async function toBlob(
   doc: DocModel,
   spec: Spec,
   meta: ExportMeta = {},
 ): Promise<Blob> {
-  return Packer.toBlob(buildDocument(doc, spec, meta))
+  const zip = await buildZip(doc, spec, meta)
+  return zip.generateAsync({ type: 'blob', mimeType: DOCX_MIME })
 }
 
 /** 打包成 base64，方便在 node 端写文件或做校验 */
@@ -305,5 +381,6 @@ export async function toBase64(
   spec: Spec,
   meta: ExportMeta = {},
 ): Promise<string> {
-  return Packer.toBase64String(buildDocument(doc, spec, meta))
+  const zip = await buildZip(doc, spec, meta)
+  return zip.generateAsync({ type: 'base64' })
 }

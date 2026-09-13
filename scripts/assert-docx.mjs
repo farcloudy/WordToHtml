@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs'
 import {
   computeNumbering,
   lengthToPx,
+  lineSpacePt,
   plainText,
   resolveSpec,
 } from '../dist-lib/wordtohtml.mjs'
@@ -78,8 +79,10 @@ for (const kind of Object.keys(spec.styles)) {
     eq(`${s.name}·对齐`, st.alignment, ALIGN[s.align]),
     eq(`${s.name}·行距规则`, st.lineSpacingRule, LINE_RULE[s.lineRule]),
     s.lineRule === 'auto' ? true : eq(`${s.name}·行距(磅)`, st.lineSpacing, s.linePt),
-    eq(`${s.name}·段前(磅)`, st.spaceBefore, round2(s.spaceBeforeLines * s.linePt)),
-    eq(`${s.name}·段后(磅)`, st.spaceAfter, round2(s.spaceAfterLines * s.linePt)),
+    // 段前/段后的「行」以文档网格行高为基准（lineSpacePt），不是本段行距。
+    // Word 报的 SpaceBefore/SpaceAfter 就是 w:before/w:after 这对后备值。
+    eq(`${s.name}·段前(磅)`, st.spaceBefore, round2(lineSpacePt(s.spaceBeforeLines, spec))),
+    eq(`${s.name}·段后(磅)`, st.spaceAfter, round2(lineSpacePt(s.spaceAfterLines, spec))),
     s.firstLineChars > 0
       ? eq(`${s.name}·首行缩进(字符)`, st.characterUnitFirstLineIndent, s.firstLineChars)
       : expectOneOf(`${s.name}·首行缩进(字符)`, st.characterUnitFirstLineIndent, [0, -1]),
@@ -105,15 +108,34 @@ const expected = model.blocks
   .filter((b) => b.t === 'textBlock')
   .map((b) => ({ style: spec.styles[b.kind].name, text: (numbering.get(b.id) ?? '') + plainText(b) }))
 
-// 分节符在 OOXML 里由一个只带 <w:sectPr> 的空段落承载，Word 把它读成一段只含
-// 分页符（\f）的文字。这是 docx 库生成分节符的方式 —— 副作用是每插入一个分节符，
-// 上一节末尾会多出一个空行。这里把它单独识别出来，而不是混进正文比对。
-const isSectionArtifact = (p) => p.text.length > 0 && p.text.replace(/[\f\u0007]/g, '') === ''
-const artifacts = dump.paragraphs.filter(isSectionArtifact)
-const body = dump.paragraphs.filter((p) => !isSectionArtifact(p))
+// 换页标记在 OOXML 里都会多出一个「空段落」：
+//   · 分节符由一个只带 <w:sectPr> 的空段落承载（docx 库的生成方式，副作用是每插
+//     一个分节符、上一节末尾多一个空行）；
+//   · 后面没有段落可挂的分页符（紧跟分节符、或在节末/文末）退回成独立段落里的
+//     <w:br w:type="page"/>（见 docx/export.ts 的 sectionParagraphs）。
+// Word 把这两种都读成「只含换页符（\f）的文字」，从文字上分不出来，只能按模型
+// 算出应该有几个、再和 Word 报的对账。
+const isBreakArtifact = (p) => p.text.length > 0 && p.text.replace(/[\f\u0007]/g, '') === ''
+const artifacts = dump.paragraphs.filter(isBreakArtifact)
+const body = dump.paragraphs.filter((p) => !isBreakArtifact(p))
 const sectionBreaks = model.blocks.filter((b) => b.t === 'sectionBreak').length
 
-eq('分节符承载的空段落数', artifacts.length, sectionBreaks)
+// 一节里连续的若干分页符只产出 1 个独立段落；只有当这一串后面没有正文段落时才产出
+let standalonePageBreaks = 0
+let pendingPageBreak = false
+for (const b of model.blocks) {
+  if (b.t === 'pageBreak') {
+    pendingPageBreak = true
+  } else if (b.t === 'sectionBreak') {
+    if (pendingPageBreak) standalonePageBreaks += 1
+    pendingPageBreak = false
+  } else {
+    pendingPageBreak = false
+  }
+}
+if (pendingPageBreak) standalonePageBreaks += 1
+
+eq('换页标记承载的空段落数', artifacts.length, sectionBreaks + standalonePageBreaks)
 eq('正文段落数', body.length, expected.length)
 const pairs = Math.min(body.length, expected.length)
 for (let i = 0; i < pairs; i += 1) {
@@ -143,7 +165,7 @@ console.log(`ok   插入="${insText}" 删除="${delText}" 批注锚定="${dump.c
 /* ---------------------------- 四、纸张、页码、分节 ------------------------- */
 
 console.log('\n=== 4. 纸张 / 页边距 / 页码 / 分节 ===')
-eq('节数', dump.sectionCount, 2)
+eq('节数', dump.sectionCount, sectionBreaks + 1)
 for (const sec of dump.sections) {
   const tag = `第${sec.index}节`
   near(`${tag}·页宽(磅)`, sec.pageWidth, toPt(spec.page.size.width), 0.1)

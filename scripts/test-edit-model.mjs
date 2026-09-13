@@ -19,17 +19,22 @@ import {
   commentScopes,
   deleteRange,
   findBlock,
+  insertBreakAfter,
   insertText,
   mergeIntoPrevious,
+  normalizeBlocks,
+  parseMd,
   plainText,
   rangeColor,
   rangeIsBold,
+  removeBreak,
   removeComment,
   replyComment,
   replaceRange,
   setBlockKind,
   splitBlock,
   toMd,
+  updateComment,
 } from '../dist-lib/wordtohtml.mjs'
 
 let failed = 0
@@ -251,6 +256,43 @@ console.log('\n=== 8. setBlockKind / cloneDoc / 往返 ===')
 
   const md = toMd(model)
   eq('模型能序列化成 md', md, '## abc')
+}
+
+console.log('\n=== 9. 批注改写 / 换页标记 ===')
+{
+  const model = docFrom('abcdef')
+  const id = addComment(model, 't0', 0, 2, '原内容', '张三', '2026-09-13T10:00:00.000Z')
+  eq('改写返回 true', updateComment(model, id, '改过了'), true)
+  eq('内容改成新的', model.comments[0].text, '改过了')
+  eq('作者没被动', model.comments[0].author, '张三')
+  eq('时间没被动', model.comments[0].date, '2026-09-13T10:00:00.000Z')
+  eq('改不存在的批注返回 false', updateComment(model, 999, 'x'), false)
+
+  const pageId = insertBreakAfter(model, 't0', 'page')
+  eq('分页符插在指定块之后', model.blocks[1].t, 'pageBreak')
+  eq('返回的就是新块 id', model.blocks[1].id, pageId)
+  const secId = insertBreakAfter(model, undefined, 'section')
+  const last = model.blocks[model.blocks.length - 1]
+  eq('没给落点就追加到文末', last.t, 'sectionBreak')
+  eq('返回的是分节符 id', last.id, secId)
+  ok('分节符默认重排页码', last.t === 'sectionBreak' && last.restartNumbering === true)
+
+  eq('分页符删得掉', removeBreak(model, pageId), true)
+  eq('分页符没了', model.blocks.some((b) => b.t === 'pageBreak'), false)
+  eq('文字块不归 removeBreak 管', removeBreak(model, 't0'), false)
+
+  // 附件与换页标记都要能过 md 往返
+  const round = {
+    blocks: [
+      { t: 'textBlock', id: 'a', kind: 'attachment', inlines: [{ t: 'text', text: '附件一' }] },
+      { t: 'pageBreak', id: 'p' },
+      { t: 'sectionBreak', id: 's', restartNumbering: true },
+    ],
+    comments: [],
+  }
+  eq('附件/分页符/分节符都能序列化', toMd(round), '% 附件一\n===\n---')
+  eq('再解析回来还是同一份结构', JSON.stringify(normalizeBlocks(parseMd(toMd(round)))),
+    JSON.stringify(normalizeBlocks(round)))
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

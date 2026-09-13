@@ -19,6 +19,7 @@ const PREFIX: Record<BlockKind, string> = {
   h3: '#### ',
   salutation: '@ ',
   signature: '>> ',
+  attachment: '% ',
   listTitle: '! ',
   listItem: '- ',
   body: '',
@@ -69,6 +70,10 @@ export function toMd(doc: DocModel): string {
       lines.push('---')
       continue
     }
+    if (block.t === 'pageBreak') {
+      lines.push('===')
+      continue
+    }
     lines.push(PREFIX[block.kind] + serializeInlines(block.inlines, comments))
   }
 
@@ -77,9 +82,11 @@ export function toMd(doc: DocModel): string {
 
 /** 便于测试与调试：把块序列归一化成可比较的形状（丢掉内存 id） */
 export function normalizeBlocks(doc: DocModel): unknown[] {
-  return doc.blocks.map((block: Block) =>
-    block.t === 'sectionBreak'
-      ? { t: 'sectionBreak', restartNumbering: block.restartNumbering }
-      : { t: 'textBlock', kind: block.kind, inlines: block.inlines },
-  )
+  return doc.blocks.map((block: Block) => {
+    if (block.t === 'sectionBreak') {
+      return { t: 'sectionBreak', restartNumbering: block.restartNumbering }
+    }
+    if (block.t === 'pageBreak') return { t: 'pageBreak' }
+    return { t: 'textBlock', kind: block.kind, inlines: block.inlines }
+  })
 }

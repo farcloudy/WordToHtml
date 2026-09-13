@@ -21,7 +21,15 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { createServer } from 'vite'
 
-import { STYLE_KEYS, commentScopes, parseMd, ptToPx, resolveSpec, toMd } from '../dist-lib/wordtohtml.mjs'
+import {
+  STYLE_KEYS,
+  commentScopes,
+  lineSpacePt,
+  parseMd,
+  ptToPx,
+  resolveSpec,
+  toMd,
+} from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -153,7 +161,7 @@ try {
     const commentSidebar = {
       present: commentAside !== null,
       items: commentAside
-        ? Array.from(commentAside.querySelectorAll('li button')).map((b) => ({
+        ? Array.from(commentAside.querySelectorAll('li .wtp-comment-item')).map((b) => ({
             scope: (b.querySelector('.wtp-comment-scope')?.textContent ?? '').trim(),
             text: (b.querySelector('.wtp-comment-text')?.textContent ?? '').trim(),
           }))
@@ -212,8 +220,8 @@ try {
       eq(`${kind}·字重`, got.fontWeight, s.bold ? '700' : '400'),
       eq(`${kind}·对齐`, got.textAlign, s.align === 'both' ? 'justify' : s.align),
       approx(`${kind}·首行缩进`, got.textIndent, s.firstLineChars * ptToPx(s.sizePt)),
-      approx(`${kind}·段前`, got.marginTop, ptToPx(s.spaceBeforeLines * s.linePt)),
-      approx(`${kind}·段后`, got.marginBottom, ptToPx(s.spaceAfterLines * s.linePt)),
+      approx(`${kind}·段前`, got.marginTop, ptToPx(lineSpacePt(s.spaceBeforeLines, spec))),
+      approx(`${kind}·段后`, got.marginBottom, ptToPx(lineSpacePt(s.spaceAfterLines, spec))),
       ok(
         `${kind}·字体栈含中西文`,
         got.fontFamily.includes(s.ascii) && got.fontFamily.includes(s.eastAsia),
@@ -257,7 +265,7 @@ try {
   // 点侧栏 → 正文锚点高亮。这条是「能看到批注内容」这个需求的落点，必须实测。
   const firstComment = commentModel.comments[0]
   if (firstComment) {
-    await page.click('.wtp-comments li button')
+    await page.click('.wtp-comments li .wtp-comment-item')
     // Vue 的更新在微任务里，等一帧再读更稳；超时也让后面的断言给出真实差异
     await page
       .waitForFunction(() => document.querySelectorAll('.wtp-comment-active').length > 0, null, {
@@ -276,6 +284,11 @@ try {
 
   console.log('\n=== 4. 页首与续排的间距豁免 ===')
   for (const p of report.pages) {
+    // 空白页（文末分节符留下的那种）没有片段，谈不上「首块段前距」
+    if (p.items.length === 0) {
+      ok(`第${p.index}页是空白页（Word 也会留这一页）`, p.fragments === 0)
+      continue
+    }
     ok(
       `第${p.index}页首块段前距为 0`,
       (p.items[0]?.marginTop ?? -1) === 0,
@@ -297,7 +310,7 @@ try {
     if (!paper) return null
     return paper.getMeasurements().map((m) =>
       m.t === 'break'
-        ? { t: 'break' }
+        ? { t: 'break', kind: m.kind, id: m.blockId }
         : {
             t: 'block',
             id: m.blockId,
@@ -327,7 +340,7 @@ try {
 
     for (const m of measurements) {
       if (m.t === 'break') {
-        console.log('        [分节符]')
+        console.log(`        [${m.kind === 'section' ? '分节符' : '分页符'}]`)
         continue
       }
       const r = rendered.get(m.id) ?? { height: 0, pieces: 0 }

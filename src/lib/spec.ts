@@ -22,6 +22,7 @@ export type BlockKind =
   | 'body'
   | 'salutation'
   | 'signature'
+  | 'attachment'
   | 'listTitle'
   | 'listItem'
 
@@ -33,6 +34,7 @@ export const BLOCK_KINDS: readonly BlockKind[] = [
   'body',
   'salutation',
   'signature',
+  'attachment',
   'listTitle',
   'listItem',
 ]
@@ -85,9 +87,17 @@ export interface TextStyleSpec {
   lineRule: LineRule
   /** 行距值，pt；lineRule 为 auto 时忽略 */
   linePt: number
-  /** 段前间距，行数（按本段行距换算成 pt） */
+  /**
+   * 段前间距，单位「行」。
+   *
+   * 「行」的基准是**文档网格行高**（page.gridLinePt），不是本段的 linePt ——
+   * Word 就是这么算的：设了 `w:docGrid/@w:linePitch` 之后，段前 0.5 行 = 0.5 ×
+   * 网格行高，跟这一段自己的行距无关。所以这里不能用 `spaceBeforeLines * linePt`
+   * 折算，那样在 Word 里显示成「磅」的固定值，行距一变间距就不跟着走。
+   * 换算统一走 lineSpacePt()，不要在别处重写。
+   */
   spaceBeforeLines: number
-  /** 段后间距，行数 */
+  /** 段后间距，行数；基准同 spaceBeforeLines */
   spaceAfterLines: number
   /** 自动编号规则；页脚这类不成块的样式固定填 'none' */
   numbering: NumberingStyle
@@ -110,6 +120,19 @@ export interface PageSpec {
   footer: Length
   /** 页眉顶边到纸张顶边的距离 */
   header: Length
+  /**
+   * 文档网格的行高，pt。**全文只有一个**（docx 里它是节属性 `w:docGrid/@w:linePitch`），
+   * 而段前/段后的「行」就以它为基准 —— 所以行距各不相同的样式用的是同一个基准。
+   *
+   * 取 15.6pt（312 缇）：这是 Word 中文默认文档的网格（A4 默认页边距下「每页 44 行」），
+   * 也是真实公文里实际生效的值 —— 据一份真实公文导出的 styles.xml 实测，Normal 的
+   * 「0.5 行」写作 before="156"、Title 的「1.5 行」写作 before="468"，反推 1 行都是
+   * 312 缇。按这个基准导出，段前/段后与那份公文逐字相同。
+   *
+   * 网格类型用 `lines`（对齐行网格）。文档里行距是固定值的段落不受网格影响，
+   * 量出来的行盒与预览一致；`page.gridLinePt` 只决定「1 行」等于多少磅。
+   */
+  gridLinePt: number
 }
 
 /**
@@ -154,6 +177,7 @@ export interface Spec {
  *   h1/h2/h3    (2.1)(2.2)(2.3)     → 内置「标题 1/2/3」，自动编号
  *   salutation  (2.4) 抬头（正文但无首行缩进）    → 自定义名
  *   signature   (2.5) 落款（正文但右对齐）        → 自定义名
+ *   attachment  附件标记（正文但黑体、顶格、段后 1 行） → 自定义名
  *   listItem    (3) 列表段落        → 内置「列表段落」
  *   listTitle   (3.1) 列表标题      → 自定义名（Word 无对应内置）
  *   footer      页脚页码段落        → 内置「页脚」
@@ -164,6 +188,8 @@ export const DEFAULT_SPEC: Spec = {
     margin: DEFAULT_MARGIN,
     footer: '12.5mm',
     header: '12.5mm',
+    // 312 缇 = 15.6pt，Word 中文默认文档网格（见 PageSpec.gridLinePt 的说明）
+    gridLinePt: 15.6,
   },
   styles: {
     title: {
@@ -271,6 +297,29 @@ export const DEFAULT_SPEC: Spec = {
       spaceAfterLines: 0.5,
       numbering: 'none',
     },
+    /**
+     * 附件标记。基于正文：字号、行距、对齐都随正文，只改字体（黑体）、
+     * 取消首行缩进、段前归零、段后留 1 行 —— 公文的「附件」标识要顶格起段，
+     * 与后文（附件正文）之间空开一行。
+     *
+     * 西文槽位也用黑体：真实公文里那条「附件」样式，w:rFonts 的
+     * ascii/eastAsia/hAnsi 写的都是黑体。
+     */
+    attachment: {
+      name: '附件',
+      id: 'WT-Attachment',
+      eastAsia: '黑体',
+      ascii: '黑体',
+      sizePt: 14,
+      bold: false,
+      align: 'both',
+      firstLineChars: 0,
+      lineRule: 'exact',
+      linePt: 25,
+      spaceBeforeLines: 0,
+      spaceAfterLines: 1,
+      numbering: 'none',
+    },
     listTitle: {
       name: '列表标题',
       id: 'WT-ListTitle',
@@ -350,6 +399,7 @@ export function resolveSpec(override?: DeepPartial<Spec>): Spec {
       margin: { ...DEFAULT_SPEC.page.margin, ...p?.margin },
       footer: p?.footer ?? DEFAULT_SPEC.page.footer,
       header: p?.header ?? DEFAULT_SPEC.page.header,
+      gridLinePt: p?.gridLinePt ?? DEFAULT_SPEC.page.gridLinePt,
     },
     styles,
   }
@@ -370,6 +420,17 @@ export function mm(value: number): Length {
 /** pt → twips（docx 的 spacing / indent 单位） */
 export function ptToTwips(pt: number): number {
   return Math.round(pt * 20)
+}
+
+/**
+ * 段前/段后（行）→ pt。基准是文档网格行高，不是段落自己的 linePt。
+ *
+ * docx 的 `w:before`/`w:after`、预览 CSS 的 margin、量测出来的段距，三处换算
+ * 都必须走这一个函数 —— 任何一处回退成 `lines * linePt` 都会让 Word 与预览
+ * 在段间距上分家，而且因为显示单位不同（磅 vs 行）很难一眼看出来。
+ */
+export function lineSpacePt(lines: number, spec: Spec): number {
+  return lines * spec.page.gridLinePt
 }
 
 /** pt → 半磅（docx 的 run.size 单位） */

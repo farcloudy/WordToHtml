@@ -6,7 +6,7 @@
  * 标点避头尾这些都会影响换行位置，只有让浏览器真的排一遍才是准的。
  */
 
-import { contentBoxPx, ptToPx } from '../spec'
+import { contentBoxPx, lineSpacePt, ptToPx } from '../spec'
 import type { Spec } from '../spec'
 import { computeNumbering } from '../numbering'
 import type { DocModel } from '../types'
@@ -135,8 +135,8 @@ function measureElement(
     displayLength,
     rows,
     lineHeight,
-    spaceBefore: ptToPx(s.spaceBeforeLines * s.linePt),
-    spaceAfter: ptToPx(s.spaceAfterLines * s.linePt),
+    spaceBefore: ptToPx(lineSpacePt(s.spaceBeforeLines, spec)),
+    spaceAfter: ptToPx(lineSpacePt(s.spaceAfterLines, spec)),
     rowStarts,
   }
 }
@@ -194,7 +194,7 @@ export function measureDocument(
   const alive = new Set<string>()
 
   for (const block of doc.blocks) {
-    if (block.t === 'sectionBreak') continue
+    if (block.t !== 'textBlock') continue
     alive.add(block.id)
     const prefix = numbering.get(block.id) ?? ''
     const html = renderInlinesHtml(block.inlines, prefix)
@@ -240,7 +240,17 @@ export function measureDocument(
 
   return doc.blocks.flatMap<MeasuredItem>((block) => {
     if (block.t === 'sectionBreak') {
-      return [{ t: 'break', restartNumbering: block.restartNumbering }]
+      return [
+        {
+          t: 'break',
+          blockId: block.id,
+          kind: 'section',
+          restartNumbering: block.restartNumbering,
+        },
+      ]
+    }
+    if (block.t === 'pageBreak') {
+      return [{ t: 'break', blockId: block.id, kind: 'page', restartNumbering: false }]
     }
     const m = resolved.get(block.id)
     return m ? [m] : []

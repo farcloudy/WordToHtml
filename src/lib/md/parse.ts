@@ -12,9 +12,11 @@
  *   ####   三级标题      → 自动编号 1、
  *   @      抬头（正文但取消首行缩进）
  *   >>     落款（正文但右对齐）
+ *   %      附件标记（基于正文：黑体、顶格、段前 0、段后 1 行）
  *   -      列表段落
  *   !      列表标题
  *   ---    分节符（单独一行，新起一页且页码重新从 1 开始）
+ *   ===    分页符（单独一行，只强制换页，页码连续）
  *
  * 行内标记：
  *   **文字**          加粗
@@ -246,11 +248,13 @@ const BLOCK_RULES: readonly BlockRule[] = [
   { re: /^#\s+(.*)$/, kind: 'title' },
   { re: /^@\s*(.*)$/, kind: 'salutation' },
   { re: /^>>\s*(.*)$/, kind: 'signature' },
+  { re: /^%\s+(.*)$/, kind: 'attachment' },
   { re: /^!\s+(.*)$/, kind: 'listTitle' },
   { re: /^-\s+(.*)$/, kind: 'listItem' },
 ]
 
 const SECTION_BREAK_RE = /^-{3,}\s*$/
+const PAGE_BREAK_RE = /^={3,}\s*$/
 
 export function parseMd(source: string, options: ParseOptions = {}): DocModel {
   const author = options.author ?? '管理员'
@@ -284,6 +288,11 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
 
     if (SECTION_BREAK_RE.test(line)) {
       blocks.push({ t: 'sectionBreak', id: nextBlockId('s'), restartNumbering: true })
+      continue
+    }
+
+    if (PAGE_BREAK_RE.test(line)) {
+      blocks.push({ t: 'pageBreak', id: nextBlockId('pg') })
       continue
     }
 

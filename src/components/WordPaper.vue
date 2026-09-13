@@ -35,26 +35,29 @@ import {
   applyFormat,
   cloneDoc,
   findBlock,
+  insertBreakAfter,
   insertText,
   mergeIntoPrevious,
   rangeColor,
   rangeIsBold,
+  removeBreak as removeBreakOp,
   removeComment as removeCommentOp,
   replyComment as replyCommentOp,
   replaceRange,
   setBlockKind as setBlockKindOp,
   sliceStrict,
   splitBlock,
+  updateComment as updateCommentOp,
 } from '../lib/edit/model'
 import type { EditorSelection } from '../lib/edit/model'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
-import { injectCss } from '../lib/render/css'
+import { KEEP_SELECTION_HIGHLIGHT, injectCss } from '../lib/render/css'
 import { renderInlinesHtml } from '../lib/render/html'
 import { clearMeasureCache, measureDocument } from '../lib/render/measure'
 import type { MeasureCache } from '../lib/render/measure'
 import { paginate } from '../lib/render/paginate'
-import type { MeasuredItem, PageFragment, PageLayout } from '../lib/render/paginate'
+import type { BreakKind, MeasuredItem, PageFragment, PageLayout } from '../lib/render/paginate'
 import { contentBoxPx, resolveSpec } from '../lib/spec'
 import type { BlockKind, DeepPartial, Spec } from '../lib/spec'
 import { commentScopes } from '../lib/types'
@@ -102,6 +105,9 @@ const pages = shallowRef<PageLayout[]>([])
 const measured = shallowRef<MeasuredItem[]>([])
 /** 侧栏里正在查看的批注；只影响高亮，不触发重排 */
 const activeCommentId = ref<number | null>(null)
+/** 侧栏里正在改写的那条批注与草稿（只在侧栏里用，不进模型） */
+const editingId = ref<number | null>(null)
+const editDraft = ref('')
 
 const cache: MeasureCache = new Map()
 let cssKey = ''
@@ -229,6 +235,14 @@ function sameLayout(a: readonly PageLayout[], b: readonly PageLayout[]): boolean
     const pb = b[i]
     if (!pa || !pb) return false
     if (pa.sectionIndex !== pb.sectionIndex || pa.pageNumber !== pb.pageNumber) return false
+    // 换页标记也要比：插一个「文末分页符」不会改变片段，但标记得画出来；
+    // 换了是哪几条（kind/blockId）标记的文案与删除目标也不同
+    if (pa.breaks.length !== pb.breaks.length) return false
+    for (let j = 0; j < pa.breaks.length; j += 1) {
+      const ma = pa.breaks[j]
+      const mb = pb.breaks[j]
+      if (!ma || !mb || ma.blockId !== mb.blockId || ma.kind !== mb.kind) return false
+    }
     if (pa.fragments.length !== pb.fragments.length) return false
     for (let j = 0; j < pa.fragments.length; j += 1) {
       const fa = pa.fragments[j]
@@ -523,6 +537,8 @@ function onSelectionChange(): void {
   if (!sel || sel.rangeCount === 0) return
   const range = sel.getRangeAt(0)
   if (!fragmentOf(range.startContainer)) return
+  // 选区回到正文了，那层「续命」高亮就该撤掉，免得和原生选区叠成两种颜色
+  dropKeptSelection()
   const selected = selectedRanges(rootEl)
   if (selected.length > 0) stickyRanges = selected
   const point = displayPointOf(rootEl, range.startContainer, range.startOffset)
@@ -771,6 +787,10 @@ function addCommentOnSelection(text: string): number {
   )
   if (id < 0) return -1
   activeCommentId.value = id
+  // 批注已经落下，选区记录与那层「续命」高亮都该收掉了：
+  // 留着会让下一条批注悄悄用上一次的选区。
+  stickyRanges = []
+  dropKeptSelection()
   refreshLayout({ force: true })
   return id
 }
@@ -804,7 +824,98 @@ function removeComment(id: number): void {
   pushHistory()
   removeCommentOp(doc.value, id)
   if (activeCommentId.value === id) activeCommentId.value = null
+  if (editingId.value === id) cancelEdit()
   refreshLayout({ force: true })
+}
+
+/** 改一条批注的内容。作者与时间不动 —— 改的是内容，不是谁在什么时候说的。 */
+function editComment(id: number, text: string): boolean {
+  const next = text.trim()
+  if (next === '') return false
+  pushHistory()
+  if (!updateCommentOp(doc.value, id, next)) return false
+  refreshLayout({ force: true })
+  return true
+}
+
+/** 侧栏：把某条批注切成编辑态 / 退出编辑态 / 提交草稿 */
+function startEdit(id: number, text: string): void {
+  editingId.value = id
+  editDraft.value = text
+}
+
+function cancelEdit(): void {
+  editingId.value = null
+  editDraft.value = ''
+}
+
+function commitEdit(id: number): void {
+  if (editComment(id, editDraft.value)) cancelEdit()
+}
+
+/* -------------------------------------------------------------------------- */
+/* 分页符 / 分节符                                                             */
+/* -------------------------------------------------------------------------- */
+
+/** 在落点所在块之后插入一个换页标记；落点取不到就追加到文末 */
+function insertBreak(kind: BreakKind): void {
+  if (!props.editable) return
+  const point = caretPoint()
+  pushHistory(point)
+  insertBreakAfter(doc.value, point?.blockId, kind)
+  refreshLayout({ anchor: point, force: true })
+}
+
+/** 点页间标记上的 × 时删掉那一枚分页符/分节符 */
+function deleteBreak(blockId: string): void {
+  if (!props.editable) return
+  const point = caretPoint()
+  pushHistory(point)
+  if (!removeBreakOp(doc.value, blockId)) return
+  refreshLayout({ anchor: point, force: true })
+}
+
+/** 工具栏按钮：在落点所在块之后插入分页符 / 分节符 */
+function insertPageBreak(): void {
+  insertBreak('page')
+}
+
+function insertSectionBreak(): void {
+  insertBreak('section')
+}
+
+/* -------------------------------------------------------------------------- */
+/* 选区保持                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 点工具栏或批注输入框会把焦点从正文拿走，浏览器随即收起原生选区 —— 选中的底色
+ * 就没了（批注其实照样加得上，因为区间记在 stickyRanges 里，丢的只是视觉）。
+ *
+ * 这里用 CSS Custom Highlight API 单独画一层高亮：它不动 DOM，也就不必重排、
+ * 不会碰到正在编辑的内容。不支持的浏览器直接跳过，降级成「没有高亮」。
+ */
+type HighlightRegistry = Map<string, Highlight>
+
+function highlightRegistry(): HighlightRegistry | null {
+  if (typeof CSS === 'undefined') return null
+  const registry = (CSS as unknown as { highlights?: HighlightRegistry }).highlights
+  return registry ?? null
+}
+
+function keepSelection(): void {
+  if (!props.editable) return
+  const registry = highlightRegistry()
+  if (!registry) return
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return
+  const range = sel.getRangeAt(0)
+  if (!fragmentOf(range.startContainer)) return
+  registry.set(KEEP_SELECTION_HIGHLIGHT, new Highlight(range.cloneRange()))
+}
+
+function dropKeptSelection(): void {
+  highlightRegistry()?.delete(KEEP_SELECTION_HIGHLIGHT)
 }
 
 function undo(): void {
@@ -904,6 +1015,12 @@ defineExpose({
   addCommentAt,
   replyComment,
   removeComment,
+  editComment,
+  insertPageBreak,
+  insertSectionBreak,
+  deleteBreak,
+  keepSelection,
+  dropKeptSelection,
   undo,
   redo,
   canUndo: (): boolean => undoStack.length > 0,
@@ -915,33 +1032,59 @@ defineExpose({
 <template>
   <div ref="root" class="wtp-root">
     <div class="wtp-pages">
-      <div v-for="page in pages" :key="`${page.sectionIndex}-${page.pageNumber}`" class="wtp-page">
-        <div
-          class="wtp-content"
-          :contenteditable="editable ? 'true' : undefined"
-          :spellcheck="editable ? 'false' : undefined"
-          @input="onInput"
-          @keydown="onKeydown"
-          @beforeinput="onBeforeInput"
-          @paste="onPaste"
-          @compositionstart="onCompositionStart"
-          @compositionend="onCompositionEnd"
-        >
+      <template v-for="page in pages" :key="`${page.sectionIndex}-${page.pageNumber}`">
+        <div class="wtp-page">
           <div
-            v-for="(frag, index) in page.fragments"
-            :key="`${frag.blockId}-${frag.from}`"
-            :class="`wtp-${frag.kind}`"
-            :style="fragmentStyle(frag, index === 0)"
-            :data-block-id="frag.blockId"
-            :data-from="frag.from"
-            :data-to="frag.to"
-            :data-continuation="frag.continuation ? '1' : undefined"
-            v-html="fragmentHtml(frag)"
-          />
+            class="wtp-content"
+            :contenteditable="editable ? 'true' : undefined"
+            :spellcheck="editable ? 'false' : undefined"
+            @input="onInput"
+            @keydown="onKeydown"
+            @beforeinput="onBeforeInput"
+            @paste="onPaste"
+            @compositionstart="onCompositionStart"
+            @compositionend="onCompositionEnd"
+          >
+            <div
+              v-for="(frag, index) in page.fragments"
+              :key="`${frag.blockId}-${frag.from}`"
+              :class="`wtp-${frag.kind}`"
+              :style="fragmentStyle(frag, index === 0)"
+              :data-block-id="frag.blockId"
+              :data-from="frag.from"
+              :data-to="frag.to"
+              :data-continuation="frag.continuation ? '1' : undefined"
+              v-html="fragmentHtml(frag)"
+            />
+          </div>
+          <!-- wtp-footer 提供排版（= 内置「页脚」样式），wtp-page-number 只负责定位 -->
+          <div class="wtp-page-number wtp-footer">{{ page.pageNumber }}</div>
         </div>
-        <!-- wtp-footer 提供排版（= 内置「页脚」样式），wtp-page-number 只负责定位 -->
-        <div class="wtp-page-number wtp-footer">{{ page.pageNumber }}</div>
-      </div>
+        <!--
+          换页标记，可以有不止一枚（分页符 + 分节符连在一起时两枚都落在同一页底部）。
+          放在两页之间的空隙里而不是版心内：既不挤占版心高度（分页算术不必为它记账），
+          也不会盖住正文。有它才能看见「这里插了一个分节符」。
+        -->
+        <div
+          v-for="mark in page.breaks"
+          :key="mark.blockId"
+          class="wtp-break"
+          :data-break-id="mark.blockId"
+        >
+          <span class="wtp-break-label">{{
+            mark.kind === 'section' ? '分节符（下一页）' : '分页符'
+          }}</span>
+          <button
+            v-if="editable"
+            type="button"
+            class="wtp-break-del"
+            title="删除这个换页标记"
+            @click="deleteBreak(mark.blockId)"
+          >
+            ×
+          </button>
+        </div>
+      </template>
       <div v-if="pages.length === 0" class="wtp-page">
         <div class="wtp-content" />
         <div class="wtp-page-number wtp-footer">1</div>
@@ -952,9 +1095,10 @@ defineExpose({
     <aside v-if="comments.length > 0" class="wtp-comments">
       <div class="wtp-comments-title">批注 {{ comments.length }}</div>
       <ul>
-        <li v-for="c in comments" :key="c.id">
+        <li v-for="c in comments" :key="c.id" class="wtp-comment-row" :data-comment-id="c.id">
           <button
             type="button"
+            class="wtp-comment-item"
             :class="{ 'is-active': c.id === activeCommentId }"
             @click="focusComment(c.id)"
           >
@@ -964,8 +1108,23 @@ defineExpose({
               <em v-if="c.resolved">已解决</em>
             </span>
             <span class="wtp-comment-scope">「{{ c.scope }}」</span>
-            <span class="wtp-comment-text">{{ c.text }}</span>
+            <span v-if="editingId !== c.id" class="wtp-comment-text">{{ c.text }}</span>
           </button>
+          <div v-if="editingId === c.id" class="wtp-comment-edit">
+            <input
+              v-model="editDraft"
+              type="text"
+              spellcheck="false"
+              @keydown.enter.prevent="commitEdit(c.id)"
+              @keydown.esc.prevent="cancelEdit"
+            />
+            <button type="button" class="primary" @click="commitEdit(c.id)">保存</button>
+            <button type="button" @click="cancelEdit">取消</button>
+          </div>
+          <div class="wtp-comment-actions">
+            <button type="button" @click="startEdit(c.id, c.text)">编辑</button>
+            <button type="button" @click="removeComment(c.id)">删除</button>
+          </div>
           <ul v-if="c.replies.length > 0" class="wtp-replies">
             <li v-for="r in c.replies" :key="r.id">
               <span class="wtp-comment-meta"
@@ -1029,7 +1188,8 @@ defineExpose({
 .wtp-comments li + li {
   border-top: 1px solid #eef0f3;
 }
-.wtp-comments button {
+/* 只有「正文那条」是整块可点的条目按钮；编辑/删除是下面独立的一排小按钮 */
+.wtp-comments .wtp-comment-item {
   display: block;
   width: 100%;
   padding: 8px 10px;
@@ -1040,11 +1200,79 @@ defineExpose({
   text-align: left;
   cursor: pointer;
 }
-.wtp-comments button:hover {
+.wtp-comments .wtp-comment-item:hover {
   background: #f8f9fb;
 }
-.wtp-comments button.is-active {
+.wtp-comments .wtp-comment-item.is-active {
   background: rgba(255, 213, 0, 0.35);
+}
+.wtp-comment-edit {
+  display: flex;
+  gap: 4px;
+  padding: 0 10px 6px;
+}
+.wtp-comment-edit input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  font: inherit;
+}
+.wtp-comment-edit button,
+.wtp-comment-actions button {
+  padding: 3px 8px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  background: #fff;
+  color: #4a4f56;
+  font: inherit;
+  cursor: pointer;
+}
+.wtp-comment-edit button.primary {
+  border-color: #1f6feb;
+  background: #1f6feb;
+  color: #fff;
+}
+.wtp-comment-actions {
+  display: flex;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+.wtp-comment-actions button:hover {
+  border-color: #8a9099;
+}
+/* 页间换页标记：放在两页之间的空隙里，不占版心 */
+.wtp-break {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -6px 0;
+  color: #8a9099;
+  font-size: 11px;
+  line-height: 1;
+}
+.wtp-break-label {
+  padding: 1px 8px;
+  border: 1px dashed #b6bcc4;
+  border-radius: 999px;
+  background: #f3f4f6;
+  white-space: nowrap;
+}
+.wtp-break-del {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid #c8ccd2;
+  border-radius: 999px;
+  background: #fff;
+  color: #8a9099;
+  line-height: 1;
+  cursor: pointer;
+}
+.wtp-break-del:hover {
+  border-color: #e0a9a4;
+  color: #b3261e;
 }
 .wtp-replies {
   padding: 0 10px 8px 22px !important;

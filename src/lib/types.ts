@@ -49,6 +49,15 @@ export interface SectionBreakBlock {
   restartNumbering: boolean
 }
 
+/**
+ * 分页符。对应 md 里的独立一行 `===`。
+ * 与分节符的区别：只强制换页，不新开一节（页码连续、页眉页脚照旧）。
+ */
+export interface PageBreakBlock {
+  t: 'pageBreak'
+  id: string
+}
+
 export interface TextBlock {
   t: 'textBlock'
   id: string
@@ -56,7 +65,7 @@ export interface TextBlock {
   inlines: Inline[]
 }
 
-export type Block = TextBlock | SectionBreakBlock
+export type Block = TextBlock | SectionBreakBlock | PageBreakBlock
 
 export interface CommentDef {
   id: number

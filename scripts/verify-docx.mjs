@@ -13,9 +13,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { Packer } from 'docx'
+import JSZip from 'jszip'
 
-import { buildDocument, normalizeBlocks, parseMd, resolveSpec, toMd } from '../dist-lib/wordtohtml.mjs'
+import { normalizeBlocks, parseMd, resolveSpec, toBase64, toMd } from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -50,6 +50,14 @@ const SAMPLE = [
   '',
   '本节为附件，页码重新起算。',
   '',
+  '% 附件一：资产核查明细表',
+  '',
+  // 分页符紧挨着分节符（故意留的连排）：分页符后面没有段落可挂，必须退回成
+  // 独立段落里的 w:br w:type="page"，否则换页会被静默丢掉。Word 每次验 P1
+  // 都会真的打开一次这种形状。
+  '===',
+  '---',
+  '',
   '>> 江苏爱康光电破产管理人',
   '>> 2026年9月12日',
   '',
@@ -82,12 +90,58 @@ if (before !== after) {
 }
 console.log('[ok] 往返一致性通过（模型 → md → 模型）')
 
-const doc = buildDocument(model, spec, { title: '爱康光电资产核查情况说明' })
-const buffer = await Packer.toBuffer(doc)
+const buffer = Buffer.from(
+  await toBase64(model, spec, { title: '爱康光电资产核查情况说明' }),
+  'base64',
+)
 
 const outPath = join(root, '.qwen', 'tmp', 'verify.docx')
 mkdirSync(dirname(outPath), { recursive: true })
 writeFileSync(outPath, buffer)
+
+/*
+ * 行单位段距必须在 OOXML 层面就能看见。
+ *
+ * Word 的 styles[].SpaceBefore 报的是 w:before/w:after 这对后备值，看的是「多少磅」，
+ * 证明不了这一段在 Word 里被当成「行」—— 判定「行」与「磅」的是 w:beforeLines /
+ * w:afterLines 在不在。所以这里直接看写进文件的字节。
+ */
+{
+  const zip = await JSZip.loadAsync(buffer)
+  const stylesXml = await zip.file('word/styles.xml').async('string')
+  const docXml = await zip.file('word/document.xml').async('string')
+
+  const problems = []
+
+  // 正文（docDefaults）也要写成行单位
+  const defaults = /<w:pPrDefault\b[\s\S]*?<\/w:pPrDefault>/.exec(stylesXml)?.[0] ?? ''
+  if (!/w:beforeLines=/.test(defaults)) problems.push('docDefaults（正文）没写 beforeLines')
+
+  // 规格表里每条样式（不含正文）都该带上
+  const styleIds = Object.entries(spec.styles)
+    .filter(([key]) => key !== 'body')
+    .map(([, s]) => s.id)
+  const bare = styleIds.filter((id) => {
+    const block = new RegExp(
+      `<w:style\\b[^>]*?w:styleId="${id}"[^>]*>[\\s\\S]*?</w:style>`,
+    ).exec(stylesXml)?.[0]
+    return !block || !/w:beforeLines=/.test(block)
+  })
+  if (bare.length > 0) problems.push(`这些样式没写 beforeLines：${bare.join('、')}`)
+
+  const grids = [...docXml.matchAll(/<w:docGrid\b[^>]*>/g)].map((m) => m[0])
+  if (grids.length === 0) problems.push('document.xml 里没有 w:docGrid（「行」就没有基准）')
+
+  if (problems.length > 0) {
+    console.error('[FAIL] 行单位段距没有正确写进 docx：')
+    for (const p of problems) console.error(`  - ${p}`)
+    process.exit(1)
+  }
+  console.log(
+    `[ok] 行单位段距：${styleIds.length + 1} 处 spacing 带 beforeLines/afterLines，` +
+      `${grids.length} 处 docGrid（${grids[0]}）`,
+  )
+}
 
 // 临时副本名带上 pid：Word 退出后会短暂占住文件，用固定名会让下一次运行
 // 撞上 EBUSY。每次换一个新名字就永远不会冲突，跑完由 verify-p1.mjs 清理。

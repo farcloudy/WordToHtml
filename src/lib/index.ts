@@ -17,6 +17,7 @@ export {
   STYLE_KEYS,
   contentBoxPx,
   lengthToPx,
+  lineSpacePt,
   mm,
   ptToHalfPoints,
   ptToPx,
@@ -53,6 +54,7 @@ export type {
   CommentStartInline,
   DocModel,
   Inline,
+  PageBreakBlock,
   RevMark,
   SectionBreakBlock,
   TextBlock,
@@ -69,17 +71,20 @@ export {
   deleteRange,
   findBlock,
   findBlockIndex,
+  insertBreakAfter,
   insertText,
   mergeIntoPrevious,
   rangeColor,
   rangeIsBold,
   removeBlock,
+  removeBreak,
   removeComment,
   replyComment,
   replaceRange,
   setBlockKind,
   sliceStrict,
   splitBlock,
+  updateComment,
 } from './edit/model'
 export type { BlockPoint, EditorSelection } from './edit/model'
 
@@ -105,6 +110,8 @@ export { normalizeBlocks, toMd } from './md/serialize'
 
 export { buildDocument, paragraphStyles, toBase64, toBlob } from './docx/export'
 export type { ExportMeta } from './docx/export'
+export { lineUnitPlan, patchStylesXml } from './docx/lineUnits'
+export type { LineUnit, LineUnitPlan } from './docx/lineUnits'
 
 export { WTP, buildCss, injectCss } from './render/css'
 export { escapeHtml, renderInlinesHtml } from './render/html'
@@ -112,9 +119,11 @@ export { clearMeasureCache, measureDocument } from './render/measure'
 export type { MeasureCache, MeasureCacheEntry } from './render/measure'
 export { paginate } from './render/paginate'
 export type {
+  BreakKind,
   MeasuredBlock,
   MeasuredBreak,
   MeasuredItem,
+  PageBreakMark,
   PageFragment,
   PageLayout,
   PaginateOptions,

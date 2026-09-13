@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
-import { BLOCK_KINDS, MARGIN_PRESETS } from './lib/spec'
+import { BLOCK_KINDS, MARGIN_PRESETS, ptToPx, resolveSpec } from './lib/spec'
 import type { BlockKind, DeepPartial, Spec } from './lib/spec'
 import type { EditorSelection } from './lib/edit/model'
 
@@ -57,6 +57,7 @@ const KIND_LABEL: Record<BlockKind, string> = {
   body: '正文',
   salutation: '抬头',
   signature: '落款',
+  attachment: '附件',
   listTitle: '列表标题',
   listItem: '列表段落',
 }
@@ -89,15 +90,27 @@ const specOverride = computed<DeepPartial<Spec>>(() => {
   return { page: { margin: { ...preset.margin } } }
 })
 
+/** 完整规格表。样式库要按每条样式自己的字体字号预览，所以这里要拿到解析后的值。 */
+const spec = computed<Spec>(() => resolveSpec(specOverride.value))
+
 const kind = computed<BlockKind>(() => selection.value?.kind ?? 'body')
+
+/**
+ * 样式库按钮照 Word 的做法「所见即所得」：用这条样式自己的字体与字重显示按钮文字。
+ * 字号按样式字号缩放但夹在 12–15px，否则标题那类大字号会把整条样式栏撑高一倍。
+ */
+function chipStyle(k: BlockKind): Record<string, string> {
+  const s = spec.value.styles[k]
+  const size = Math.min(15, Math.max(12, ptToPx(s.sizePt) * 0.62))
+  return {
+    fontFamily: `"${s.ascii}", "${s.eastAsia}", serif`,
+    fontWeight: s.bold ? '700' : '400',
+    fontSize: `${size.toFixed(1)}px`,
+  }
+}
 
 function onSelectionChange(value: EditorSelection | null): void {
   selection.value = value
-}
-
-function onKindChange(event: Event): void {
-  const value = (event.target as HTMLSelectElement).value as BlockKind
-  paper.value?.setBlockKind(value)
 }
 
 function insertComment(): void {
@@ -181,18 +194,28 @@ onMounted(() => {
       </button>
     </header>
 
+    <!--
+      样式库。照 Word 的样子水平排成一排大按钮，按钮文字用各条样式自己的字体字号
+      渲染 —— 一眼能对上是哪条样式，也不用先在下拉框里找。
+    -->
+    <div v-if="mode === 'edit'" class="styles">
+      <span class="styles-label">样式</span>
+      <button
+        v-for="k in BLOCK_KINDS"
+        :key="k"
+        type="button"
+        class="style-chip"
+        :class="{ 'is-on': k === kind }"
+        :style="chipStyle(k)"
+        :title="KIND_LABEL[k]"
+        @mousedown.prevent
+        @click="paper?.setBlockKind(k)"
+      >
+        {{ KIND_LABEL[k] }}
+      </button>
+    </div>
+
     <div v-if="mode === 'edit'" class="toolbar">
-      <label class="field">
-        段落样式
-        <select :value="kind" @change="onKindChange">
-          <option v-for="k in BLOCK_KINDS" :key="k" :value="k">
-            {{ KIND_LABEL[k] }}
-          </option>
-        </select>
-      </label>
-
-      <span class="sep" />
-
       <button
         type="button"
         class="tool"
@@ -252,12 +275,34 @@ onMounted(() => {
 
       <span class="sep" />
 
+      <button
+        type="button"
+        class="tool"
+        title="在光标所在段落后插入分页符（只换页，页码连续）"
+        @mousedown.prevent
+        @click="paper?.insertPageBreak()"
+      >
+        分页符
+      </button>
+      <button
+        type="button"
+        class="tool"
+        title="在光标所在段落后插入分节符（新起一页，页码从 1 重排）"
+        @mousedown.prevent
+        @click="paper?.insertSectionBreak()"
+      >
+        分节符
+      </button>
+
+      <span class="sep" />
+
       <span class="field comment-field">
         批注
         <input
           v-model="commentDraft"
           type="text"
           placeholder="选中文字后填写"
+          @mousedown="paper?.keepSelection()"
           @keydown.enter.prevent="insertComment"
         />
         <button type="button" @mousedown.prevent @click="insertComment">添加</button>
@@ -277,7 +322,7 @@ onMounted(() => {
             </li>
             <li>
               <code>@</code> 抬头（取消首行缩进）；<code>&gt;&gt;</code>
-              落款（右对齐）
+              落款（右对齐）；<code>%</code> 附件标记（黑体、顶格、段后 1 行）
             </li>
             <li>
               <code>-</code> 列表段落；<code>!</code> 列表标题；<code>---</code>
@@ -409,6 +454,44 @@ button.primary {
 button.primary:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.styles {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid #e4e6ea;
+  background: #f6f7f9;
+}
+
+.styles-label {
+  margin-right: 2px;
+  color: #8a9099;
+  font-size: 12px;
+}
+
+/* 按钮文字由 inline style 按各条样式自己的字体字号渲染（见 chipStyle） */
+.style-chip {
+  padding: 5px 12px;
+  border: 1px solid #d5d9df;
+  border-radius: 5px;
+  background: #fff;
+  color: #33383f;
+  line-height: 1.35;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.style-chip:hover {
+  border-color: #a9b0b8;
+}
+
+.style-chip.is-on {
+  border-color: #1f6feb;
+  background: #e8f0fe;
+  box-shadow: inset 0 0 0 1px #1f6feb;
 }
 
 .toolbar {

@@ -6,10 +6,16 @@
  * w:rFonts 的 ascii / eastAsia 分工。这是预览能和 docx 对上的基础。
  */
 
-import { STYLE_KEYS } from '../spec'
+import { STYLE_KEYS, lineSpacePt } from '../spec'
 import type { Spec, TextStyleSpec } from '../spec'
 
 export const WTP = 'wtp'
+
+/**
+ * 焦点离开正文时给选区「续命」用的高亮名（CSS Custom Highlight API）。
+ * 名字在这里定义，注册与清除在编辑层做，两边必须用同一个。
+ */
+export const KEEP_SELECTION_HIGHLIGHT = `${WTP}-keep-selection`
 
 function quote(name: string): string {
   return `"${name.replace(/"/g, '')}"`
@@ -61,7 +67,8 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
       `.${ns}-${kind} { font-family: ${fontStack(s.ascii, s.eastAsia)}; font-size: ${s.sizePt}pt; ` +
         `font-weight: ${s.bold ? 'bold' : 'normal'}; text-align: ${textAlignOf(s)}; ` +
         `line-height: ${lineHeightOf(s)}; text-indent: ${s.firstLineChars > 0 ? `${s.firstLineChars}em` : '0'}; ` +
-        `margin: ${s.spaceBeforeLines * s.linePt}pt 0 ${s.spaceAfterLines * s.linePt}pt; ` +
+        // 段前/段后按文档网格行高换算（lineSpacePt），与 docx 的 w:beforeLines 同源
+        `margin: ${lineSpacePt(s.spaceBeforeLines, spec)}pt 0 ${lineSpacePt(s.spaceAfterLines, spec)}pt; ` +
         `white-space: pre-wrap; }`,
     )
   }
@@ -73,6 +80,10 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     `.${ns}-comment { background: rgba(255, 213, 0, 0.28); border-bottom: 1px dotted #a6791d; }`,
     // 侧栏里选中某条批注时，正文里的锚点加深，方便对上位置
     `.${ns}-comment-active { background: rgba(255, 213, 0, 0.62); }`,
+    // 点批注输入框或工具栏时焦点离开正文，浏览器会把原生选区收起来 ——
+    // 选区看起来就「丢了」。这里用 Custom Highlight 单独画一层：不动 DOM，
+    // 因此不会碰坏正在编辑的内容，选区回到正文时再撤掉。
+    `::highlight(${KEEP_SELECTION_HIGHLIGHT}) { background: rgba(31, 111, 235, 0.32); }`,
   )
 
   return out.join('\n')

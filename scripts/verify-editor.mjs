@@ -402,7 +402,9 @@ try {
   console.log('\n=== H. 批注：选中 → 写内容 → 侧栏出现 ===')
   await openApp()
   const commentsBefore = (await getModel()).comments.length
-  const sidebarBefore = await page.evaluate(() => document.querySelectorAll('.wtp-comments li button').length)
+  const sidebarBefore = await page.evaluate(
+    () => document.querySelectorAll('.wtp-comments li .wtp-comment-item').length,
+  )
   const anchor = await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
   ok('选中了被批注的文字', anchor === '债务人爱康光', anchor ?? '未选中')
   // 选区要变成「记录」：点进批注框以后实时选区就只剩输入框里的空选区了
@@ -416,7 +418,7 @@ try {
   const last = commented.comments[commented.comments.length - 1]
   ok('批注内容与作者写对了', last && last.text === '这是一条实测批注', JSON.stringify(last))
   const sidebarAfter = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('.wtp-comments li button')).map((b) => ({
+    Array.from(document.querySelectorAll('.wtp-comments li .wtp-comment-item')).map((b) => ({
       scope: (b.querySelector('.wtp-comment-scope')?.textContent ?? '').trim(),
       text: (b.querySelector('.wtp-comment-text')?.textContent ?? '').trim(),
     })),
@@ -438,6 +440,8 @@ try {
   await checkNoOverflow('H 加批注后')
 
   /* ------------------------------------------------------------------ */
+  // 紧跟在 H 后面：这一节要证明「导出用的是界面上改出来的模型」，
+  // 所以必须和刚才那些编辑处在同一次页面加载里（每次 openApp 都会重新解析源码）。
   console.log('\n=== I. 导出用的模型就是界面上改出来的 ===')
   const finalModel = await getModel()
   const hasEdits =
@@ -449,6 +453,182 @@ try {
   const dumpPath = join(tmpDir, 'editor-model.json')
   writeFileSync(dumpPath, JSON.stringify(finalModel, null, 2), 'utf8')
   console.log(`  ok   最终模型已导出：${dumpPath}`)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== H2. 点批注框时选中的底色还在（Custom Highlight 续命）===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
+  await page.waitForTimeout(80)
+  await page.click('.comment-field input')
+  await page.waitForTimeout(120)
+  const keptHighlight = await page.evaluate(() => {
+    const registry = typeof CSS !== 'undefined' ? CSS.highlights : undefined
+    if (!registry) return 'unsupported'
+    return registry.has('wtp-keep-selection')
+  })
+  ok(
+    '焦点进了批注框，选区高亮仍在',
+    keptHighlight === true,
+    keptHighlight === 'unsupported'
+      ? '浏览器不支持 CSS Custom Highlight API'
+      : `实际 ${keptHighlight}`,
+  )
+  // 加完批注应当收掉这层高亮，免得下一条批注悄悄复用旧选区
+  await page.fill('.comment-field input', '续命高亮用批注')
+  await page.click('.comment-field button')
+  await page.waitForTimeout(200)
+  const dropped = await page.evaluate(() =>
+    typeof CSS !== 'undefined' && CSS.highlights ? CSS.highlights.has('wtp-keep-selection') : false,
+  )
+  eq('加完批注后高亮收掉', dropped, false)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== H3. 批注能改、能删 ===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
+  await page.waitForTimeout(80)
+  await page.click('.comment-field input')
+  await page.fill('.comment-field input', '待改写')
+  await page.click('.comment-field button')
+  await page.waitForTimeout(200)
+  const seeded = await getModel()
+  const targetId = seeded.comments[seeded.comments.length - 1].id
+  const row = `.wtp-comments li[data-comment-id="${targetId}"]`
+
+  await page.click(`${row} .wtp-comment-actions button:nth-child(1)`)
+  await page.waitForTimeout(80)
+  ok('编辑态出现了输入框', (await page.locator(`${row} .wtp-comment-edit input`).count()) === 1)
+  await page.fill(`${row} .wtp-comment-edit input`, '已改写')
+  await page.click(`${row} .wtp-comment-edit button.primary`)
+  await page.waitForTimeout(200)
+  const edited = (await getModel()).comments.find((c) => c.id === targetId)
+  eq('模型里的批注内容被改写', edited?.text, '已改写')
+  const sidebarText = await page.evaluate(
+    (id) =>
+      document
+        .querySelector(`.wtp-comments li[data-comment-id="${id}"] .wtp-comment-text`)
+        ?.textContent?.trim() ?? '',
+    targetId,
+  )
+  eq('侧栏显示的是改写后的内容', sidebarText, '已改写')
+
+  await page.click(`${row} .wtp-comment-actions button:nth-child(2)`)
+  await page.waitForTimeout(200)
+  const afterDelete = await getModel()
+  eq('批注从模型里删掉', afterDelete.comments.some((c) => c.id === targetId), false)
+  const anchorsLeft = await page.evaluate(() => document.querySelectorAll('.wtp-comment').length)
+  eq('正文锚点也一起清掉', anchorsLeft, afterDelete.comments.length)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== H4. 分页符 / 分节符：按钮插入，页间看得见 ===')
+  await openApp()
+  const breaksBefore = await page.evaluate(() => ({
+    pages: document.querySelectorAll('.wtp-page').length,
+    marks: document.querySelectorAll('.wtp-break').length,
+  }))
+  eq('初始样本里有 1 个分节符标记', breaksBefore.marks, 1)
+
+  await page.evaluate(() => window.__wtpTest.setCaret('苏州市公安局', 0))
+  await page.click('button.tool[title^="在光标所在段落后插入分页符"]')
+  await page.waitForTimeout(250)
+  const withPage = await getModel()
+  eq('模型里多了一个分页符', withPage.blocks.filter((b) => b.t === 'pageBreak').length, 1)
+  const pageMarks = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.wtp-break')).map((el) => el.textContent.trim()),
+  )
+  ok('页间出现了「分页符」标记', pageMarks.some((t) => t.includes('分页符')), JSON.stringify(pageMarks))
+  const pagesAfterPage = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  eq('分页符把内容推到了新一页', pagesAfterPage, breaksBefore.pages + 1)
+
+  // 点标记上的 × 删掉刚插的分页符
+  await page.click('.wtp-break .wtp-break-del')
+  await page.waitForTimeout(250)
+  const afterDel = await getModel()
+  eq('点 × 删掉了分页符', afterDel.blocks.filter((b) => b.t === 'pageBreak').length, 0)
+  const pagesAfterDel = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  eq('页数回到插入前', pagesAfterDel, breaksBefore.pages)
+
+  // 再插一个分节符（样本里本来还有一个 `---`，加完共 2 个）
+  await page.evaluate(() => window.__wtpTest.setCaret('苏州市公安局', 0))
+  await page.click('button.tool[title^="在光标所在段落后插入分节符"]')
+  await page.waitForTimeout(250)
+  const withSection = await getModel()
+  eq('模型里多了一个分节符', withSection.blocks.filter((b) => b.t === 'sectionBreak').length, 2)
+  const sectionMarks = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.wtp-break')).map((el) => el.textContent.trim()),
+  )
+  ok(
+    '页间出现了「分节符」标记',
+    sectionMarks.some((t) => t.includes('分节符')),
+    JSON.stringify(sectionMarks),
+  )
+  await checkNoOverflow('H4 插换页标记后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== H5. 分页符 + 分节符连在一起：两枚标记都要看得见 ===')
+  await openApp()
+  const beforeBoth = await page.evaluate(
+    () => document.querySelectorAll('.wtp-page').length,
+  )
+  await page.evaluate(() => window.__wtpTest.setCaret('苏州市公安局', 0))
+  await page.click('button.tool[title^="在光标所在段落后插入分页符"]')
+  await page.waitForTimeout(200)
+  await page.evaluate(() => window.__wtpTest.setCaret('苏州市公安局', 0))
+  await page.click('button.tool[title^="在光标所在段落后插入分节符"]')
+  await page.waitForTimeout(300)
+
+  const bothModel = await getModel()
+  eq(
+    '模型里分页符/分节符各就各位',
+    `${bothModel.blocks.filter((b) => b.t === 'pageBreak').length}/${
+      bothModel.blocks.filter((b) => b.t === 'sectionBreak').length
+    }`,
+    '1/2',
+  )
+  const both = await page.evaluate(() => {
+    const kids = Array.from(document.querySelector('.wtp-pages').children)
+    const marks = kids.filter((el) => el.classList.contains('wtp-break'))
+    return {
+      texts: marks.map((el) => el.textContent.trim()),
+      adjacent: kids.some(
+        (el, i) =>
+          el.classList.contains('wtp-break') && kids[i + 1]?.classList.contains('wtp-break'),
+      ),
+      pages: kids.filter((el) => el.classList.contains('wtp-page')).length,
+    }
+  })
+  eq('三枚标记都画出来了（原有 1 个分节符 + 新增 2 枚）', both.texts.length, 3)
+  eq(
+    '文案里分页符 1 枚、分节符 2 枚',
+    `${both.texts.filter((t) => t.includes('分页符')).length}/${
+      both.texts.filter((t) => t.includes('分节符')).length
+    }`,
+    '1/2',
+  )
+  ok('新增的两枚挨在一起（不会被吞掉一枚）', both.adjacent)
+  eq('换页只推进一页 —— 与 Word 实测一致', both.pages, beforeBoth + 1)
+  await checkNoOverflow('H5 两枚标记连在一起后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== H6. 文末插分节符：Word 会多留一张空白页 ===')
+  await openApp()
+  const beforeTail = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('2026年9月12日'))
+  await page.click('button.tool[title^="在光标所在段落后插入分节符"]')
+  await page.waitForTimeout(300)
+  const tail = await page.evaluate(() => {
+    const pages = Array.from(document.querySelectorAll('.wtp-page'))
+    const last = pages[pages.length - 1]
+    return {
+      pages: pages.length,
+      lastFragments: last ? last.querySelectorAll('[data-block-id]').length : -1,
+      lastNumber: (last?.querySelector('.wtp-page-number')?.textContent ?? '').trim(),
+    }
+  })
+  eq('文末分节符多留了一张空白页', tail.pages, beforeTail + 1)
+  eq('最后一张确实没有片段', tail.lastFragments, 0)
+  eq('空白页页码重排为 1', tail.lastNumber, '1')
+  await checkNoOverflow('H6 文末分节符后')
 } finally {
   await browser?.close()
   await server.close()

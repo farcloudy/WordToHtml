@@ -326,6 +326,42 @@ export function replyComment(
   return id
 }
 
+/** 改写某条批注的内容。作者与时间保持原样（改的是内容，不是“谁在什么时候说的”）。 */
+export function updateComment(doc: DocModel, commentId: number, text: string): boolean {
+  const target = doc.comments.find((c) => c.id === commentId)
+  if (!target) return false
+  target.text = text
+  return true
+}
+
+/**
+ * 在 blockId 之后插入一个分页符或分节符，返回新块的 id。
+ * blockId 找不到（或没给）时追加到文末。
+ */
+export function insertBreakAfter(
+  doc: DocModel,
+  blockId: string | undefined,
+  kind: 'page' | 'section',
+): string {
+  const found = blockId === undefined ? -1 : doc.blocks.findIndex((b) => b.id === blockId)
+  const at = found < 0 ? doc.blocks.length : found + 1
+  const block: Block =
+    kind === 'page'
+      ? { t: 'pageBreak', id: nextBlockId('pg') }
+      : { t: 'sectionBreak', id: nextBlockId('s'), restartNumbering: true }
+  doc.blocks.splice(at, 0, block)
+  return block.id
+}
+
+/** 删掉一个分页符/分节符。文字块不归它管（那条路是 removeBlock / 退格合并）。 */
+export function removeBreak(doc: DocModel, blockId: string): boolean {
+  const index = doc.blocks.findIndex((b) => b.id === blockId)
+  const block = doc.blocks[index]
+  if (index < 0 || !block || block.t === 'textBlock') return false
+  doc.blocks.splice(index, 1)
+  return true
+}
+
 /** 删除整条批注及其锚点（父批注连同回复一起删） */
 export function removeComment(doc: DocModel, commentId: number): void {
   const doomed = new Set<number>([commentId])
@@ -353,7 +389,7 @@ export function removeComment(doc: DocModel, commentId: number): void {
 export function cloneDoc(doc: DocModel): DocModel {
   return {
     blocks: doc.blocks.map((block): Block => {
-      if (block.t === 'sectionBreak') return { ...block }
+      if (block.t !== 'textBlock') return { ...block }
       return {
         t: 'textBlock',
         id: block.id,
