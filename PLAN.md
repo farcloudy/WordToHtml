@@ -1,4 +1,4 @@
-# WordToHtml 编辑器大修工作计划（W2–W5）
+# WordToHtml 编辑器大修工作计划（W3–W5）
 
 > **这份文件是写给「下一个 session」的。** 读完它就应该能直接开工，不必回头翻对话记录。
 >
@@ -13,11 +13,34 @@
 
 ## 0. 工作方式（硬性，先读这段）
 
-**调度方式**：由主 session 充当调度与集成，不自己顺序做完。用户已明确授权：
+**调度方式**：由主 session 充当调度与集成，不自己顺序做完：每波**先派实现代理 → 回来再派独立验收代理**，
+验收过了才 `git commit`，然后才进下一波。
 
-- 每波**先派实现代理**（一个代理做一波；同一波内若文件互斥才考虑并行，见下），
-- 回来后**再派一个独立验收代理**，只允许读文件 + 跑命令，**不许改文件**；
-- 验收过了才 `git commit`，然后才进下一波。
+> **2026-09-13 改：代理不再是 subagent，改成独立的 headless CLI 进程。**
+>
+> 原因见第 9 节第 1 条：宿主 TUI 会崩在「大块输出渲进 TUI」上，而 subagent 的报告走的正是
+> `<task-notification>` → 渲染进主 session 这条路径（三次崩溃全部落在报告落地那一刻）。
+> headless 进程没有 TUI，把 stdout 重定向到文件之后，进主 session 的只有 shell 工具那几行摘要。
+>
+> ```
+> qwen -p "<任务书>" --model <与主 session 同一个模型> --approval-mode auto-edit > .qwen/tmp/wX-impl.log 2>&1
+> ```
+>
+> - **模型必须显式 `--model` 钉死**：实测不带这个参数时，子进程自己挑了个快模型（`deepseek-flash`），
+>   实现质量会因此完全不受控。
+> - 任务书里固定要求：**结论写进 `.qwen/tmp/wX-impl-result.md`（≤ 40 行）**，细节与长日志留在
+>   `wX-impl.log`；主 session 只读那个结果文件，需要细节再 grep 日志。
+> - `--approval-mode auto-edit` 实测可以无人值守地写文件（已跑通）。
+> - **验收代理**默认也用 `auto-edit`（它常需要自己写临时脚本，例如 playwright 断言），但任务书里必须
+>   限定「只许在 `.qwen/tmp/` 下新建文件，仓库内任何文件都不许改」，并且**验收一跑完主 session 立刻
+>   `git status --short` 复核**：只要有一个仓库内文件被动过，这次验收作废。
+>   若这一轮验收不需要自写脚本，改用 `--approval-mode plan` 更省心 —— 实测它是硬闸门：写操作被拦在
+>   执行前，当轮工具表里连 `write_file` / `Edit` 都没有，而且不会挂住（写完「待批准方案」就退出）。
+> - 可选护栏：`--max-session-turns N`（超限退出码 53）、`--max-wall-time`、`--max-tool-calls`（预算类退出码 55）。
+> - 子进程启动会打一条「MCP server(s) failed to start」（那三个 `qwen-mm-plugins-*` 起不来），
+>   **属正常**，内置工具照常可用，不要去修它。
+> - 日志是 UTF-8：**用 `read_file` 看，不要用 PowerShell 的 `Get-Content`**（默认 GBK，会花屏）。
+> - 可以后台跑（`is_background`），但 stdout 必须重定向到文件 —— 完成通知有可能带上输出尾部。
 
 **为什么并行度低**：这个仓库的功能横切面很集中 —— 工具栏在 `src/App.vue`，编辑手感与分页渲染在
 `src/components/WordPaper.vue`（约 1300 行），模型/渲染/导出又在 `src/lib/*` 横穿。
@@ -28,13 +51,16 @@
 1. 同步扩 `scripts/` 下对应的验收脚本（这是本仓库的既有规矩：每一条功能都带断言，见 README 的验收表）；
 2. 收尾必须跑 `npm run type-check` 与相关 `npm run verify:pX`，**全绿才回报**；
 3. **不要 commit**（提交由主 session 在验收通过后做）；
-4. 报告要如实列出「没做到 / 不确定」的部分，不许美化。
+4. **结论单独写进 `.qwen/tmp/wX-impl-result.md`（≤ 40 行）**：改了哪些文件、跑了哪些命令与结果、
+   「没做到 / 不确定」的部分（不许美化）；细节与完整日志留在 `wX-impl.log` 里，不要灌进结论文件。
 
 **派发验收代理时，必须写进任务里**（这是踩过坑的，见第 9 节）：
-- 只读 + 跑命令，不许改任何文件；发现缺陷只报告不修；
+- 仓库内**任何文件都不许改**（发现缺陷只报告不修）；需要临时脚本只许写在 `.qwen/tmp/` 下；
 - **长命令输出一律重定向到文件**（`%TEMP%\` 或 `.qwen/tmp/`），只回摘要；
-- 最终报告**限长**（建议 ≤ 60 行）；
+- 结论写进 `.qwen/tmp/wX-review.md`（≤ 40 行：逐条主张给「确认 / 被证伪 / 无法验证」+ 一个总判定），
+  证据与命令输出放同一个文件的后面；主 session 只读小窗口，不许把长日志粘进结论；
 - 任务是**证伪**实现者的自报，不是复述。
+- 不允许自行唤起office word。如果要验证docx文件是否正确，可以交给用户，或者自己解压看xml
 
 **提交风格**：中文 commit message，多条改动用 ①②③ 分段讲清「为什么」，结尾标注对应的 issue。
 一次提交装一波。
@@ -69,8 +95,14 @@
   打印隐藏清单齐全（含新增的 `.toast`）且 `!important` 的说法成立；`check-docx.ps1` 仍纯 ASCII
   且无 BOM；`formatAmount` 无精度丢失与溢出；`styles.xml` 的 `WT-ListItem` 无脏值；无越界改动。
   两处非阻断的次要项见第 8 节第 4 条。
+- **W2 已完成并提交**（2026-09-13，`734dc48`，feat: 文件模板（样式与页边距绑定）与双页并排）。
+  它动了 12 个文件、+803/−317：`README.md`、5 个 `scripts/*.mjs`、`src/App.vue`、
+  `src/components/WordPaper.vue`、`src/lib/index.ts`、`src/lib/render/css.ts`、`src/lib/spec.ts`、
+  `src/lib/render/measure.ts`（只有一段注释）。全量 `npm run verify` 五阶段 PASS
+  （`.qwen/tmp/w2-verify.log` 末尾 `VERIFY_EXIT=0`）；独立验收结论**可接受** —— 细节见第 4.5 节，
+  次要项见第 8 节第 5 条。
 
-**W1 提交之后工作区是干净的**。如果你打开这个仓库时看到未提交改动，那它属于某个后续波次的在制品：
+**W2 提交之后工作区是干净的**。如果你打开这个仓库时看到未提交改动，那它属于某个后续波次的在制品：
 先 `git status --short` 与 `git diff` 看清是什么，再决定是「补做验收后提交」还是「接着做」；
 **不要**直接 `git checkout`／`git stash` 丢掉它。
 
@@ -122,7 +154,7 @@
 
 ---
 
-## 4. W2 —— 样式与页边距绑定（两套模板）+ 双页并排
+## 4. W2 —— 样式与页边距绑定（两套模板）+ 双页并排（已完成 2026-09-13）
 
 **需求原文（issue 第 7、4 条）**：
 
@@ -171,6 +203,24 @@ issue 已说清（宽度足够就两页一排），按**自适应**做：容器�
   **并排布局下每页仍不得溢出**；两页并排时页宽/页间距正确；宽度不足时回落到一页一排。
 - `scripts/verify-page-count.mjs`：两套模板都要跟 Word 对页数与分节重编号。
 - 切换模板后页数变化、插入符与选区不丢（沿用 P3 那套断言）。
+
+### 4.5 结论（2026-09-13）
+
+设计原样落地，**没有偏离 4.1–4.3 节**。实际做法与验收：
+
+- 模板键是 `manager`（管理人文件）/ `govDoc`（简易公文格式）；`DOC_TEMPLATES` 是唯一真相源，
+  `MARGIN_PRESETS` 由它派生，公文那组边距数值全仓库只出现一处（`spec.ts`）。
+- 4.2 的两条坑都收住了：`props.spec` 的 watcher 现在是「显式 `clearMeasureCache` → 按旧坐标还原插入符/选区
+  → `force` 重排」，并且**断言了页数确实改变**（管理人文件 4 页 ↔ 简易公文格式 5 页，两套都与 Word 吻合）；
+  `measure.ts` 的缓存注释改成写明「缓存只在同一份规格表下有效」这个不变式（它以前声称「排版宽度全局固定」，
+  换模板之后那句话就不成立了）。
+- 双页并排：`.wtp-pages` 可换行横排 + 页面 `flex: none`（不缩放纸宽）；换页标记 `flex: 0 0 100%` 占满整行。
+  浏览器实测：宽 2200px 两页同排（间距 18px、纸宽未被压缩、页带不横向溢出）、窄 1000px 回落一页一排、
+  打印仍一页一张。
+- 独立验收结论**可接受**：七项定向证伪全过（含验收方自写 46 项 playwright 断言做 `admin→gov→admin→gov`
+  来回切并核对插入符/选区，以及亲自复现 `verify:p2`/`verify:p3`），无功能性缺陷、无越界改动、无放水断言。
+  次要项见第 8 节第 5 条。
+- 提交：`734dc48`。
 
 ---
 
@@ -384,6 +434,13 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    ② **下划线只认 `<u>` 标签与行内 `style.textDecorationLine`**，纯 CSS 类画的下划线不会被
    `readInlines` 读回。当前无害（`render/html.ts` 固定用 `<u>`），但**将来若把下划线的渲染改成 class
    就会静默丢格式** —— 动那处渲染前先回来看这条。
+5. **W2 验收发现的次要项**（非阻断，记在这里免得只躺在提交信息里）：
+   ① `MARGIN_PRESETS` 的 key / label 由 `default` / `gov`、「四边 25mm」改成了 `manager` / `govDoc`、
+   「管理人文件」—— 与 4.1 节「保住已发布的 lib 接口」只部分相符。仓库内没有消费方，且
+   `package.json` 是 `private: true`（并没有真的对外发布过），所以暂不处理；将来真要发版前再定键名。
+   ② `scripts/verify-browser.mjs` 里硬编码了并排间距 `18px`（数值源自 `render/css.ts` 的 `gap`）。
+   ③ 切模板的断言分散在 `verify-browser` 与 `verify-editor` 两个脚本里。
+   ②③ 属整洁度问题，不影响结论。
 
 ---
 
@@ -393,7 +450,9 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    `C:\Users\18082\.qwen\debug\<session-id>.txt` 里有 `[STARTUP] [UNCAUGHT_EXCEPTION] React error #185`，
    栈全在 React 的提交/状态更新路径（`getRootForUpdatedFiber` → `dispatchSetState` → `commitRoot`），
    即终端 UI 层崩，**与内存无关**（32 GB 机器还剩 12 GB 时照样崩）。
-   两次崩溃的时间点分别紧贴「实现代理回报一份极长报告」与「验收日志跑完」，所以**触发路径是大块输出渲进 TUI**。
+   2026-09-13 一天之内崩了三次，每次都紧贴「代理回报一份极长报告」或「长输出灌进 TUI」，所以**触发路径是大块输出渲进 TUI**。
+   完整的排查与可用的规避开关（`ui.shellOutputMaxLines`、`tools.truncateToolOutput*`、别按 `Ctrl+O` 等）
+   记在 `C:\Users\18082\.qwen\qwen-tui-large-output-crash.md`（用户 2026-09-13 选择暂不改设置）。
    对策：让命令输出重定向到文件、代理报告限长（见第 0 节）；**长任务做完后另开新 session**，
    别让一条进程链背着几千万 token 的 transcript 继续往前推。
 2. **命令环境**：Windows 11 + cmd.exe（不是 bash），路径统一用正斜杠；所有命令加 `rtk` 前缀
@@ -418,7 +477,7 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 | 波次 | 内容 | 状态 |
 | --- | --- | --- |
 | W1 | 快捷键组（ctrl+U / ctrl+shift+E / alt+4 / ctrl+P）+ 三种特殊空格；顺带把「列表段落」首行缩进改成 0 | **已完成**（2026-09-13，提交 `4ca96c8`；独立验收结论「可接受」，两处次要项见第 8 节第 4 条） |
-| W2 | 样式与页边距绑定（两套模板）+ 双页并排 | 设计已定稿（第 4 节），未开工 |
+| W2 | 样式与页边距绑定（两套模板）+ 双页并排 | **已完成**（2026-09-13，提交 `734dc48`；独立验收结论「可接受」，次要项见第 8 节第 5 条） |
 | W3 | 查找替换 + 导航窗格 | 需求明确，设计为提案（第 5 节），未开工 |
 | W4a | 表格：模型 + 渲染 + 量测 + 分页 + 导出 + md 语法 | 模型设计已过用户闸门（第 6 节），未开工 |
 | W4b | 表格：编辑交互 | 同上，未开工 |
