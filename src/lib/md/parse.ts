@@ -36,6 +36,7 @@
  *   {+文字}           插入修订
  *   {-文字}           删除修订
  *   [[文字|批注内容]]  批注，锚定在「文字」上
+ *   {br}              软换行（Word 的 <w:br/>），零宽、不占字符位
  *   反斜杠 \ 转义上述所有标记字符
  *
  * 行内标记可以互相嵌套，例如 {红|**重点**}、{+**新增且加粗**}。
@@ -161,6 +162,14 @@ function makeRev(kind: 'ins' | 'del', ctx: InlineContext): RevMark {
 
 /** 解析一段花括号指令，返回它产出的 inline 序列 */
 function parseDirective(inner: string, ctx: InlineContext): Inline[] {
+  // {br} = 软换行（Word 的 <w:br/>）。
+  //
+  // 必须排在下面「没有竖线就当成字面量」那一支之前；也刻意不用 `\n` 那种写法 ——
+  // parseInline 的第一条分支是「反斜杠吃掉下一个字符」，`\n` 会被解析成字面量 n，
+  // 想绕开就得在那条通用转义分支之前另开一条特判。花括号指令没有这个坑：
+  // 正文里真想写「{br}」时，escapeText 会把它序列化成 `\{br\}`，不会撞车。
+  if (inner === 'br') return [{ t: 'break' }]
+
   const head = inner[0]
   if (head === '+') {
     return parseInline(inner.slice(1), { ...ctx, rev: makeRev('ins', ctx) })

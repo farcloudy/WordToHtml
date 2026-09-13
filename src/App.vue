@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { Ref } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
@@ -38,6 +39,15 @@ const SAMPLE = [
   '### 机器设备',
   '',
   '债务人申报的生产设备共47台（套），管理人已现场清点，{红|其中3台因搬迁灭失}[[其中3台|灭失设备的名称与型号需另行说明]]，其余设备存放于厂区内。',
+  '',
+  ':::table minLines=2',
+  '> 单位：元',
+  '| 设备名称 | 数量 | 账面原值 |',
+  '| 数控加工中心 | 6 | 1,860,000.00 |',
+  '| 注塑机{br}（含配套模具） | 11 | 2,340,000.00 |',
+  '| 检测仪器 | 9 | 415,000.00 |',
+  '< 注：上列账面原值取自固定资产明细账，未经审计',
+  ':::',
   '',
   '关于对外投资部分，债务人申报其持有苏州爱康新材料有限公司30%股权、苏州爱康智能装备有限公司18%股权以及江苏爱康光电研究所有限公司10%股权。经调取市场监管部门登记信息核对，上述三家公司均处于存续状态，其中苏州爱康新材料有限公司已于2025年8月被列入经营异常名录，苏州爱康智能装备有限公司的注册资本尚未实缴到位。管理人已分别向上述三家公司发出书面通知，要求其提供最近三年经审计的财务报表、公司章程、股东会决议以及股权质押情况说明；截至本说明出具之日，仅苏州爱康智能装备有限公司回函表示正在整理资料，其余两家公司未予回复。鉴于股权价值评估须以财务报表为基础，管理人拟在收齐上述材料后另行委托评估机构对股权价值进行评估，评估结论将作为后续财产变价方案的依据。此外，债务人陈述其曾于2024年6月与第三方签订股权转让框架协议，约定转让所持苏州爱康新材料有限公司全部股权，因受让方未按期支付首期款，该协议已于2025年3月解除，相关违约金债权是否已实际发生，管理人正在进一步核查。另据债务人陈述，其于2023年以设备融资租赁方式取得生产设备11台（套），租赁期限五年，截至本说明出具之日尚有租金未付，出租人已向管理人申报债权，管理人正在对该笔融资租赁的性质进行审查，即认定为融资租赁债权抑或取回权，将直接影响该批设备是否纳入债务人财产范围。关于应收账款，债务人账面记载的应收账款共37笔，金额合计人民币2860万元，其中账龄超过三年的有14笔；管理人已向全部债务人发出催收通知，截至本说明出具之日收到回函9份，回款人民币118万元，其余款项管理人将继续跟进催收。此外，管理人于2026年7月10日向全体已知债权人发出债权申报通知，申报期限至2026年8月25日止；截至本说明出具之日，共收到债权申报43笔，申报金额合计人民币1.14亿元，管理人已完成初步审查38笔，其中确认32笔、不予确认2笔、暂缓确认4笔。对于暂缓确认的债权，管理人的主要考虑是其担保物权是否已经依法设立并办理登记，以及申报人所主张的利息计算标准是否符合合同约定与法律规定，管理人将在补充核查后另行出具审查意见。同时，管理人对债务人涉诉及执行情况进行了梳理，债务人作为被告的民事诉讼案件共计6件，涉案金额约人民币3200万元，其中2件已经一审判决、1件处于二审阶段、3件尚未开庭；债务人作为被执行人的执行案件共计4件，执行标的合计约人民币900万元，管理人已向各执行法院提交了中止执行的申请。上述诉讼与执行情况可能对债务人财产范围及债权数额产生影响，管理人将持续跟进并及时向你单位报告。',
   '',
@@ -127,15 +137,40 @@ const previewPane = ref<HTMLElement | null>(null)
 const searchPanel = ref<HTMLElement | null>(null)
 /** 拖动后的位置（相对预览窗格）。null = 还没拖过，贴右上角 */
 const panelPos = ref<{ x: number; y: number } | null>(null)
-/** 拖动起点：指针相对面板左上角的偏移，保证「抓住哪儿就从哪儿拖」 */
-let dragOffset: { x: number; y: number } | null = null
 
-/** 未拖过时贴右上角；两个分支给同一组键，免得推断出带 undefined 的联合类型 */
-const searchPanelStyle = computed<Record<string, string>>(() => {
-  const pos = panelPos.value
-  if (!pos) return { right: '12px', left: 'auto', top: '12px' }
+/** 「插入表格」面板打开时的默认规格（与 WordPaper 侧的占位默认一致） */
+const TABLE_ROWS_DEFAULT = 2
+const TABLE_COLS_DEFAULT = 3
+
+/**
+ * 「插入表格」面板：行数、列数由用户选，插进去的空表按这个规格生成。
+ * 打开时回到默认值，免得上次调的规格在下次插入时被当成默认。
+ */
+const tablePanel = ref<HTMLElement | null>(null)
+const tablePanelPos = ref<{ x: number; y: number } | null>(null)
+const tablePanelOpen = ref(false)
+const tableRows = ref(TABLE_ROWS_DEFAULT)
+const tableCols = ref(TABLE_COLS_DEFAULT)
+const tableRowsInput = ref<HTMLInputElement | null>(null)
+
+/**
+ * 未拖过时用各自给的贴边位置；两个分支给同一组键，免得推断出带 undefined 的联合类型。
+ * 插入表格面板默认贴左上、查找面板贴右上 —— 两个浮层同时开着也不会叠在一起。
+ */
+function floatingPanelStyle(
+  pos: { x: number; y: number } | null,
+  fallback: Record<string, string>,
+): Record<string, string> {
+  if (!pos) return fallback
   return { left: `${pos.x}px`, top: `${pos.y}px`, right: 'auto' }
-})
+}
+
+const searchPanelStyle = computed(() =>
+  floatingPanelStyle(panelPos.value, { right: '12px', left: 'auto', top: '12px' }),
+)
+const tablePanelStyle = computed(() =>
+  floatingPanelStyle(tablePanelPos.value, { right: 'auto', left: '12px', top: '12px' }),
+)
 
 const specOverride = computed<DeepPartial<Spec>>(() => {
   const template = DOC_TEMPLATES.find((t) => t.key === templateKey.value) ?? DOC_TEMPLATES[0]
@@ -265,37 +300,90 @@ function replaceAllMatches(): void {
   paper.value?.replaceAll(searchReplace.value)
 }
 
-function startSearchDrag(event: PointerEvent): void {
+/** 打开「插入表格」面板：每次打开都回到默认规格，并把焦点交给行数框 */
+async function openTablePanel(): Promise<void> {
+  tableRows.value = TABLE_ROWS_DEFAULT
+  tableCols.value = TABLE_COLS_DEFAULT
+  tablePanelOpen.value = true
+  tablePanelPos.value = null
+  // 焦点进面板：数字立刻能敲，Esc 也才有接收者（Esc 只挂在面板的输入框上）。
+  // 焦点离开正文不会丢掉插入点 —— 组件那边 lastCaret 记着上一次的落点。
+  await nextTick()
+  tableRowsInput.value?.focus()
+  tableRowsInput.value?.select()
+}
+
+/** 取消：关面板并把焦点还给版面，接着敲字不用再点一次 */
+function cancelTablePanel(): void {
+  tablePanelOpen.value = false
+  tablePanelPos.value = null
+  void nextTick(() => {
+    document.querySelector<HTMLElement>('.wtp-content[contenteditable="true"]')?.focus()
+  })
+}
+
+/** 插完就关。不还焦点 —— 插入本身已经把插入符放进新表的第一格了 */
+function closeTablePanel(): void {
+  tablePanelOpen.value = false
+  tablePanelPos.value = null
+}
+
+/** 按面板里选的行列数插入空表；越界值由 WordPaper 那边夹回合法区间 */
+function confirmInsertTable(): void {
+  paper.value?.insertTable(tableRows.value, tableCols.value)
+  closeTablePanel()
+}
+
+/** 正在拖的面板（同一时刻只会有一个）与指针相对它左上角的偏移，保证「抓住哪儿就从哪儿拖」 */
+let dragState: {
+  panel: HTMLElement
+  pos: Ref<{ x: number; y: number } | null>
+  offset: { x: number; y: number }
+} | null = null
+
+/** 两个浮动面板共用一套拖动：起始函数只管把「自己的元素与位置引用」交进来 */
+function beginPanelDrag(
+  panel: HTMLElement | null,
+  pos: Ref<{ x: number; y: number } | null>,
+  event: PointerEvent,
+): void {
   const pane = previewPane.value
-  const panel = searchPanel.value
   if (!pane || !panel) return
   const paneRect = pane.getBoundingClientRect()
-  const panelRect = panel.getBoundingClientRect()
-  dragOffset = { x: event.clientX - panelRect.left, y: event.clientY - panelRect.top }
+  const rect = panel.getBoundingClientRect()
   // 由 right 定位切成 left 定位：不先钉住，第一下 pointermove 会跳半个面板宽
-  panelPos.value = { x: panelRect.left - paneRect.left, y: panelRect.top - paneRect.top }
-  window.addEventListener('pointermove', onSearchDrag)
-  window.addEventListener('pointerup', endSearchDrag)
+  pos.value = { x: rect.left - paneRect.left, y: rect.top - paneRect.top }
+  dragState = { panel, pos, offset: { x: event.clientX - rect.left, y: event.clientY - rect.top } }
+  window.addEventListener('pointermove', onPanelDrag)
+  window.addEventListener('pointerup', endPanelDrag)
   event.preventDefault()
 }
 
-function onSearchDrag(event: PointerEvent): void {
+function startSearchDrag(event: PointerEvent): void {
+  beginPanelDrag(searchPanel.value, panelPos, event)
+}
+
+function startTableDrag(event: PointerEvent): void {
+  beginPanelDrag(tablePanel.value, tablePanelPos, event)
+}
+
+function onPanelDrag(event: PointerEvent): void {
   const pane = previewPane.value
-  const panel = searchPanel.value
-  if (!pane || !panel || !dragOffset) return
+  const drag = dragState
+  if (!pane || !drag) return
   const paneRect = pane.getBoundingClientRect()
-  const maxX = Math.max(0, paneRect.width - panel.offsetWidth)
-  const maxY = Math.max(0, paneRect.height - panel.offsetHeight)
-  panelPos.value = {
-    x: Math.min(Math.max(0, event.clientX - paneRect.left - dragOffset.x), maxX),
-    y: Math.min(Math.max(0, event.clientY - paneRect.top - dragOffset.y), maxY),
+  const maxX = Math.max(0, paneRect.width - drag.panel.offsetWidth)
+  const maxY = Math.max(0, paneRect.height - drag.panel.offsetHeight)
+  drag.pos.value = {
+    x: Math.min(Math.max(0, event.clientX - paneRect.left - drag.offset.x), maxX),
+    y: Math.min(Math.max(0, event.clientY - paneRect.top - drag.offset.y), maxY),
   }
 }
 
-function endSearchDrag(): void {
-  dragOffset = null
-  window.removeEventListener('pointermove', onSearchDrag)
-  window.removeEventListener('pointerup', endSearchDrag)
+function endPanelDrag(): void {
+  dragState = null
+  window.removeEventListener('pointermove', onPanelDrag)
+  window.removeEventListener('pointerup', endPanelDrag)
 }
 
 /** 切到源码视图前，把当前模型序列化成 md —— 所见即所得改完总要看得到「它长什么样」 */
@@ -304,6 +392,8 @@ function switchMode(next: 'edit' | 'source'): void {
   if (next === 'source') {
     // 源码视图用浏览器自带的查找；面板留着会和 props.source 的重新解析打架
     if (searchOpen.value) closeSearch()
+    // 插入表格面板同理：它在只读预览上没有任何意义，还会盖住版面
+    if (tablePanelOpen.value) closeTablePanel()
     source.value = paper.value ? toMd(paper.value.getModel()) : source.value
     mdView.value = source.value
   }
@@ -340,7 +430,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (toastTimer !== null) clearTimeout(toastTimer)
-  endSearchDrag()
+  endPanelDrag()
 })
 </script>
 
@@ -488,6 +578,15 @@ onBeforeUnmount(() => {
       >
         分节符
       </button>
+      <button
+        type="button"
+        class="tool"
+        title="在光标所在段落后插入一张空表格（行数、列数可选）"
+        @mousedown.prevent
+        @click="openTablePanel"
+      >
+        插入表格
+      </button>
 
       <span class="sep" />
 
@@ -559,6 +658,8 @@ onBeforeUnmount(() => {
               改色（中文色名或 <code>#RRGGBB</code>）
             </li>
             <li><code>{+新增}</code> 插入修订；<code>{-删除}</code> 删除修订</li>
+            <li><code>{br}</code> 软换行（单元格里用；零宽、不占字符位）</li>
+            <li><code>:::table … :::</code> 表格围栏块（<code>&gt;</code> 单位行 / <code>&lt;</code> 附注行 / <code>|</code> 数据行）</li>
             <li><code>[[文字|批注内容]]</code> 批注</li>
             <li>一个非空行就是一段；空行只作分隔，不产出内容</li>
           </ul>
@@ -658,6 +759,56 @@ onBeforeUnmount(() => {
                 />
                 当前选中的文本
               </label>
+            </div>
+          </div>
+        </div>
+
+        <!--
+          「插入表格」规格面板：与查找替换面板同一套浮动卡片（可拖、×/Esc 关）。
+          工具栏那个按钮只负责开它 —— 行数列数在这里定，空表按这个规格生成。
+        -->
+        <div v-if="tablePanelOpen" ref="tablePanel" class="table-panel" :style="tablePanelStyle">
+          <div class="table-panel-head" @pointerdown="startTableDrag">
+            <span class="table-panel-title">插入表格</span>
+            <button
+              type="button"
+              class="table-panel-close"
+              title="关闭（Esc）"
+              @pointerdown.stop
+              @click="cancelTablePanel"
+            >
+              ×
+            </button>
+          </div>
+          <div class="table-panel-body">
+            <label class="table-panel-row">
+              <span>行数</span>
+              <input
+                ref="tableRowsInput"
+                v-model.number="tableRows"
+                type="number"
+                min="1"
+                max="30"
+                step="1"
+                @keydown.enter.prevent="confirmInsertTable"
+                @keydown.esc.prevent="cancelTablePanel"
+              />
+            </label>
+            <label class="table-panel-row">
+              <span>列数</span>
+              <input
+                v-model.number="tableCols"
+                type="number"
+                min="1"
+                max="12"
+                step="1"
+                @keydown.enter.prevent="confirmInsertTable"
+                @keydown.esc.prevent="cancelTablePanel"
+              />
+            </label>
+            <div class="table-panel-actions">
+              <button type="button" @mousedown.prevent @click="confirmInsertTable">插入</button>
+              <button type="button" @mousedown.prevent @click="cancelTablePanel">取消</button>
             </div>
           </div>
         </div>
@@ -958,8 +1109,11 @@ button.primary:disabled {
   color: #8a9099;
 }
 
-/* 浮动查找替换面板 */
-.search-panel {
+/* 浮动面板的公共卡片外观与内件：查找替换面板与插入表格面板共用同一套。
+   拆成两套类名而不用一个基类，是为了让「谁是哪个面板」在模板里一眼可辨；
+   样式靠分组选择器共享，不重复声明。 */
+.search-panel,
+.table-panel {
   position: absolute;
   z-index: 12;
   width: 272px;
@@ -970,7 +1124,12 @@ button.primary:disabled {
   font-size: 12px;
   color: #33383f;
 }
-.search-head {
+/* 插入表格面板只有两个数字输入，比查找面板窄 */
+.table-panel {
+  width: 186px;
+}
+.search-head,
+.table-panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -981,10 +1140,12 @@ button.primary:disabled {
   cursor: move;
   user-select: none;
 }
-.search-title {
+.search-title,
+.table-panel-title {
   font-weight: 600;
 }
-.search-close {
+.search-close,
+.table-panel-close {
   padding: 0 4px;
   border: 0;
   background: transparent;
@@ -993,22 +1154,26 @@ button.primary:disabled {
   line-height: 1;
   cursor: pointer;
 }
-.search-body {
+.search-body,
+.table-panel-body {
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 8px 10px 10px;
 }
-.search-row {
+.search-row,
+.table-panel-row {
   display: flex;
   align-items: center;
   gap: 6px;
 }
-.search-row span {
+.search-row span,
+.table-panel-row span {
   flex: 0 0 28px;
   color: #5a5f66;
 }
-.search-row input {
+.search-row input,
+.table-panel-row input {
   flex: 1;
   min-width: 0;
   padding: 3px 6px;
@@ -1029,12 +1194,14 @@ button.primary:disabled {
 .search-error {
   color: #b3261e;
 }
-.search-actions {
+.search-actions,
+.table-panel-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
-.search-actions button {
+.search-actions button,
+.table-panel-actions button {
   padding: 3px 8px;
   border: 1px solid #c8ccd2;
   border-radius: 4px;
@@ -1042,7 +1209,8 @@ button.primary:disabled {
   font: inherit;
   cursor: pointer;
 }
-.search-actions button:hover {
+.search-actions button:hover,
+.table-panel-actions button:hover {
   border-color: #8a9099;
 }
 .search-toggle,
@@ -1153,7 +1321,8 @@ textarea {
   textarea,
   .toast,
   .nav-pane,
-  .search-panel {
+  .search-panel,
+  .table-panel {
     display: none !important;
   }
 

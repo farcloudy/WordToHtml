@@ -181,6 +181,12 @@ function inlineChildren(inlines: readonly Inline[], prefix = ''): ParagraphChild
   }
 
   for (const inline of inlines) {
+    if (inline.t === 'break') {
+      // 软换行：lib 的 TextRun 有 break 字段（见 index.d.ts 的 IRunOptionsBase），
+      // 它会在 <w:r> 里放一个不带属性的 <w:br/>，正是 Word 的软换行（不是分页的 w:br type="page"）。
+      children.push(new TextRun({ break: 1 }))
+      continue
+    }
     if (inline.t === 'commentStart') {
       children.push(new CommentRangeStart(inline.commentId))
       continue

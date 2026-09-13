@@ -10,8 +10,8 @@ import { contentBoxPx, lineSpacePt, ptToPx } from '../spec'
 import type { Spec } from '../spec'
 import { computeNumbering } from '../numbering'
 import type { DocModel } from '../types'
-import { renderInlinesHtml } from './html'
-import type { MeasuredBlock, MeasuredItem } from './paginate'
+import { renderInlinesHtml, renderTableFragment } from './html'
+import type { MeasuredBlock, MeasuredItem, MeasuredTableRow } from './paginate'
 
 interface TextPos {
   node: Text
@@ -148,16 +148,19 @@ function measureElement(
  * （长段落要跑二分找行首，每次 getClientRects 都会触发布局）。
  * 块的排版只取决于「版心宽度 + 本块内容 + 本块样式」，
  * 所以内容没变的块可以直接复用上次的结果，只量改过的那一块。
- * 签名里带上渲出来的 HTML，等于把「文字、加粗、颜色、修订、编号」一起算了进去。
+ * 签名里带上渲出来的 HTML，等于把「文字、加粗、颜色、修订、编号」一起算了进去
+ * —— 表格的签名含**整张表**的 HTML，任一格改动即失效。
  *
  * **缓存只在同一份规格表下有效**：版心宽度由 spec.page.margin 决定，换文件模板（DOC_TEMPLATES）
  * 就会变，而签名里**故意不含宽度与样式值** —— 否则每次敲键都要为每个块序列化一遍 spec。
  * 所以规格表一变就必须 clearMeasureCache，否则会拿旧版心的量测值算分页；
  * 调用点见 WordPaper.vue 里 props.spec 的 watcher（清缓存 → 还原插入符 → force 重排）。
  */
+export type MeasuredCacheValue = MeasuredBlock | MeasuredTableRow[]
+
 export interface MeasureCacheEntry {
   signature: string
-  measured: MeasuredBlock
+  measured: MeasuredCacheValue
 }
 
 export type MeasureCache = Map<string, MeasureCacheEntry>
@@ -195,10 +198,34 @@ export function measureDocument(
     signature: string
   }[] = []
 
+  const pendingTables: {
+    el: HTMLElement
+    id: string
+    signature: string
+  }[] = []
+
   const resolved = new Map<string, MeasuredBlock>()
+  const resolvedTables = new Map<string, MeasuredTableRow[]>()
   const alive = new Set<string>()
 
   for (const block of doc.blocks) {
+    if (block.t === 'table') {
+      // 表格走独立分支：整张表渲进探针，只量每行的实测高（行是原子的，不量 rowStarts）
+      alive.add(block.id)
+      const html = renderTableFragment(block, 0, block.rows.length)
+      const signature = `table\u0000${html}`
+      const cached = cache?.get(block.id)
+      if (cached && cached.signature === signature && Array.isArray(cached.measured)) {
+        resolvedTables.set(block.id, cached.measured)
+        continue
+      }
+      const el = document.createElement('div')
+      el.className = 'wtp-tableFrag'
+      el.innerHTML = html
+      probe.appendChild(el)
+      pendingTables.push({ el, id: block.id, signature })
+      continue
+    }
     if (block.t !== 'textBlock') continue
     alive.add(block.id)
     const prefix = numbering.get(block.id) ?? ''
@@ -211,7 +238,7 @@ export function measureDocument(
     }
 
     const cached = cache?.get(block.id)
-    if (cached && cached.signature === signature) {
+    if (cached && cached.signature === signature && !Array.isArray(cached.measured)) {
       resolved.set(block.id, cached.measured)
       continue
     }
@@ -229,7 +256,7 @@ export function measureDocument(
     }
   }
 
-  if (pending.length > 0) {
+  if (pending.length > 0 || pendingTables.length > 0) {
     root.appendChild(probe)
     // 强制一次布局，后面读 rect 就不会反复触发回流
     void probe.getBoundingClientRect()
@@ -238,6 +265,12 @@ export function measureDocument(
       const measured = measureElement(item.el, spec, item.kind, item.id, item.length)
       resolved.set(item.id, measured)
       cache?.set(item.id, { signature: item.signature, measured })
+    }
+
+    for (const item of pendingTables) {
+      const rows = measureTableRows(item.el, item.id)
+      resolvedTables.set(item.id, rows)
+      cache?.set(item.id, { signature: item.signature, measured: rows })
     }
 
     root.removeChild(probe)
@@ -257,7 +290,18 @@ export function measureDocument(
     if (block.t === 'pageBreak') {
       return [{ t: 'break', blockId: block.id, kind: 'page', restartNumbering: false }]
     }
+    if (block.t === 'table') return resolvedTables.get(block.id) ?? []
     const m = resolved.get(block.id)
     return m ? [m] : []
   })
+}
+
+/** 一张表里每一行的实测高（px）。行序就是 block.rows 的顺序 */
+function measureTableRows(el: HTMLElement, tableId: string): MeasuredTableRow[] {
+  return Array.from(el.querySelectorAll('tr')).map((tr, row) => ({
+    t: 'tableRow' as const,
+    blockId: tableId,
+    row,
+    height: tr.getBoundingClientRect().height,
+  }))
 }

@@ -42,10 +42,12 @@ export type {
 } from './spec'
 
 export {
+  allInlineHolders,
   cellId,
   collectRevisions,
   commentScopes,
   emptyDoc,
+  inlinesText,
   nextBlockId,
   parseCellId,
   plainText,
@@ -53,11 +55,13 @@ export {
 } from './types'
 export type {
   Block,
+  BreakInline,
   CommentDef,
   CommentEndInline,
   CommentStartInline,
   DocModel,
   Inline,
+  InlineHolder,
   PageBreakBlock,
   RevMark,
   SectionBreakBlock,
@@ -76,9 +80,11 @@ export {
   applyFormat,
   blockLength,
   cloneDoc,
+  containerLength,
   deleteRange,
   findBlock,
   findBlockIndex,
+  findContainer,
   insertBreakAfter,
   insertText,
   mergeIntoPrevious,
@@ -95,7 +101,7 @@ export {
   splitBlock,
   updateComment,
 } from './edit/model'
-export type { BlockPoint, EditorSelection } from './edit/model'
+export type { BlockPoint, EditorSelection, InlineContainer } from './edit/model'
 
 export { formatAmount } from './edit/amount'
 
@@ -138,15 +144,16 @@ export {
   buildCss,
   injectCss,
 } from './render/css'
-export { escapeHtml, renderInlinesHtml } from './render/html'
+export { escapeHtml, renderInlinesHtml, renderTableFragment } from './render/html'
 export { clearMeasureCache, measureDocument } from './render/measure'
-export type { MeasureCache, MeasureCacheEntry } from './render/measure'
-export { paginate } from './render/paginate'
+export type { MeasureCache, MeasureCacheEntry, MeasuredCacheValue } from './render/measure'
+export { isTableFragment, paginate } from './render/paginate'
 export type {
   BreakKind,
   MeasuredBlock,
   MeasuredBreak,
   MeasuredItem,
+  MeasuredTableRow,
   PageBreakMark,
   PageFragment,
   PageLayout,

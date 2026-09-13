@@ -662,7 +662,28 @@ try {
   )
   ok('页间出现了「分页符」标记', pageMarks.some((t) => t.includes('分页符')), JSON.stringify(pageMarks))
   const pagesAfterPage = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
-  eq('分页符把内容推到了新一页', pagesAfterPage, breaksBefore.pages + 1)
+  // 页数只可能不变或 +1：分页符后面的内容被迫另起一页，而页尾原来那点余量被吸收掉，
+  // 恰好抵掉一页时总数就不变（这不是缺陷）。所以真正要断言的是「后面的内容确实被推到新页页首」。
+  ok(
+    '插分页符后页数不减少',
+    pagesAfterPage >= breaksBefore.pages,
+    `${breaksBefore.pages} → ${pagesAfterPage}`,
+  )
+  const pushed = await page.evaluate(() => {
+    const frags = Array.from(document.querySelectorAll('.wtp-pages .wtp-content > *'))
+    const first = frags.find((el) => (el.textContent ?? '').includes('我方于2026年9月1日'))
+    if (!first) return null
+    const pageEl = first.closest('.wtp-page')
+    return {
+      isFirstInPage: pageEl ? pageEl.querySelector('.wtp-content > *') === first : false,
+      page: pageEl ? Array.from(document.querySelectorAll('.wtp-page')).indexOf(pageEl) + 1 : -1,
+    }
+  })
+  ok(
+    '分页符把后面的段落推到了新一页的页首',
+    pushed?.isFirstInPage === true && pushed.page > 1,
+    JSON.stringify(pushed),
+  )
 
   // 点标记上的 × 删掉刚插的分页符
   await page.click('.wtp-break .wtp-break-del')
@@ -1094,6 +1115,9 @@ try {
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
   await page.keyboard.press('Control+f')
   await page.waitForSelector('.search-panel', { timeout: 3000 })
+  // 插入表格面板也要一起验：它和查找面板一样是浮层，打印时同样不该出现
+  await page.locator('button.tool[title^="在光标所在段落后插入一张空表格"]').click()
+  await page.waitForSelector('.table-panel', { timeout: 3000 })
 
   /** 打印媒体下这些选择器的 display（元素不存在时给 'missing'，别把「没有」当成「隐藏了」） */
   const printDisplay = () =>
@@ -1110,6 +1134,7 @@ try {
         '.wtp-break',
         '.nav-pane',
         '.search-panel',
+        '.table-panel',
       ]
       const out = {}
       for (const sel of sels) {
@@ -1149,6 +1174,8 @@ try {
 
   await page.emulateMedia({ media: 'print' })
   const printEdit = await printDisplay()
+  // .table-panel 只在编辑态的打印里断言：切到源码视图时面板会被主动关掉（它在那儿没有意义），
+  // 那时元素不存在，给的是 'missing' 而不是 'none'，下面那个源码视图的循环因此不带它
   for (const sel of [
     '.bar',
     '.styles',
@@ -1158,6 +1185,7 @@ try {
     '.wtp-break',
     '.nav-pane',
     '.search-panel',
+    '.table-panel',
   ]) {
     eq(`打印时隐藏 ${sel}`, printEdit[sel], 'none')
   }
@@ -1476,6 +1504,169 @@ try {
   await page.locator('.bar button', { hasText: '导航' }).click()
   await page.waitForTimeout(250)
   eq('顶栏的导航开关把它放回来', await page.locator('.nav-pane').count(), 1)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== T. 表格：渲染、格内读回、行不跨页拆开 ===')
+  await openApp()
+  const tableModel = await getModel()
+  const tableBlocks = tableModel.blocks.filter((b) => b.t === 'table')
+  ok('样本里有一张表（本波 demo 样本新增）', tableBlocks.length >= 1)
+  if (tableBlocks.length > 0) {
+    const t = tableBlocks[0]
+    const surface = await page.evaluate(() => {
+      const frags = Array.from(document.querySelectorAll('.wtp-tableFrag'))
+      return {
+        frags: frags.length,
+        outerHasBlockId: frags.some((el) => el.dataset.blockId !== undefined),
+        renderedRows: frags.reduce(
+          (n, el) => n + el.querySelectorAll(':scope > table > tbody > tr').length,
+          0,
+        ),
+        // 每个片段自带的行区间必须与它渲出来的行数一致（行不被拆开的直接证据）
+        spansMatch: frags.every(
+          (el) =>
+            el.querySelectorAll(':scope > table > tbody > tr').length ===
+            Number(el.dataset.rowTo) - Number(el.dataset.rowFrom),
+        ),
+        cells: document.querySelectorAll('.wtp-table .wtp-listItem[data-block-id]').length,
+        firstCellText: document.querySelector('.wtp-table .wtp-listItem[data-block-id]')
+          ?.textContent,
+      }
+    })
+    ok('表格渲成了 .wtp-tableFrag', surface.frags >= 1)
+    eq('表格外层不挂 data-block-id（否则会被当成片段读回）', surface.outerHasBlockId, false)
+    eq('各片渲染的行数合计 = 模型行数', surface.renderedRows, t.rows.length)
+    ok('每个表格片段渲染的行数 = 它的行区间（行没被拆开）', surface.spansMatch)
+    eq(
+      '格内那层都挂了 data-block-id',
+      surface.cells,
+      t.rows.reduce((n, row) => n + (row.role === 'body' ? t.columns : 1), 0),
+    )
+
+    // 格内打字：模型必须同步，且版式没变（正常输入不得重排）
+    // 目标格子是「数控加工中心」那一格：样本表第 0 行是 unit 行，第 1 行是正文表头
+    const targetCell = `${t.id}.r2c0`
+    const pagesBeforeT = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+    const beforeCell = await page.evaluate(
+      (id) => document.querySelector(`[data-block-id="${id}"]`)?.textContent ?? '',
+      targetCell,
+    )
+    await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+    await page.keyboard.insertText('（试）')
+    await page.waitForTimeout(300)
+    const afterT = await getModel()
+    const afterTable = afterT.blocks.find((b) => b.t === 'table')
+    const afterCell = (afterTable?.rows[2]?.cells[0]?.inlines ?? [])
+      .map((i) => (i.t === 'text' ? i.text : ''))
+      .join('')
+    ok(
+      '格内打字同步到模型',
+      afterCell === `${beforeCell}（试）`,
+      `模型里是「${afterCell}」`,
+    )
+    eq(
+      '格内打字不改变页数',
+      await page.evaluate(() => document.querySelectorAll('.wtp-page').length),
+      pagesBeforeT,
+    )
+    ok(
+      '格内打字后片段还是同一个 DOM 节点',
+      await page.evaluate((id) => {
+        const el = document.querySelector(`[data-block-id="${id}"]`)
+        return el !== null && el.isConnected
+      }, targetCell),
+    )
+    await checkNoOverflow('T 格内打字后')
+  }
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== U. 插入表格面板：选规格后按规格插入，Esc 只关面板 ===')
+  await openApp()
+  const tableIds = async () =>
+    (await getModel()).blocks.filter((b) => b.t === 'table').map((b) => b.id)
+  const beforeU = await tableIds()
+
+  const tableBtn = 'button.tool[title^="在光标所在段落后插入一张空表格"]'
+  const tablePanel = page.locator('.table-panel')
+  const rowBox = tablePanel.locator('input[type="number"]').nth(0)
+  const colBox = tablePanel.locator('input[type="number"]').nth(1)
+
+  await page.locator(tableBtn).click()
+  await page.waitForTimeout(150)
+  eq('点「插入表格」出现规格面板', await tablePanel.count(), 1)
+  eq('面板默认行数 = 2', await rowBox.inputValue(), '2')
+  eq('面板默认列数 = 3', await colBox.inputValue(), '3')
+
+  // Esc 只关面板，不插表
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  eq('Esc 关掉面板', await tablePanel.count(), 0)
+  eq('Esc 之后没插表', (await tableIds()).length, beforeU.length)
+
+  // 选 4 行 2 列再插入
+  await page.locator(tableBtn).click()
+  await page.waitForTimeout(150)
+  await rowBox.fill('4')
+  await colBox.fill('2')
+  await tablePanel.getByRole('button', { name: '插入', exact: true }).click()
+  await page.waitForTimeout(300)
+  const afterU = await getModel()
+  const added = afterU.blocks.filter((b) => b.t === 'table' && !beforeU.includes(b.id))
+  eq('插入了一张新表', added.length, 1)
+  const fresh = added[0]
+  eq('新表行数 = 面板里选的 4', fresh?.rows.length, 4)
+  eq('新表每行格数 = 面板里选的 2', fresh?.rows.every((r) => r.cells.length === 2), true)
+  eq('新表 columns = 面板里选的 2', fresh?.columns, 2)
+  eq('新表 minLines 仍是 2', fresh?.minLines, 2)
+  eq('新表默认禁止跨页断行', fresh?.cantSplit, true)
+  eq('插入后面板自动关闭', await tablePanel.count(), 0)
+  ok(
+    '插入符落在新表第一个格子里',
+    await page.evaluate((id) => {
+      const el = document.querySelector(`[data-block-id="${id}"]`)
+      const sel = window.getSelection()
+      return (
+        el !== null &&
+        sel !== null &&
+        sel.rangeCount > 0 &&
+        el.contains(sel.getRangeAt(0).startContainer)
+      )
+    }, `${fresh?.id ?? ''}.r0c0`),
+  )
+  await checkNoOverflow('U 插入表格后')
+
+  // 数字框的 min/max 只是提示，值能直接敲进去 —— 组件侧必须夹回合法区间
+  await page.locator(tableBtn).click()
+  await page.waitForTimeout(150)
+  await rowBox.fill('999')
+  await colBox.fill('0')
+  await tablePanel.getByRole('button', { name: '插入', exact: true }).click()
+  await page.waitForTimeout(300)
+  const clampedModel = await getModel()
+  // 按 id 差分认新表，不能取「文档里最后一张表」—— 插入落点是插入符所在块之后，
+  // 不一定是文末（样本里本来就有一张表，取最后一张可能取到它）
+  const clampedAdded = clampedModel.blocks.filter(
+    (b) => b.t === 'table' && !afterU.blocks.some((known) => known.id === b.id),
+  )
+  eq('越界那次也插进了一张新表', clampedAdded.length, 1)
+  const clamped = clampedAdded[0]
+  eq('行数上界夹到 30', clamped?.rows.length, 30)
+  eq('列数下界夹到 1', clamped?.columns, 1)
+
+  // 另一侧的两个边界也要各测一次，否则「1–30 / 1–12」只验了上界那半边
+  await page.locator(tableBtn).click()
+  await page.waitForTimeout(150)
+  await rowBox.fill('0')
+  await colBox.fill('999')
+  await tablePanel.getByRole('button', { name: '插入', exact: true }).click()
+  await page.waitForTimeout(300)
+  const clampedAdded2 = (await getModel()).blocks.filter(
+    (b) => b.t === 'table' && !clampedModel.blocks.some((known) => known.id === b.id),
+  )
+  eq('另一侧也插进了一张新表', clampedAdded2.length, 1)
+  eq('行数下界夹到 1', clampedAdded2[0]?.rows.length, 1)
+  eq('列数上界夹到 12', clampedAdded2[0]?.columns, 12)
+  await checkNoOverflow('U 另一侧越界夹回后')
 } finally {
   await browser?.close()
   await server.close()
@@ -1490,5 +1681,6 @@ if (failures.length > 0) {
 console.log(
   '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
     '金额格式、特殊空格、切文件模板、打印、查找替换（面板/高亮/范围/替换一处与全部）、' +
-    '导航窗格（条目与模型一致、点击跳转、折叠）均落到模型。',
+    '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）' +
+    '均落到模型。',
 )

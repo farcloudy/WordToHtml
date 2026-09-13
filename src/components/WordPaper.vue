@@ -41,6 +41,7 @@ import {
   applyFormat,
   cloneDoc,
   findBlock,
+  findContainer,
   insertBreakAfter,
   insertText,
   mergeIntoPrevious,
@@ -65,15 +66,15 @@ import {
   SEARCH_HIGHLIGHT,
   injectCss,
 } from '../lib/render/css'
-import { renderInlinesHtml } from '../lib/render/html'
+import { renderInlinesHtml, renderTableFragment } from '../lib/render/html'
 import { clearMeasureCache, measureDocument } from '../lib/render/measure'
 import type { MeasureCache } from '../lib/render/measure'
 import { paginate } from '../lib/render/paginate'
 import type { BreakKind, MeasuredItem, PageFragment, PageLayout } from '../lib/render/paginate'
 import { contentBoxPx, resolveSpec } from '../lib/spec'
 import type { BlockKind, DeepPartial, Spec } from '../lib/spec'
-import { commentScopes } from '../lib/types'
-import type { DocModel, Inline, RevMark, TextBlock, TextInline } from '../lib/types'
+import { allInlineHolders, cellId, commentScopes, nextBlockId, parseCellId, sliceInlines } from '../lib/types'
+import type { DocModel, Inline, RevMark, TableBlock, TextBlock, TextInline } from '../lib/types'
 
 const props = withDefaults(
   defineProps<{
@@ -203,33 +204,30 @@ const blocksById = computed(() => {
   return map
 })
 
-/** 与预览分页同源的切片（保留跨片批注锚点，让高亮画全） */
-function sliceForView(inlines: readonly Inline[], from: number, to: number): Inline[] {
-  const out: Inline[] = []
-  let cursor = 0
-  for (const inline of inlines) {
-    if (inline.t !== 'text') {
-      out.push(inline)
-      continue
-    }
-    const start = cursor
-    const end = cursor + inline.text.length
-    cursor = end
-    if (end <= from || start >= to) continue
-    out.push({
-      ...inline,
-      text: inline.text.slice(Math.max(from, start) - start, Math.min(to, end) - start),
-    })
+/** 表格查找表。表格片段没有 data-block-id（见 render/html.ts），得另有一张按 id 取块的表 */
+const tablesById = computed(() => {
+  const map = new Map<string, TableBlock>()
+  for (const block of viewDoc.value.blocks) {
+    if (block.t === 'table') map.set(block.id, block)
   }
-  return out
-}
+  return map
+})
 
 /**
  * 渲染一个分页片段。
+ *
  * 片段偏移用的是「显示文字」坐标系（含自动编号前缀），模型里不含前缀，
  * 所以要先把前缀长度扣掉；只有首片才带前缀。
+ *
+ * 表格片段走另一条路：按行区间调 renderTableFragment（与量测共用同一个函数），
+ * 它渲染出来的格内 div 自己挂 data-block-id，外层不挂。
  */
 function fragmentHtml(frag: PageFragment): string {
+  if (frag.rowFrom !== undefined) {
+    const table = tablesById.value.get(frag.blockId)
+    if (!table) return ''
+    return renderTableFragment(table, frag.rowFrom, frag.rowTo ?? frag.rowFrom + 1)
+  }
   const block = blocksById.value.get(frag.blockId)
   if (!block) return ''
   const prefix = viewNumbering.value.get(frag.blockId) ?? ''
@@ -238,12 +236,24 @@ function fragmentHtml(frag: PageFragment): string {
 
   if (frag.from < p) {
     return renderInlinesHtml(
-      sliceForView(block.inlines, 0, Math.max(0, frag.to - p)),
+      sliceInlines(block.inlines, 0, Math.max(0, frag.to - p)),
       prefix,
       active,
     )
   }
-  return renderInlinesHtml(sliceForView(block.inlines, frag.from - p, frag.to - p), '', active)
+  return renderInlinesHtml(sliceInlines(block.inlines, frag.from - p, frag.to - p), '', active)
+}
+
+/**
+ * v-for 的 key。表格片段在同一页里 from/to 恒为 0，同一页出现两张表就会撞键，
+ * 所以表格片段必须带上行区间。段落片段也统一带上行区间（没有就是 -1），键保持唯一且稳定。
+ */
+function fragmentKey(frag: PageFragment): string {
+  return `${frag.blockId}:${frag.from}:${frag.rowFrom ?? -1}:${frag.rowTo ?? -1}`
+}
+
+function fragmentClass(frag: PageFragment): string {
+  return frag.rowFrom !== undefined ? 'wtp-tableFrag' : `wtp-${frag.kind}`
 }
 
 /** 批注时间只显示到分钟，够用且不挤 */
@@ -256,6 +266,8 @@ function formatDate(iso: string): string {
 
 /** 页首那一块不能带段前距，续排块还要去掉首行缩进 —— 这两点分页时已经按此记账 */
 function fragmentStyle(frag: PageFragment, isFirst: boolean): Record<string, string> {
+  // 表格片段的排版全在表格自己的 CSS 里（行高最小值、单元格内边距），外层不加任何间距
+  if (frag.rowFrom !== undefined) return {}
   const style: Record<string, string> = {}
   if (isFirst) style.marginTop = '0'
   if (frag.continuation) style.textIndent = '0'
@@ -291,7 +303,11 @@ function sameLayout(a: readonly PageLayout[], b: readonly PageLayout[]): boolean
         fa.from !== fb.from ||
         fa.to !== fb.to ||
         fa.kind !== fb.kind ||
-        fa.continuation !== fb.continuation
+        fa.continuation !== fb.continuation ||
+        // 表格片段的行区间也要比：漏比会导致「分页变了却不重建 DOM」，
+        // 页面上的表还是上一轮的若干行
+        fa.rowFrom !== fb.rowFrom ||
+        fa.rowTo !== fb.rowTo
       ) {
         return false
       }
@@ -388,7 +404,13 @@ function fragmentRange(frag: HTMLElement, blockId: string): { from: number; to: 
   return { from, to: Math.max(from, end - p) }
 }
 
-/** 按当前 DOM 重新给同一块的各片段打标（data-from / data-to），编辑后坐标才不会越用越偏 */
+/**
+ * 按当前 DOM 重新给同一容器的各片段打标（data-from / data-to），编辑后坐标才不会越用越偏。
+ *
+ * 只对挂着 data-block-id 的元素工作，所以它天然只碰段落片段与**格子**：
+ * 表格片段的外层没有 data-block-id（见 render/html.ts），不会被当成片段重写属性。
+ * 格子永远是一格一个整体（不分页切分），这条路径对它就是把 data-from/to 重写成 0..len。
+ */
 function retagFragments(blockId: string): void {
   const rootEl = root.value
   if (!rootEl) return
@@ -409,14 +431,16 @@ function retagFragments(blockId: string): void {
  * 把页面上每一片的 DOM 读回模型。
  * 片段覆盖的区间用它自己的 data-from/data-to（分页时算出来的行边界），
  * 用 DOM 的新内容整段替换 —— 这样「删掉几个字」和「多打几个字」都能被如实记录。
+ *
+ * 查找容器而不是段落：格内（data-block-id = cellId）也走这条路，所以格内能直接打字。
  */
 function syncPlain(pageEl: HTMLElement): void {
   for (const frag of Array.from(pageEl.querySelectorAll<HTMLElement>('[data-block-id]'))) {
     const blockId = frag.dataset.blockId ?? ''
-    const block = findBlock(doc.value, blockId)
-    if (!block) continue
+    const container = findContainer(doc.value, blockId)
+    if (!container) continue
     const { from, to } = fragmentRange(frag, blockId)
-    replaceRange(block, from, to, readInlines(frag))
+    replaceRange(container, from, to, readInlines(frag))
     retagFragments(blockId)
   }
 }
@@ -425,9 +449,10 @@ function syncPlain(pageEl: HTMLElement): void {
 let revSeq = -1
 function mark(kind: 'ins' | 'del'): RevMark {
   let max = -1
-  for (const block of doc.value.blocks) {
-    if (block.t !== 'textBlock') continue
-    for (const inline of block.inlines) {
+  // 必须扫到表格格子：修订落在格子里时，只遍历 blocks 里看得见的 textBlock 会漏掉它，
+  // 于是下一枚修订标记会重用同一个 id —— Word 要求 w:ins / w:del 的 id 全篇唯一。
+  for (const holder of allInlineHolders(doc.value)) {
+    for (const inline of holder.inlines) {
       if (inline.t === 'text' && inline.rev) max = Math.max(max, inline.rev.id)
     }
   }
@@ -445,10 +470,10 @@ function syncTracked(pageEl: HTMLElement): DisplayPoint | null {
 
   for (const frag of Array.from(pageEl.querySelectorAll<HTMLElement>('[data-block-id]'))) {
     const blockId = frag.dataset.blockId ?? ''
-    const block = findBlock(doc.value, blockId)
-    if (!block) continue
+    const container = findContainer(doc.value, blockId)
+    if (!container) continue
     const { from, to } = fragmentRange(frag, blockId)
-    const before = sliceStrict(block.inlines, from, to)
+    const before = sliceStrict(container.inlines, from, to)
     const after = readInlines(frag)
 
     const oldText = textOf(before)
@@ -474,7 +499,7 @@ function syncTracked(pageEl: HTMLElement): DisplayPoint | null {
       const added: Inline[] = sliceStrict(after, head, head + addedLen).map((inl) =>
         inl.t === 'text' ? { ...inl, rev: mark('ins') } : inl,
       )
-      replaceRange(block, from, to, [
+      replaceRange(container, from, to, [
         ...sliceStrict(before, 0, head),
         ...removed,
         ...added,
@@ -572,22 +597,25 @@ function emitSelection(): void {
     emit('selection-change', null)
     return
   }
-  const block = findBlock(doc.value, range.start.blockId)
-  if (!block) {
+  const container = findContainer(doc.value, range.start.blockId)
+  if (!container) {
     emit('selection-change', null)
     return
   }
+  // 格子没有 BlockKind（单元格文字复用「列表段落」样式，所以回显它最接近事实）
+  const block = findBlock(doc.value, range.start.blockId)
+  const kind: BlockKind = block ? block.kind : 'listItem'
   const p = prefixLength(range.start.blockId)
   const from = Math.max(0, range.start.offset - p)
   const to = Math.max(from, range.end.offset - p)
   emit('selection-change', {
-    blockId: block.id,
-    kind: block.kind,
+    blockId: range.start.blockId,
+    kind,
     from,
     to,
     collapsed: to === from,
-    bold: to > from ? rangeIsBold(block, from, to) : false,
-    color: to > from ? rangeColor(block, from, to) : undefined,
+    bold: to > from ? rangeIsBold(container, from, to) : false,
+    color: to > from ? rangeColor(container, from, to) : undefined,
   })
 }
 
@@ -729,7 +757,15 @@ function onKeydown(event: KeyboardEvent): void {
     return
   }
   if (event.key === 'Enter') {
+    /*
+     * 格内的一律不接管：Enter / Shift+Enter 都只 preventDefault，不动模型。
+     * Enter 分段与 Shift+Enter 软换行的按键绑定都留给 W4b —— 但护栏现在就得上：
+     * 不拦的话回车会掉进 insertParagraphBreak，把整张表当段落切开。
+     * （insertParagraphBreak 里还有一道 findBlock 兜底，两道都在，免得日后改一处漏一处。）
+     */
+    const point = caretPoint()
     event.preventDefault()
+    if (point && isTableCell(point.blockId)) return
     insertParagraphBreak()
     return
   }
@@ -753,10 +789,16 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+/** 这个 id 是表格格子（`tableId.rNcM`）还是普通段落？格子的结构性操作都得绕开 */
+function isTableCell(blockId: string): boolean {
+  return parseCellId(blockId) !== null
+}
+
 /** 回车：在落点切开当前块。标题类段落回车后接一个正文段（公文习惯：标题一行一段） */
 function insertParagraphBreak(): void {
   const point = caretPoint()
   if (!point) return
+  // splitBlock 只对段落有意义；格子落点到这里应当是空操作（onKeydown 已经拦了一道）
   const block = findBlock(doc.value, point.blockId)
   if (!block) return
   const offset = Math.max(0, point.offset - prefixLength(point.blockId))
@@ -779,6 +821,32 @@ function onPaste(event: ClipboardEvent): void {
 
   // 纯文本粘贴：换行还原成新段落（公文里段落就是行）
   const lines = text.replace(/\r\n?/g, '\n').split('\n')
+
+  if (isTableCell(point.blockId)) {
+    /*
+     * 单元格是单段落，分段在这里表达不出来。多行粘贴把换行变成**软换行**
+     * （而不是像段落那样往后切段）—— 若不特判，splitBlock 对格子是空操作，
+     * 后面的行会被静默丢掉。
+     */
+    const container = findContainer(doc.value, point.blockId)
+    if (!container) return
+    const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+    const inlines: Inline[] = []
+    lines.forEach((line, i) => {
+      if (i > 0) inlines.push({ t: 'break' })
+      if (line !== '') inlines.push({ t: 'text', text: line })
+    })
+    replaceRange(container, offset, offset, inlines)
+    refreshLayout({
+      anchor: {
+        blockId: point.blockId,
+        offset: prefixLength(point.blockId) + offset + lines.join('').length,
+      },
+      force: true,
+    })
+    return
+  }
+
   let blockId = point.blockId
   let offset = Math.max(0, point.offset - prefixLength(blockId))
   for (let i = 0; i < lines.length; i += 1) {
@@ -843,10 +911,10 @@ function toggleBold(): void {
   const ranges = selectedRanges(rootEl)
   if (ranges.length === 0) return
   const allBold = ranges.every((range) => {
-    const block = findBlock(doc.value, range.blockId)
-    if (!block) return false
+    const container = findContainer(doc.value, range.blockId)
+    if (!container) return false
     const p = prefixLength(range.blockId)
-    return rangeIsBold(block, Math.max(0, range.from - p), Math.max(0, range.to - p))
+    return rangeIsBold(container, Math.max(0, range.from - p), Math.max(0, range.to - p))
   })
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, { bold: !allBold }),
@@ -859,10 +927,10 @@ function toggleUnderline(): void {
   const ranges = selectedRanges(rootEl)
   if (ranges.length === 0) return
   const allUnderline = ranges.every((range) => {
-    const block = findBlock(doc.value, range.blockId)
-    if (!block) return false
+    const container = findContainer(doc.value, range.blockId)
+    if (!container) return false
     const p = prefixLength(range.blockId)
-    return rangeIsUnderline(block, Math.max(0, range.from - p), Math.max(0, range.to - p))
+    return rangeIsUnderline(container, Math.max(0, range.from - p), Math.max(0, range.to - p))
   })
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, { underline: !allUnderline }),
@@ -888,28 +956,28 @@ function formatSelectionAsAmount(): boolean {
   const ranges = selectedRanges(rootEl)
   const target = ranges.length === 1 ? ranges[0] : undefined
   if (!target) return false
-  const block = findBlock(doc.value, target.blockId)
-  if (!block) return false
-  const p = prefixLength(block.id)
+  const container = findContainer(doc.value, target.blockId)
+  if (!container) return false
+  const p = prefixLength(target.blockId)
   const from = Math.max(0, target.from - p)
   const to = Math.max(from, target.to - p)
   if (to <= from) return false
 
-  const amount = formatAmount(textOf(sliceStrict(block.inlines, from, to)))
+  const amount = formatAmount(textOf(sliceStrict(container.inlines, from, to)))
   if (amount === null) return false
 
   // 新数字继承原文的格式（加粗／颜色／下划线／修订标记），与「改几个字」同一路数
-  const first = sliceStrict(block.inlines, from, to).find(
+  const first = sliceStrict(container.inlines, from, to).find(
     (inline): inline is TextInline => inline.t === 'text',
   )
   const piece: Inline = first ? { ...first, text: amount } : { t: 'text', text: amount }
 
   pushHistory()
-  replaceRange(block, from, to, [piece])
+  replaceRange(container, from, to, [piece])
   // 改完仍把这串数字选中：连着按几次结果稳定（12,345.60 再解析还是它自己）
   refreshLayout({
-    anchor: { blockId: block.id, offset: p + from },
-    anchorEnd: { blockId: block.id, offset: p + from + amount.length },
+    anchor: { blockId: target.blockId, offset: p + from },
+    anchorEnd: { blockId: target.blockId, offset: p + from + amount.length },
     force: true,
   })
   return true
@@ -936,17 +1004,17 @@ function insertSpecialSpace(kind: 'em' | 'en' | 'quarterEm'): boolean {
   const caret = caretPoint()
   const blockId = target?.blockId ?? caret?.blockId
   if (blockId === undefined) return false
-  const block = findBlock(doc.value, blockId)
-  if (!block) return false
+  const container = findContainer(doc.value, blockId)
+  if (!container) return false
 
-  const p = prefixLength(block.id)
+  const p = prefixLength(blockId)
   const from = target ? Math.max(0, target.from - p) : Math.max(0, (caret?.offset ?? 0) - p)
   const to = target ? Math.max(from, target.to - p) : from
   const char = SPECIAL_SPACES[kind]
 
   pushHistory(caret)
-  replaceRange(block, from, to, [{ t: 'text', text: char }])
-  refreshLayout({ anchor: { blockId: block.id, offset: p + from + char.length }, force: true })
+  replaceRange(container, from, to, [{ t: 'text', text: char }])
+  refreshLayout({ anchor: { blockId, offset: p + from + char.length }, force: true })
   return true
 }
 
@@ -980,7 +1048,7 @@ function addCommentOnSelection(text: string): number {
 
 /** 给指定区间加批注（模型文字坐标） */
 function addCommentAt(blockId: string, from: number, to: number, text: string): number {
-  if (!findBlock(doc.value, blockId)) return -1
+  if (!findContainer(doc.value, blockId)) return -1
   const p = prefixLength(blockId)
   const id = addComment(
     doc.value,
@@ -1065,6 +1133,69 @@ function insertPageBreak(): void {
 
 function insertSectionBreak(): void {
   insertBreak('section')
+}
+
+/* -------------------------------------------------------------------------- */
+/* 插入表格                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** 新表格的默认规格与上限：行数（不含 unit/note 行）、列数、最小行高（2 = 最小两行） */
+const NEW_TABLE_ROWS = 2
+const NEW_TABLE_COLUMNS = 3
+const NEW_TABLE_MIN_LINES: 1 | 2 = 2
+const MAX_TABLE_ROWS = 30
+const MAX_TABLE_COLUMNS = 12
+
+/**
+ * 把界面上敲进来的行列数夹到合法区间。
+ * 面板虽然写了 min/max，但数字是能直接敲进框里的（清空后还会给到 NaN），
+ * 所以这里不信任输入：非法值回落默认值，越界值夹到边界。
+ */
+function clampCount(value: number, fallback: number, max: number): number {
+  const n = Math.trunc(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(Math.max(1, n), max)
+}
+
+/**
+ * 在当前块之后（找不到落点就追加到文末）插入一张空表，并把插入符放进第一个格子。
+ *
+ * 默认 2 行 × 3 列的空表、`minLines: 2`、`cantSplit: true`；行列数由调用方给
+ * （demo 的「插入表格」面板让用户选）。增删行列与行高切换在 W4b。
+ */
+function insertTable(rows: number = NEW_TABLE_ROWS, columns: number = NEW_TABLE_COLUMNS): string {
+  if (!props.editable) return ''
+  const bodyRows = clampCount(rows, NEW_TABLE_ROWS, MAX_TABLE_ROWS)
+  const cols = clampCount(columns, NEW_TABLE_COLUMNS, MAX_TABLE_COLUMNS)
+  const point = caretPoint()
+  pushHistory(point)
+
+  // 落点在格子里时，插到那张表之后（不能插进格子里 —— 格子里放不下一个块）
+  const anchorId = point?.blockId
+  const cell = anchorId === undefined ? null : parseCellId(anchorId)
+  const targetId = cell ? cell.tableId : anchorId
+  const found =
+    targetId === undefined ? -1 : doc.value.blocks.findIndex((block) => block.id === targetId)
+  const at = found < 0 ? doc.value.blocks.length : found + 1
+
+  const id = nextBlockId('tb')
+  const table: TableBlock = {
+    t: 'table',
+    id,
+    columns: cols,
+    minLines: NEW_TABLE_MIN_LINES,
+    cantSplit: true,
+    rows: Array.from({ length: bodyRows }, () => ({
+      role: 'body',
+      cells: Array.from({ length: cols }, () => ({ inlines: [] })),
+    })),
+  }
+  doc.value.blocks.splice(at, 0, table)
+
+  // 插入符放进第一个格子的开头：格子 id + offset 0 就是它的锚点
+  const first = cellId(id, 0, 0)
+  refreshLayout({ anchor: { blockId: first, offset: 0 }, force: true })
+  return id
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1458,6 +1589,7 @@ defineExpose({
   editComment,
   insertPageBreak,
   insertSectionBreak,
+  insertTable,
   deleteBreak,
   keepSelection,
   dropKeptSelection,
@@ -1497,12 +1629,15 @@ defineExpose({
           >
             <div
               v-for="(frag, index) in page.fragments"
-              :key="`${frag.blockId}-${frag.from}`"
-              :class="`wtp-${frag.kind}`"
+              :key="fragmentKey(frag)"
+              :class="fragmentClass(frag)"
               :style="fragmentStyle(frag, index === 0)"
-              :data-block-id="frag.blockId"
-              :data-from="frag.from"
-              :data-to="frag.to"
+              :data-block-id="frag.rowFrom === undefined ? frag.blockId : undefined"
+              :data-from="frag.rowFrom === undefined ? frag.from : undefined"
+              :data-to="frag.rowFrom === undefined ? frag.to : undefined"
+              :data-table-id="frag.rowFrom === undefined ? undefined : frag.blockId"
+              :data-row-from="frag.rowFrom"
+              :data-row-to="frag.rowTo"
               :data-continuation="frag.continuation ? '1' : undefined"
               v-html="fragmentHtml(frag)"
             />

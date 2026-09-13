@@ -242,8 +242,30 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
   const before = failures.length
   eq('表格数', dumpTables.length, modelTables.length)
 
+  /*
+   * 模型里的格文字 → Word 读回来的样子。
+   * 软换行（<w:br/>）在 Word 的 Range.Text 里是**垂直制表符 chr(11)**，不是换行也不是空格；
+   * 批注锚点不占字符。期望值必须按这个口径算，否则「格内的软换行被吞了」看不出来。
+   */
   const cellText = (cell) =>
-    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+    cell.inlines
+      .map((i) => (i.t === 'text' ? i.text : i.t === 'break' ? '\u000b' : ''))
+      .join('')
+
+  const softBreakInModel = model.blocks
+    .filter((b) => b.t === 'table')
+    .some((t) => t.rows.some((r) => r.cells.some((c) => c.inlines.some((i) => i.t === 'break'))))
+  if (softBreakInModel) {
+    // Word 侧的直接证据：软换行在 Range.Text 里就是 chr(11)，读回来的格文字里必须看得到
+    const wordSoft = dumpTables
+      .flatMap((t) => (t.rows ?? []).flatMap((r) => (r.cells ?? []).map((c) => c.text ?? '')))
+      .filter((text) => text.includes('\u000b')).length
+    if (wordSoft === 0) {
+      failures.push('模型里有软换行，Word 读回来的格文字里却没有 chr(11)（换行没落到 docx）')
+    } else {
+      console.log(`ok   软换行：${wordSoft} 个格子的文字里读到了 chr(11)`)
+    }
+  }
 
   // 版心宽（磅）= 页面宽 − 左右页边距
   const contentWidthPt =

@@ -23,8 +23,10 @@ import {
   cellId,
   cloneDoc,
   commentScopes,
+  containerLength,
   deleteRange,
   findBlock,
+  findContainer,
   findMatches,
   formatAmount,
   insertBreakAfter,
@@ -40,11 +42,13 @@ import {
   rangeIsUnderline,
   removeBreak,
   removeComment,
+  renderTableFragment,
   replyComment,
   replaceMatches,
   replaceRange,
   resolveSpec,
   setBlockKind,
+  sliceInlines,
   splitBlock,
   toBase64,
   toMd,
@@ -870,6 +874,131 @@ console.log('\n=== 17c. md 往返：批注内容里的 \\ 与 | 必须还原（�
     .map((i) => i.text)
     .join('')
   eq('整段文字（含被锚定的那段）往返不变', anchorText, '相关日期以通知书为准通知书原件。')
+}
+
+console.log('\n=== 18. 软换行 {br}：零宽、往返、转义 ===')
+{
+  const doc = parseMd('甲{br}乙')
+  const block = findBlock(doc, doc.blocks[0].id)
+  eq('解析出 3 个 inline', block.inlines.length, 3)
+  eq('中间那枚是 break', block.inlines[1].t, 'break')
+  eq('零宽：plainText 不含换行', plainText(block), '甲乙')
+  eq('零宽：块长度不含换行', blockLength(block), 2)
+  eq('序列化写回 {br}', toMd(doc), '甲{br}乙')
+  eq('往返结构一致', JSON.stringify(normalizeBlocks(parseMd(toMd(doc)))), JSON.stringify(normalizeBlocks(doc)))
+  eq('再往返一次字节稳定', toMd(parseMd(toMd(doc))), '甲{br}乙')
+
+  // 正文里真想写「{br}」时会被 escapeText 逃逸，不会撞上指令
+  const literal = parseMd('\\{br\\}')
+  eq('转义后的 {br} 是字面量', plainText(findBlock(literal, literal.blocks[0].id)), '{br}')
+  eq('字面量往返稳定', toMd(parseMd(toMd(literal))), toMd(literal))
+}
+
+console.log('\n=== 19. 软换行的切片：不读到 undefined.length，边界不重复不丢失 ===')
+{
+  const inlines = [{ t: 'text', text: 'abc' }, { t: 'break' }, { t: 'text', text: 'def' }]
+  const shape = (list) => list.map((i) => (i.t === 'break' ? '⏎' : i.text)).join('')
+  eq('分页切片：整段保住那枚换行', shape(sliceInlines(inlines, 0, 6)), 'abc⏎def')
+  eq('分页切片：前段丢掉边界上的换行', shape(sliceInlines(inlines, 0, 3)), 'abc')
+  eq('分页切片：续排段不把边界换行带进来（否则多出一个没记账的行盒）', shape(sliceInlines(inlines, 3, 6)), 'def')
+  eq('分页切片：换行在片内就留下', shape(sliceInlines(inlines, 0, 4)), 'abc⏎d')
+
+  // 编辑用的 sliceStrict 与分页不同：保住比丢掉好（切分段落时不把换行弄没）
+  const split = parseMd('abc{br}def')
+  const host = findBlock(split, split.blocks[0].id)
+  const head = host.inlines.slice(0, 1)
+  eq('读第一段 inline 不崩', head.length, 1)
+  splitBlock(split, host.id, 3, 'body')
+  eq('在换行处分段：前段', plainText(findBlock(split, split.blocks[0].id)), 'abc')
+  eq('在换行处分段：后段（换行跟着后半段）', plainText(findBlock(split, split.blocks[1].id)), 'def')
+}
+
+console.log('\n=== 20. 容器泛化：格子也能读、写、改格式 ===')
+{
+  const model = parseMd('正文一段\n\n:::table\n| 甲乙 | b |\n| c | d |\n:::')
+  const table = model.blocks.find((b) => b.t === 'table')
+  const id = table.id
+  const cell = findContainer(model, cellId(id, 0, 0))
+  ok('格子能被找到', cell !== undefined && cell !== null)
+  eq('格子文字', containerLength(cell), 2)
+  eq('表格 id 本身不是容器（表格不可编辑）', findContainer(model, id), undefined)
+  eq('越界的格号不是容器', findContainer(model, cellId(id, 9, 9)), undefined)
+  eq('普通段落仍能找到', findContainer(model, model.blocks[0].id) !== undefined, true)
+
+  // 写入
+  replaceRange(cell, 0, 1, [{ t: 'text', text: 'X' }])
+  eq('格内替换', cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join(''), 'X乙')
+  insertText(model, cellId(id, 0, 0), 1, 'Y')
+  eq('格内插入', cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join(''), 'XY乙')
+
+  // 格式：加粗 / 判读
+  applyFormat(model, cellId(id, 1, 1), 0, 1, { bold: true })
+  const other = findContainer(model, cellId(id, 1, 1))
+  eq('格内加粗', rangeIsBold(other, 0, 1), true)
+  eq('别的格子没被连带', rangeIsBold(findContainer(model, cellId(id, 1, 0)), 0, 1), false)
+
+  // 修订模式下的删除：标成 del 留在原处
+  deleteRange(model, cellId(id, 0, 1), 0, 1, {
+    kind: 'del',
+    id: 99,
+    author: '甲',
+    date: '2026-01-01T00:00:00.000Z',
+  })
+  const marked = findContainer(model, cellId(id, 0, 1)).inlines.find((i) => i.rev)
+  eq('格内删除留痕', marked?.rev?.kind, 'del')
+  eq('格内删完文字还在', containerLength(findContainer(model, cellId(id, 0, 1))), 1)
+
+  // 结构性操作对格子必须是安全的空操作
+  eq('splitBlock 对格子是空操作', splitBlock(model, cellId(id, 0, 0), 0, 'body'), '')
+  eq('mergeIntoPrevious 对格子不动模型', mergeIntoPrevious(model, cellId(id, 0, 0)), null)
+  eq('setBlockKind 对格子不动模型', (setBlockKind(model, cellId(id, 0, 0), 'h1'), findContainer(model, cellId(id, 0, 0)).kind), undefined)
+}
+
+console.log('\n=== 21. 跨格查找与替换（含格内与段落各一处）===')
+{
+  const model = parseMd('债务人申报如下\n\n:::table\n| 项目 | 债务人 |\n| 甲 | 1 |\n:::')
+  const table = model.blocks.find((b) => b.t === 'table')
+  const hits = findMatches(model, '债务人')
+  eq('段落 + 格内各命中一处', hits.length, 2)
+  const inCell = hits.filter((m) => parseCellId(m.blockId) !== null)
+  eq('其中一处在格子里', inCell.length, 1)
+  eq('格子命中的坐标', `${inCell[0].from}/${inCell[0].to}`, '0/3')
+
+  const replaced = replaceMatches(model, hits, '义务人')
+  eq('两处都替换了', replaced, 2)
+  eq('段落里换成新词', plainText(findBlock(model, model.blocks[0].id)), '义务人申报如下')
+  const cell = findContainer(model, cellId(table.id, 0, 1))
+  eq('格里换成新词', cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join(''), '义务人')
+}
+
+console.log('\n=== 22. 表格片段渲染：接口约束（外层无 data-block-id、格内坐标、行区间）===')
+{
+  // 这些约束是「量测与预览共用一套 DOM」的地基：外层若挂了 data-block-id，
+  // fragmentOf 会把整张表当成一个片段读回模型；格内若不挂，格内根本编辑不了。
+  const model = parseMd(':::table minLines=2\n> 单位：元\n| 甲 | 乙 |\n| 丙{br}丁 | 戊 |\n< 注：附注\n:::')
+  const table = model.blocks[0]
+  const html = renderTableFragment(table, 0, table.rows.length)
+  eq('外层是 wtp-table + minLines 修饰类', html.includes('<table class="wtp-table wtp-table-min2">'), true)
+  eq('外层不挂 data-block-id（否则整张表会被当成片段读回）', /<table[^>]*data-block-id/.test(html), false)
+  eq('外层带 data-table-id 也不用（片段自带行区间）', /data-table-id/.test(html), false)
+  eq('四行各一个 <tr>', (html.match(/<tr/g) ?? []).length, 4)
+  eq('unit/note 行整行一格', (html.match(/colspan="2"/g) ?? []).length, 2)
+  eq('unit 行右对齐', html.includes('text-align: right'), true)
+  eq('note 行左对齐且顶端对齐', html.includes('text-align: left') && html.includes('vertical-align:top'), true)
+  eq('格内都挂了 data-block-id', (html.match(/data-block-id="/g) ?? []).length, 2 + 1 + 2 + 1)
+  eq(
+    '格内坐标是 cellId 形态且 from=0',
+    html.includes(`data-block-id="${cellId(table.id, 1, 0)}" data-from="0" data-to="1"`),
+    true,
+  )
+  eq('软换行渲染成带类的 <br>（与空段落占位区分）', html.includes('<br class="wtp-br">'), true)
+
+  const partial = renderTableFragment(table, 1, 3)
+  eq('按行区间只渲那两行', (partial.match(/<tr/g) ?? []).length, 2)
+  eq('行区间从 1 开始时格内 id 跟着行号走', partial.includes(`data-block-id="${cellId(table.id, 1, 0)}"`), true)
+
+  const single = parseMd(':::table\n| a |\n:::').blocks[0]
+  eq('minLines=1 用另一个修饰类', renderTableFragment(single, 0, 1).includes('wtp-table-min1'), true)
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

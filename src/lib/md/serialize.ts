@@ -43,6 +43,12 @@ function serializeInlines(
 ): string {
   let out = ''
   for (const inline of inlines) {
+    if (inline.t === 'break') {
+      // 软换行是零宽标记，不参与 bold/underline/color/rev 的包裹：它没有属于自己的格式，
+      // 前后两段文字各自带着自己的格式（readInlines 读回来也是这样）。
+      out += '{br}'
+      continue
+    }
     if (inline.t === 'commentStart') {
       out += '[['
       continue

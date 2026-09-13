@@ -129,7 +129,12 @@ export function readInlines(
     if (child.nodeType !== ELEMENT_NODE) continue
     const el = child as HTMLElement
     if (el.classList.contains('wtp-num')) continue
-    if (el.tagName === 'BR') continue
+    if (el.tagName === 'BR') {
+      // 带 wtp-br 的才是真软换行（渲染时唯一会写出这个类的地方）；裸 <br> 是
+      // 「空段落占位」或浏览器残留的换行符，两种都不是模型内容，忽略。
+      if (el.classList.contains('wtp-br')) out.push({ t: 'break' })
+      continue
+    }
 
     if (el.classList.contains('wtp-comment')) {
       const id = Number(el.dataset.comment ?? '')

@@ -12,8 +12,8 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { Block, CommentDef, DocModel, Inline, RevMark, TextBlock } from '../types'
-import { nextBlockId, plainText } from '../types'
+import type { Block, CommentDef, DocModel, Inline, InlineHolder, RevMark, TextBlock } from '../types'
+import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
 
 export interface BlockPoint {
   blockId: string
@@ -35,6 +35,15 @@ export interface EditorSelection {
   color?: string
 }
 
+/**
+ * 能承载一段可编辑文字的东西 —— 唯一要求就是有一串 inlines。
+ *
+ * 「块」不止 textBlock：表格的每个格子也是一段可编辑文字（单段落），
+ * 编辑层把它当成一个「伪块」（id 用 cellId(tableId, r, c)）。所以本文件里的
+ * 编辑操作统一吃**容器**，段落与格子走同一条路，不必各写一套。
+ */
+export type InlineContainer = InlineHolder
+
 export function findBlock(doc: DocModel, id: string): TextBlock | undefined {
   for (const block of doc.blocks) {
     if (block.t === 'textBlock' && block.id === id) return block
@@ -42,8 +51,31 @@ export function findBlock(doc: DocModel, id: string): TextBlock | undefined {
   return undefined
 }
 
+/**
+ * 按 id 找一个可编辑容器：段落按 id 命中；`tableId.rNcM` 按 cellId 命中最深的那个格子。
+ *
+ * 找不到（id 过期、格号越界、或者 id 其实是一张表的 id —— 表格本身不可编辑）返回 undefined，
+ * 调用方据此安全跳过。
+ */
+export function findContainer(doc: DocModel, id: string): InlineContainer | undefined {
+  const cell = parseCellId(id)
+  for (const block of doc.blocks) {
+    if (cell) {
+      if (block.t !== 'table' || block.id !== cell.tableId) continue
+      return block.rows[cell.row]?.cells[cell.col]
+    }
+    if (block.t === 'textBlock' && block.id === id) return block
+  }
+  return undefined
+}
+
 export function findBlockIndex(doc: DocModel, id: string): number {
   return doc.blocks.findIndex((block) => block.t === 'textBlock' && block.id === id)
+}
+
+/** 容器里的文字长度。段落与格子的长度都按这个算（软换行零宽、不占字符位） */
+export function containerLength(container: InlineContainer): number {
+  return inlinesText(container.inlines).length
 }
 
 export function blockLength(block: TextBlock): number {
@@ -71,6 +103,13 @@ export function sliceStrict(inlines: readonly Inline[], from: number, to: number
       if (cursor > from && cursor <= to) out.push(inline)
       continue
     }
+    if (inline.t === 'break') {
+      // 零宽，只能按位置归属：落在 [from,to) 就跟着这一片走。
+      // 与分页用的 sliceInlines 不同 —— 那里要在片首丢掉边界上那一枚（避免多出一个没记账的行盒），
+      // 编辑读回没有行盒可丢，保住它比丢掉好（切分段落时不会把换行弄没）。
+      if (cursor >= from && cursor < to) out.push(inline)
+      continue
+    }
     const start = cursor
     const end = cursor + inline.text.length
     cursor = end
@@ -83,27 +122,33 @@ export function sliceStrict(inlines: readonly Inline[], from: number, to: number
 }
 
 /**
- * 用新片段替换块内 [from,to) 的文字（其余部分原样保留）。
+ * 用新片段替换容器内 [from,to) 的文字（其余部分原样保留）。
+ *
+ * 容器的类型是「有 inlines 的东西」—— 段落与表格格子共用这一条路
+ * （格子的单段落语义与段落一样，只有 id 的坐标系不同）。
  *
  * 批注锚点不能像 sliceStrict 那样按区间一刀切：夹住被替换文字的锚点，起点必须留在
  * 替换内容之前、终点必须留在之后。否则会剩下一个没有终点的 commentStart，
  * 渲染时它会把这一段余下的文字全吞进高亮里，导出 docx 也会写出没闭合的批注范围。
  * 所以中间的锚点按「夹到边界」处理：起点并入前半、终点并入后半，新内容自然被包住。
  * 两条规则（前半 cursor < a、后半 cursor >= b）互斥，插入（from == to）时也不会重复。
+ *
+ * 软换行（零宽）走同一条「前半 cursor < a、后半 cursor >= b」规则：
+ * 替换区间内部的换行跟着区间一起被替换掉，边界上的不会重复或丢失。
  */
 export function replaceRange(
-  block: TextBlock,
+  container: InlineContainer,
   from: number,
   to: number,
   inlines: readonly Inline[],
 ): void {
-  const len = blockLength(block)
+  const len = containerLength(container)
   const a = Math.max(0, Math.min(from, len))
   const b = Math.max(a, Math.min(to, len))
   const out: Inline[] = []
 
   let cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') {
       if (cursor < a || (cursor < b && inline.t === 'commentStart')) out.push(inline)
       continue
@@ -118,7 +163,7 @@ export function replaceRange(
   out.push(...inlines)
 
   cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') {
       if (cursor >= b || (cursor > a && cursor < b && inline.t === 'commentEnd')) {
         out.push(inline)
@@ -131,21 +176,21 @@ export function replaceRange(
     out.push({ ...inline, text: inline.text.slice(Math.max(b, start) - start) })
   }
 
-  block.inlines = out
+  container.inlines = out
 }
 
 /** 在 offset 处插入纯文本（可选地带上修订标记） */
 export function insertText(
   doc: DocModel,
-  blockId: string,
+  containerId: string,
   offset: number,
   text: string,
   rev?: RevMark,
 ): void {
-  const block = findBlock(doc, blockId)
-  if (!block || text === '') return
+  const container = findContainer(doc, containerId)
+  if (!container || text === '') return
   const piece: Inline = { t: 'text', text, ...(rev ? { rev } : {}) }
-  replaceRange(block, offset, offset, [piece])
+  replaceRange(container, offset, offset, [piece])
 }
 
 /**
@@ -154,23 +199,23 @@ export function insertText(
  */
 export function deleteRange(
   doc: DocModel,
-  blockId: string,
+  containerId: string,
   from: number,
   to: number,
   rev?: RevMark,
 ): void {
-  const block = findBlock(doc, blockId)
-  if (!block || to <= from) return
+  const container = findContainer(doc, containerId)
+  if (!container || to <= from) return
   if (!rev) {
-    replaceRange(block, from, to, [])
+    replaceRange(container, from, to, [])
     return
   }
   // 保留原文字，只把区间内的 text inline 盖上删除标记（原来的 ins 标记要让位）
-  const kept = sliceStrict(block.inlines, from, to).map((inline): Inline => {
+  const kept = sliceStrict(container.inlines, from, to).map((inline): Inline => {
     if (inline.t !== 'text') return inline
     return { ...inline, rev: { ...rev } }
   })
-  replaceRange(block, from, to, kept)
+  replaceRange(container, from, to, kept)
 }
 
 /** 把块在 offset 处切成两块，后半段成为 tailKind 的新块；返回新块 id */
@@ -218,11 +263,11 @@ export function setBlockKind(doc: DocModel, blockId: string, kind: BlockKind): v
 }
 
 /** 判断 [from,to) 内的文字是否全部加粗（空区间返回 false） */
-export function rangeIsBold(block: TextBlock, from: number, to: number): boolean {
+export function rangeIsBold(container: InlineContainer, from: number, to: number): boolean {
   if (to <= from) return false
   let seen = false
   let cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') continue
     const start = cursor
     const end = cursor + inline.text.length
@@ -235,11 +280,11 @@ export function rangeIsBold(block: TextBlock, from: number, to: number): boolean
 }
 
 /** 判断 [from,to) 内的文字是否全部带下划线（空区间返回 false） */
-export function rangeIsUnderline(block: TextBlock, from: number, to: number): boolean {
+export function rangeIsUnderline(container: InlineContainer, from: number, to: number): boolean {
   if (to <= from) return false
   let seen = false
   let cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') continue
     const start = cursor
     const end = cursor + inline.text.length
@@ -252,12 +297,16 @@ export function rangeIsUnderline(block: TextBlock, from: number, to: number): bo
 }
 
 /** 判断 [from,to) 内的文字是否全是同一个颜色；不一致返回 undefined */
-export function rangeColor(block: TextBlock, from: number, to: number): string | undefined {
+export function rangeColor(
+  container: InlineContainer,
+  from: number,
+  to: number,
+): string | undefined {
   if (to <= from) return undefined
   let found: string | undefined
   let seen = false
   let cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') continue
     const start = cursor
     const end = cursor + inline.text.length
@@ -280,18 +329,18 @@ export function rangeColor(block: TextBlock, from: number, to: number): string |
  */
 export function applyFormat(
   doc: DocModel,
-  blockId: string,
+  containerId: string,
   from: number,
   to: number,
   patch: { bold?: boolean; underline?: boolean | null; color?: string | null },
 ): void {
-  const block = findBlock(doc, blockId)
-  if (!block || to <= from) return
+  const container = findContainer(doc, containerId)
+  if (!container || to <= from) return
   replaceRange(
-    block,
+    container,
     from,
     to,
-    sliceStrict(block.inlines, from, to).map((inline): Inline => {
+    sliceStrict(container.inlines, from, to).map((inline): Inline => {
       if (inline.t !== 'text') return inline
       const next: Inline = { ...inline }
       if (patch.bold !== undefined) {
@@ -314,22 +363,22 @@ export function applyFormat(
 /** 给 [from,to) 加一条批注；返回新批注 id */
 export function addComment(
   doc: DocModel,
-  blockId: string,
+  containerId: string,
   from: number,
   to: number,
   text: string,
   author: string,
   date: string,
 ): number {
-  const block = findBlock(doc, blockId)
-  if (!block || to <= from) return -1
+  const container = findContainer(doc, containerId)
+  if (!container || to <= from) return -1
   const id = doc.comments.reduce((max, c) => Math.max(max, c.id), -1) + 1
   const def: CommentDef = { id, author, date, text }
   doc.comments.push(def)
   // 用 replaceRange 落锚点：它会顺带把与新区间相交的旧锚点配对好（见该函数的说明）
-  replaceRange(block, from, to, [
+  replaceRange(container, from, to, [
     { t: 'commentStart', commentId: id },
-    ...sliceStrict(block.inlines, from, to),
+    ...sliceStrict(container.inlines, from, to),
     { t: 'commentEnd', commentId: id },
   ])
   return id
@@ -398,9 +447,8 @@ export function removeComment(doc: DocModel, commentId: number): void {
     }
   }
   doc.comments = doc.comments.filter((c) => !doomed.has(c.id))
-  for (const block of doc.blocks) {
-    if (block.t !== 'textBlock') continue
-    block.inlines = block.inlines.filter(
+  for (const holder of allInlineHolders(doc)) {
+    holder.inlines = holder.inlines.filter(
       (inline) =>
         (inline.t !== 'commentStart' && inline.t !== 'commentEnd') || !doomed.has(inline.commentId),
     )

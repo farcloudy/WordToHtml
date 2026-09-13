@@ -246,5 +246,91 @@ console.log('\n=== 9. 行高超过版心时不死循环 ===')
   eq('兜底放下一行', pages[0].fragments.length, 1)
 }
 
+console.log('\n=== 10. 表格：按行装箱（行是原子的）===')
+{
+  /** 造一行表格量测值（行高单位 px） */
+  const row = (id, r, height) => ({ t: 'tableRow', blockId: id, row: r, height })
+
+  // 版心 100px / 每行 25px = 每页 4 行；同页相邻同表行必须合并成一个片段（一页一张 <table>）
+  const five = [0, 1, 2, 3, 4].map((r) => row('tb1', r, 25))
+  const pages = paginate(five, { contentHeight: 100 })
+  eq('页数', pages.length, 2)
+  eq('第1页只出一个片段（同表行合并）', pages[0].fragments.length, 1)
+  eq('第1页覆盖 0..4 行', `${pages[0].fragments[0].rowFrom}/${pages[0].fragments[0].rowTo}`, '0/4')
+  eq('第1页不是续排', pages[0].fragments[0].continuation, false)
+  eq('第2页覆盖 4..5 行', `${pages[1].fragments[0].rowFrom}/${pages[1].fragments[0].rowTo}`, '4/5')
+  eq('第2页是续排（跨页必须断开）', pages[1].fragments[0].continuation, true)
+  eq('表格片段没有 kind（表格不是 BlockKind）', pages[0].fragments[0].kind, undefined)
+  eq('整张表共 5 行，一行都没被拆开', pages.reduce((n, p) => n + (p.fragments[0].rowTo - p.fragments[0].rowFrom), 0), 5)
+}
+
+console.log('\n=== 11. 表格行放不下就整行挪走，不吃孤行控制的副作用 ===')
+{
+  const row = (id, r, height) => ({ t: 'tableRow', blockId: id, row: r, height })
+  // 3 行段落占 75px，剩 25px 放不下 30px 的一行 → 整行挪到第 2 页（而不是切成半行）
+  const pages = paginate([block('p', { rows: 3, length: 30, lineHeight: 25 }), row('tb1', 0, 30)], {
+    contentHeight: 100,
+  })
+  eq('页数', pages.length, 2)
+  eq('第1页只有段落', pages[0].fragments.length, 1)
+  eq('表格整行挪到第 2 页', pages[1].fragments[0].blockId, 'tb1')
+  eq('第2页那一行是完整的', pages[1].fragments[0].rowTo - pages[1].fragments[0].rowFrom, 1)
+
+  // 刚好放得下就放：1 行段落 + 75px 的表行 = 100px
+  const fits = paginate([block('p', { rows: 1, length: 10, lineHeight: 25 }), row('tb1', 0, 75)], {
+    contentHeight: 100,
+  })
+  eq('放得下就与段落同页', fits.length, 1)
+  eq('同页两个片段（段落 + 表格）', fits[0].fragments.length, 2)
+
+  // 差 1px 放不下：仍然整行挪走，不依赖 widow/orphan 分支的副作用
+  const notFit = paginate([block('p', { rows: 1, length: 10, lineHeight: 25 }), row('tb1', 0, 76)], {
+    contentHeight: 100,
+  })
+  eq('放不下就换页', notFit.length, 2)
+  eq('第2页整行承接', `${notFit[1].fragments[0].rowFrom}/${notFit[1].fragments[0].rowTo}`, '0/1')
+}
+
+console.log('\n=== 12. 表格：不同表不合并；一页一张 <table> ===')
+{
+  const row = (id, r, h) => ({ t: 'tableRow', blockId: id, row: r, height: h })
+  const pages = paginate(
+    [row('tbA', 0, 25), row('tbA', 1, 25), row('tbB', 0, 25), row('tbB', 1, 25)],
+    { contentHeight: 100 },
+  )
+  eq('页数', pages.length, 1)
+  eq('两张表各出一个片段', pages[0].fragments.length, 2)
+  eq('第一片是 tbA 的 0..2', `${pages[0].fragments[0].blockId}:${pages[0].fragments[0].rowFrom}/${pages[0].fragments[0].rowTo}`, 'tbA:0/2')
+  eq('第二片是 tbB 的 0..2', `${pages[0].fragments[1].blockId}:${pages[0].fragments[1].rowFrom}/${pages[0].fragments[1].rowTo}`, 'tbB:0/2')
+}
+
+console.log('\n=== 13. 表格与段落混排、换页标记、超版心兜底 ===')
+{
+  const row = (id, r, h) => ({ t: 'tableRow', blockId: id, row: r, height: h })
+
+  // 表格后面紧接着一个段落：同页继续排（表格没有段后距）
+  const mixed = paginate([row('tb1', 0, 25), row('tb1', 1, 25), block('p', { rows: 1, length: 10, lineHeight: 25 })], {
+    contentHeight: 100,
+  })
+  eq('混排同页', mixed.length, 1)
+  eq('表格合并后 + 段落 = 2 片', mixed[0].fragments.length, 2)
+  eq('段落那一片接着排', mixed[0].fragments[1].blockId, 'p')
+
+  // 分页符紧跟在表格之后：标记落在表格所在页底部
+  const withBreak = paginate(
+    [row('tb1', 0, 25), { t: 'break', blockId: 'pgx', kind: 'page', restartNumbering: false }, block('p', { rows: 1, length: 10 })],
+    { contentHeight: 100 },
+  )
+  eq('换页标记生效', withBreak.length, 2)
+  eq('标记挂在第1页', withBreak[0].breaks[0]?.blockId, 'pgx')
+  eq('第2页是新段落', withBreak[1].fragments[0].blockId, 'p')
+
+  // 一行比整页还高：兜底放一行，不死循环
+  const huge = paginate([row('tb1', 0, 500), row('tb1', 1, 25)], { contentHeight: 100 })
+  eq('超版心行不死循环', huge.length, 2)
+  eq('第1页放下那一行', `${huge[0].fragments[0].rowFrom}/${huge[0].fragments[0].rowTo}`, '0/1')
+  eq('第2页是下一行', `${huge[1].fragments[0].rowFrom}/${huge[1].fragments[0].rowTo}`, '1/2')
+}
+
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
 process.exit(failed === 0 ? 0 : 1)

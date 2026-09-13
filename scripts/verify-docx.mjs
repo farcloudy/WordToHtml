@@ -20,6 +20,7 @@ import JSZip from 'jszip'
 
 import {
   DOC_TEMPLATES,
+  allInlineHolders,
   lengthToPx,
   normalizeBlocks,
   parseMd,
@@ -71,7 +72,8 @@ const SAMPLE = [
   '> 单位：元',
   '| **项目** | **金额** |',
   '| 甲资产 | 1,234.00 |',
-  '| 乙资产 | 5,678.90 |',
+  // 格内软换行（{br} → <w:br/>）：Word 读回来是垂直制表符 chr(11)，assert-docx 按这个对账
+  '| 乙资产{br}（含附属设施） | 5,678.90 |',
   // 格内 `{红|…}` 的那枚竖线是内容、不是列分隔符：切格必须跳 `{}` 指令（只数反斜杠会把它切开）
   '| {红|丙资产} | 9,999.00 |',
   // `\|` 是内容里的竖线、`\\` 是内容里的反斜杠：切格必须数反斜杠，否则会被切开
@@ -214,6 +216,26 @@ writeFileSync(outPath, buffer)
   if (notSingle.length > 0) problems.push(`这些 w:u 不是 single：${notSingle.join('、')}`)
 
   /*
+   * 软换行必须在字节层看得见。Word 报的 Range.Text 里它是 chr(11)，那只说明「换行生效了」，
+   * 看不出是哪一层写出来的（段落标记、单元格标记也都带控制符），所以直接数字节：
+   * 模型里有几枚软换行，document.xml 里就该有几个**不带属性**的 <w:br/>。
+   * 正则刻意不放宽：`<w:br w:type="page"/>` 是分页符，不能混进来。
+   */
+  const softBreakTags = [...docXml.matchAll(/<w:br\/>/g)].length
+  const modelSoftBreaks = allInlineHolders(model).reduce(
+    (n, holder) => n + holder.inlines.filter((i) => i.t === 'break').length,
+    0,
+  )
+  if (usedBuiltinSample && modelSoftBreaks === 0) {
+    problems.push('内置样本里没有软换行 —— 这一项等于没验')
+  }
+  if (softBreakTags !== modelSoftBreaks) {
+    problems.push(
+      `软换行数不符：document.xml 里 ${softBreakTags} 处 <w:br/>，模型里 ${modelSoftBreaks} 处`,
+    )
+  }
+
+  /*
    * 表格：总宽/布局/行高/禁断行/整行合并/顶端对齐都必须在字节层面看得见。
    * 期望值全部从模型与规格表推导（总宽 = 版心宽、行高 = minLines × 列表段落行距），
    * 不从 Word 读回来的数推。
@@ -291,6 +313,7 @@ writeFileSync(outPath, buffer)
       `${grids.length} 处 docGrid（${grids[0]}）`,
   )
   console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
+  console.log(`[ok] 软换行：${softBreakTags} 处 <w:br/>（模型里 ${modelSoftBreaks} 枚）`)
   if (tables.length > 0) {
     console.log(`[ok] 表格：${tables.length} 张，总宽/固定布局/行高/禁断行/整行合并/顶端对齐均在字节层核对`)
   }

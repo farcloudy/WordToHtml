@@ -41,16 +41,49 @@ export interface MeasuredBreak {
   restartNumbering: boolean
 }
 
-export type MeasuredItem = MeasuredBlock | MeasuredBreak
+/**
+ * 表格的一行（已经量好高度）。
+ *
+ * 行是**原子**的：表格的断行只发生在行与行之间（Word 的 w:cantSplit 语义），
+ * 行内不做切分，所以这里没有 rowStarts，只有实测行高。
+ */
+export interface MeasuredTableRow {
+  t: 'tableRow'
+  /** 表格块 id */
+  blockId: string
+  /** 行在 block.rows 里的下标 */
+  row: number
+  /** 实测行高（px） */
+  height: number
+}
 
+export type MeasuredItem = MeasuredBlock | MeasuredBreak | MeasuredTableRow
+
+/**
+ * 一页里的一个片段。
+ *
+ * 分两种：段落片段（kind / from / to 有意义）与**表格片段** ——
+ * 表格按行装箱，一段可以覆盖若干整行，所以它用 rowFrom / rowTo 表达，且
+ * `kind` 为空：表格不是 BlockKind，硬塞一个（比如 listItem）会让「这是什么块」
+ * 变成一句假话。判别方式就是 `rowFrom !== undefined`。
+ */
 export interface PageFragment {
   blockId: string
-  kind: BlockKind
-  /** 在「显示文字」坐标系里的起止字符偏移 */
+  /** 段落片段的样式类别；表格片段为空 */
+  kind?: BlockKind
+  /** 在「显示文字」坐标系里的起止字符偏移（表格片段置 0，字符区间对它无意义） */
   from: number
   to: number
   /** true 表示这是上一页同一段落后半截（页顶续排，不缩进、不叠段前距） */
   continuation: boolean
+  /** 表格片段：本片覆盖的表格行区间 [rowFrom, rowTo)（半开）。段落片段没有这两个字段 */
+  rowFrom?: number
+  rowTo?: number
+}
+
+/** 是不是表格片段（`kind` 为空、带行区间） */
+export function isTableFragment(frag: PageFragment): boolean {
+  return frag.rowFrom !== undefined
 }
 
 /** 一枚换页标记（页底要画出来的那条） */
@@ -126,6 +159,30 @@ export function paginate(
   }
 
   /**
+   * 放下一整行表格。
+   *
+   * **同页相邻的同表行必须合并成一个片段**：一页只出一张 `<table>`，
+   * 每行一个片段就会渲出「一行一张表」，边框与列宽各算各的。
+   * 跨页时必须断开（页间本来就不是同一个 `<table>`），所以只在「本页最后一个片段
+   * 就是同一张表」时才往后延 rowTo，否则新起一个片段（continuation = 不是从第 0 行开始）。
+   */
+  const placeTableRow = (item: MeasuredTableRow): void => {
+    const last = fragments[fragments.length - 1]
+    if (last !== undefined && last.rowFrom !== undefined && last.blockId === item.blockId) {
+      last.rowTo = item.row + 1
+      return
+    }
+    fragments.push({
+      blockId: item.blockId,
+      from: 0,
+      to: 0,
+      continuation: item.row > 0,
+      rowFrom: item.row,
+      rowTo: item.row + 1,
+    })
+  }
+
+  /**
    * 还没能找到落点的标记。只有一种情况会积在这里：整篇文档一开头就是换页标记 ——
    * 那时还没有任何一页可挂，先记着，等第一页出现时一起画上去。
    */
@@ -153,6 +210,21 @@ export function paginate(
       }
       stepNumbering(item)
       cursor = 0
+      continue
+    }
+
+    if (item.t === 'tableRow') {
+      /*
+       * 表格行的**独立分支**：行是原子的，不进孤行控制。
+       *
+       * 不能让它落进下面的 widow/orphan 算术：那里的 `take = Math.min(fit, rowsLeft - 2)`
+       * 对单行项会算成 -1 → take=0 → 整项挪到下一页。「放不下就整行挪走」行为上恰好是对的，
+       * 但那是副作用，不是承诺 —— 显式写出来才不会在别人动孤行控制时被带坏。
+       */
+      if (cursor > 0 && item.height > contentHeight - cursor) newPage()
+      // cursor 已是 0 却仍放不下（一行比整页还高）：兜底放下去，否则会死循环
+      placeTableRow(item)
+      cursor += item.height
       continue
     }
 

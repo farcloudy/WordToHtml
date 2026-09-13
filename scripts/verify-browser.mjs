@@ -85,6 +85,9 @@ const analyzePage = (kinds) => {
       return {
         kind: el.className.replace('wtp-', ''),
         blockId: el.dataset.blockId ?? '',
+        // 表格片段的外层按设计不挂 data-block-id（格内 div 才是可寻址的块），
+        // 它的身份在 data-table-id 上 —— 对账表格时必须用这个键，否则永远取不到渲染高
+        tableId: el.dataset.tableId ?? '',
         height,
         marginTop: round(mt),
         marginBottom: round(mb),
@@ -127,16 +130,17 @@ const analyzePage = (kinds) => {
     el.remove()
   }
 
-  const continuations = Array.from(document.querySelectorAll('[data-continuation="1"]')).map(
-    (el) => {
-      const cs = getComputedStyle(el)
-      return {
-        textIndent: parseFloat(cs.textIndent),
-        marginTop: parseFloat(cs.marginTop),
-        text: (el.textContent ?? '').slice(0, 16),
-      }
-    },
-  )
+  // 续排片段只取段落片段（表格片段的外层没有 data-block-id，它没有「首行缩进」这回事）
+  const continuations = Array.from(
+    document.querySelectorAll('[data-continuation="1"][data-block-id]'),
+  ).map((el) => {
+    const cs = getComputedStyle(el)
+    return {
+      textIndent: parseFloat(cs.textIndent),
+      marginTop: parseFloat(cs.marginTop),
+      text: (el.textContent ?? '').slice(0, 16),
+    }
+  })
 
   // 页带的可用宽与实际内容宽：并排时「不横向溢出」就看这一对数
   const strip = document.querySelector('.wtp-pages')
@@ -330,16 +334,18 @@ try {
       return paper.getMeasurements().map((m) =>
         m.t === 'break'
           ? { t: 'break', kind: m.kind, id: m.blockId }
-          : {
-              t: 'block',
-              id: m.blockId,
-              kind: m.kind,
-              rows: m.rows,
-              lineHeight: m.lineHeight,
-              before: m.spaceBefore,
-              after: m.spaceAfter,
-              length: m.displayLength,
-            },
+          : m.t === 'tableRow'
+            ? { t: 'tableRow', id: m.blockId, row: m.row, height: m.height }
+            : {
+                t: 'block',
+                id: m.blockId,
+                kind: m.kind,
+                rows: m.rows,
+                lineHeight: m.lineHeight,
+                before: m.spaceBefore,
+                after: m.spaceAfter,
+                length: m.displayLength,
+              },
       )
     })
 
@@ -350,10 +356,12 @@ try {
       const rendered = new Map()
       for (const p of report.pages) {
         for (const it of p.items) {
-          const cur = rendered.get(it.blockId) ?? { height: 0, pieces: 0 }
+          const key = it.tableId || it.blockId
+          if (key === '') continue
+          const cur = rendered.get(key) ?? { height: 0, pieces: 0 }
           cur.height += it.height
           cur.pieces += 1
-          rendered.set(it.blockId, cur)
+          rendered.set(key, cur)
         }
       }
 
@@ -362,6 +370,7 @@ try {
           console.log(`        [${m.kind === 'section' ? '分节符' : '分页符'}]`)
           continue
         }
+        if (m.t === 'tableRow') continue
         const r = rendered.get(m.id) ?? { height: 0, pieces: 0 }
         const fromMeasurement = round2(m.rows * m.lineHeight)
         const match = Math.abs(fromMeasurement - r.height) < 1.5
@@ -375,6 +384,28 @@ try {
           `  ${match ? 'ok  ' : 'BAD '} ${m.kind.padEnd(10)} ` +
             `量测 ${m.rows}行×${String(round2(m.lineHeight)).padStart(6)}=${String(fromMeasurement).padStart(7)}px ` +
             `渲染${String(r.height).padStart(7)}px(${r.pieces}片) 段前后${round2(m.before)}/${round2(m.after)}`,
+        )
+      }
+
+      // 表格：按表把各行量测高加起来，与渲染出来的表格片高对账
+      //（同一张表可能被分页切成几片，渲染那侧也按 blockId 累加，所以两边口径一致）
+      const tableTotals = new Map()
+      for (const m of measurements) {
+        if (m.t !== 'tableRow') continue
+        tableTotals.set(m.id, (tableTotals.get(m.id) ?? 0) + m.height)
+      }
+      for (const [id, measuredTotal] of tableTotals) {
+        const r = rendered.get(id) ?? { height: 0, pieces: 0 }
+        const match = Math.abs(measuredTotal - r.height) < 1.5
+        if (!match) {
+          failures.push(
+            `${tag} 表格 量测各行合计 ${round2(measuredTotal)}px，渲染 ${r.height}px`,
+          )
+        }
+        console.log(
+          `  ${match ? 'ok  ' : 'BAD '} 表格       ` +
+            `量测各行合计=${String(round2(measuredTotal)).padStart(7)}px ` +
+            `渲染${String(r.height).padStart(7)}px(${r.pieces}片) id=${id}`,
         )
       }
     }

@@ -2,14 +2,16 @@
  * 查找与替换的纯函数层（不碰 DOM，可在 node 里单测）。
  *
  * 坐标系与 edit/model.ts 一致：偏移是**模型文字坐标**，不含标题自动编号前缀。
- * 查找跑在每个块的「可搜索文字」上 —— 也就是把块内文字按顺序连起来、但跳过删除修订
- * 的文字。批注锚点不占字符，格式切换也不占字符，所以它们都不会让匹配漏掉。
+ * 查找跑在每个**可编辑容器**的可搜索文字上 —— 段落，以及表格的每个格子
+ *（格子 id 用 cellId，与预览 DOM 的 data-block-id 同一套）。可搜索文字 = 把容器内
+ * 文字按顺序连起来、但跳过删除修订的文字；批注锚点与软换行不占字符，都不会让匹配漏掉。
  *
  * 默认大小写敏感（与公文场景一致，不做「忽略大小写」选项）。
  */
 
-import type { DocModel, RevMark, TextBlock, TextInline } from '../types'
-import { blockLength, deleteRange, findBlock, replaceRange } from './model'
+import type { DocModel, Inline, InlineHolder, RevMark, TextInline } from '../types'
+import { cellId } from '../types'
+import { containerLength, deleteRange, findContainer, replaceRange } from './model'
 
 /** 匹配区间（模型文字坐标） */
 export interface Match {
@@ -59,12 +61,12 @@ interface SearchRun {
   text: string
 }
 
-function searchRuns(block: TextBlock): SearchRun[] {
+function searchRuns(inlines: readonly Inline[]): SearchRun[] {
   const runs: SearchRun[] = []
   let cursor = 0
   let current: SearchRun | null = null
 
-  for (const inline of block.inlines) {
+  for (const inline of inlines) {
     if (inline.t !== 'text') continue
     const start = cursor
     cursor += inline.text.length
@@ -83,6 +85,27 @@ function searchRuns(block: TextBlock): SearchRun[] {
   }
 
   return runs
+}
+
+/**
+ * 全篇可搜索的容器（段落 + 表格格子），带各自的 id（格子用 cellId，与 DOM 的
+ * data-block-id 同一套）。查找/替换因此天然覆盖格内文字。
+ */
+function searchableContainers(doc: DocModel): { id: string; inlines: readonly Inline[] }[] {
+  const out: { id: string; inlines: readonly Inline[] }[] = []
+  for (const block of doc.blocks) {
+    if (block.t === 'textBlock') {
+      out.push({ id: block.id, inlines: block.inlines })
+      continue
+    }
+    if (block.t !== 'table') continue
+    block.rows.forEach((row, r) => {
+      row.cells.forEach((cell, c) => {
+        out.push({ id: cellId(block.id, r, c), inlines: cell.inlines })
+      })
+    })
+  }
+  return out
 }
 
 function collectInRun(blockId: string, run: SearchRun, re: RegExp): Match[] {
@@ -120,12 +143,11 @@ export function findMatches(doc: DocModel, query: string, opts: SearchOptions = 
   const limited = opts.scope !== undefined
 
   const out: Match[] = []
-  for (const block of doc.blocks) {
-    if (block.t !== 'textBlock') continue
-    const allowed = limited ? scopes.get(block.id) : undefined
+  for (const container of searchableContainers(doc)) {
+    const allowed = limited ? scopes.get(container.id) : undefined
     if (limited && (!allowed || allowed.length === 0)) continue
-    for (const run of searchRuns(block)) {
-      for (const match of collectInRun(block.id, run, re)) {
+    for (const run of searchRuns(container.inlines)) {
+      for (const match of collectInRun(container.id, run, re)) {
         // 区间限定：整段匹配都落在同一个 scope 里才算命中
         if (allowed && !allowed.some((s) => match.from >= s.from && match.to <= s.to)) continue
         out.push(match)
@@ -137,13 +159,13 @@ export function findMatches(doc: DocModel, query: string, opts: SearchOptions = 
 
 /** 替换结果继承被替换区间内第一个 text 片段的格式：换掉一段加粗文字不该静默丢格式 */
 function firstTextFormat(
-  block: TextBlock,
+  container: InlineHolder,
   from: number,
   to: number,
 ): { bold?: boolean; underline?: boolean; color?: string } {
   const fmt: { bold?: boolean; underline?: boolean; color?: string } = {}
   let cursor = 0
-  for (const inline of block.inlines) {
+  for (const inline of container.inlines) {
     if (inline.t !== 'text') continue
     const start = cursor
     const end = cursor + inline.text.length
@@ -178,24 +200,24 @@ export function replaceMatches(
 
   let count = 0
   for (const [blockId, list] of byBlock) {
-    const block = findBlock(doc, blockId)
-    if (!block) continue
+    const container = findContainer(doc, blockId)
+    if (!container) continue
     list.sort((a, b) => b.from - a.from)
     for (const match of list) {
-      const len = blockLength(block)
+      const len = containerLength(container)
       const from = Math.max(0, Math.min(match.from, len))
       const to = Math.max(from, Math.min(match.to, len))
       if (to <= from) continue
-      const piece: TextInline = { t: 'text', text, ...firstTextFormat(block, from, to) }
+      const piece: TextInline = { t: 'text', text, ...firstTextFormat(container, from, to) }
       if (makeRev) {
         // kind 由这里按用途覆盖，调用方只需给出唯一 id / 作者 / 时间
         const delMark: RevMark = { ...makeRev(match), kind: 'del' }
         const insMark: RevMark = { ...makeRev(match), kind: 'ins' }
         deleteRange(doc, blockId, from, to, delMark)
         // 新文字落在被删文字之后：读起来是「删除线 + 新文字」，与 Word 一致
-        replaceRange(block, to, to, [{ ...piece, rev: insMark }])
+        replaceRange(container, to, to, [{ ...piece, rev: insMark }])
       } else {
-        replaceRange(block, from, to, [piece])
+        replaceRange(container, from, to, [piece])
       }
       count += 1
     }

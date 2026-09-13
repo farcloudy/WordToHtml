@@ -37,7 +37,18 @@ export interface CommentEndInline {
   commentId: number
 }
 
-export type Inline = TextInline | CommentStartInline | CommentEndInline
+/**
+ * 软换行，对应 Word 的 `<w:br/>`（单元格里 Shift+Enter 的产物）。
+ *
+ * **零宽**：它不占字符位 —— plainText、块长度、分页的字符偏移坐标系、
+ * sliceInlines/sliceStrict 的区间全都按「它不存在」来算，所以量测与分页算术
+ * 一行都不用改。它只影响渲染（多一个行盒）与导出（一个 <w:br/>）。
+ */
+export interface BreakInline {
+  t: 'break'
+}
+
+export type Inline = TextInline | CommentStartInline | CommentEndInline | BreakInline
 
 /**
  * 分节符。对应 md 里的独立一行 `---`。
@@ -73,7 +84,7 @@ export interface TextBlock {
  */
 export type TableRowRole = 'unit' | 'body' | 'note'
 
-/** 单元格内容：单段落（不引入软换行，Shift+Enter 的 <w:br/> 是下一步的事） */
+/** 单元格内容：单段落；软换行（Shift+Enter 的 <w:br/>）作为零宽 inline 存在 inlines 里 */
 export interface TableCellModel {
   inlines: Inline[]
 }
@@ -149,22 +160,57 @@ export function nextBlockId(prefix = 'b'): string {
   return `${prefix}${idSeq}`
 }
 
-/** 只统计文字，批注锚点不占字符。分页切分用的字符偏移就是基于这个坐标系。 */
+/** 只统计文字，批注锚点与软换行都不占字符。分页切分用的字符偏移就是基于这个坐标系。 */
 export function plainText(block: Block): string {
   if (block.t !== 'textBlock') return ''
+  return inlinesText(inlinesOf(block))
+}
+
+/** inline 序列里的纯文字（批注锚点、软换行都不占字符） */
+export function inlinesText(inlines: readonly Inline[]): string {
   let s = ''
-  for (const inline of block.inlines) {
+  for (const inline of inlines) {
     if (inline.t === 'text') s += inline.text
   }
   return s
 }
 
+/** 单个 textBlock 的 inline；表格格子没有这个（没有「块」的概念） */
+function inlinesOf(block: Block): readonly Inline[] {
+  return block.t === 'textBlock' ? block.inlines : []
+}
+
+/** 「持有一串 inline」的东西：段落与表格格子都是这个形状 */
+export interface InlineHolder {
+  inlines: Inline[]
+}
+
+/**
+ * 全篇所有可编辑容器的 inlines（段落 + 表格每个格子），按文档顺序。
+ *
+ * 修订标记、批注锚点都可能落在格子里，所以全篇扫描（找修订 id 最大值、清批注锚点……
+ * 这类事）必须走这一条，只遍历 blocks 里能看到的 textBlock 会漏。
+ */
+export function allInlineHolders(doc: DocModel): InlineHolder[] {
+  const out: InlineHolder[] = []
+  for (const block of doc.blocks) {
+    if (block.t === 'textBlock') {
+      out.push(block)
+      continue
+    }
+    if (block.t !== 'table') continue
+    for (const row of block.rows) {
+      for (const cell of row.cells) out.push(cell)
+    }
+  }
+  return out
+}
+
 /** 取块内所有修订标记，便于统计/校验 */
 export function collectRevisions(doc: DocModel): RevMark[] {
   const out: RevMark[] = []
-  for (const block of doc.blocks) {
-    if (block.t !== 'textBlock') continue
-    for (const inline of block.inlines) {
+  for (const holder of allInlineHolders(doc)) {
+    for (const inline of holder.inlines) {
       if (inline.t === 'text' && inline.rev) out.push(inline.rev)
     }
   }
@@ -174,14 +220,14 @@ export function collectRevisions(doc: DocModel): RevMark[] {
 /**
  * 每条批注锚定的文字（Word 里叫 scope），按 id 索引。
  * 批注可以嵌套，所以用栈而不是单个游标；锚点不成对时丢弃，不抛错。
+ * 软换行零宽（不采字），表格格子里的锚点同样算数。
  */
 export function commentScopes(doc: DocModel): Map<number, string> {
   const out = new Map<number, string>()
   const open: { id: number; text: string }[] = []
 
-  for (const block of doc.blocks) {
-    if (block.t !== 'textBlock') continue
-    for (const inline of block.inlines) {
+  for (const holder of allInlineHolders(doc)) {
+    for (const inline of holder.inlines) {
       if (inline.t === 'commentStart') {
         open.push({ id: inline.commentId, text: '' })
         continue
@@ -194,6 +240,7 @@ export function commentScopes(doc: DocModel): Map<number, string> {
         }
         continue
       }
+      if (inline.t !== 'text') continue
       for (const entry of open) entry.text += inline.text
     }
   }
@@ -204,11 +251,19 @@ export function commentScopes(doc: DocModel): Map<number, string> {
  * 按字符区间切出 inline 片段（分页时把跨页的段落切开用）。
  * 批注锚点会跟着它夹住的那段文字一起被切走：起点落在 [from,to) 内才保留，
  * 终点同理，这样跨页后批注仍然锚定在同一段文字上。
+ *
+ * 软换行是零宽的，只能按「落在哪一片里」来分：片首（from>0 的续排片）的那一枚丢掉 ——
+ * 页边界本来就已经把这一行断开了，再多渲一个 <br> 会凭空多出一个行盒，
+ * 而分页算术里没有为它记账（量到的行盒与渲出来的必须一致，否则页面会溢出）。
  */
 export function sliceInlines(inlines: readonly Inline[], from: number, to: number): Inline[] {
   const out: Inline[] = []
   let cursor = 0
   for (const inline of inlines) {
+    if (inline.t === 'break') {
+      if (cursor < to && (from === 0 || cursor > from)) out.push(inline)
+      continue
+    }
     if (inline.t !== 'text') {
       out.push(inline)
       continue

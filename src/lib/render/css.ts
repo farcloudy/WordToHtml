@@ -88,6 +88,32 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     )
   }
 
+  /*
+   * 表格。宽度铺满版心，固定布局、边框合并。
+   *
+   * 单元格左右内边距**必须**与 docx 侧一致：导出侧写死 108 缇 = 5.4pt（docx/export.ts 的
+   * CELL_MARGIN_TWIPS），两侧不同，格内文字相对 Word 就会偏 —— 这不是巧合，是一个共用的数。
+   *
+   * 行高最小值**不能**靠 <tr> 的 min-height（表格行不吃这个属性），所以给格内那层 div 设
+   * min-height：值取「列表段落」的行距 × minLines，与导出侧的 w:trHeight 同源。
+   * ⚠️ 本机无法用浏览器验证这一点（Edge 的程序化启动坏了、不跑 playwright），留给人工核对。
+   *
+   * 另有一处已知偏差（PLAN 6.8）：列表段落样式的 CSS line-height 是固定值 12pt，
+   * 而 Word 的 atLeast 12pt 是「不小于」。单行格两者相同（minLines=2 → 24pt），
+   * 多行格（内容撑高）可能差零点几磅。
+   */
+  out.push(
+    `.${ns}-table { width: 100%; table-layout: fixed; border-collapse: collapse; }`,
+    `.${ns}-table td { border: 0.5pt solid #000; padding: 0 5.4pt; vertical-align: top; ` +
+      `overflow-wrap: break-word; }`,
+    // unit / note 行整行一格且无边框（与导出侧的 NO_BORDERS 对应）
+    `.${ns}-table td.${ns}-td-plain { border: 0; }`,
+    `.${ns}-table .${ns}-listItem { min-height: ${spec.styles.listItem.linePt}pt; }`,
+    `.${ns}-table-min2 .${ns}-listItem { min-height: ${spec.styles.listItem.linePt * 2}pt; }`,
+    // 表格片段自己是普通块（内容宽 = 版心宽），刻意外层不挂 data-block-id（见 render/html.ts）
+    `.${ns}-tableFrag { width: 100%; }`,
+  )
+
   // 修订与批注的预览外观：是近似，不去追求和 Word 像素级一致
   out.push(
     `.${ns}-rev-ins { color: #1b7f3b; text-decoration: underline; text-decoration-color: #1b7f3b; }`,
