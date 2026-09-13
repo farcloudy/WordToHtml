@@ -763,7 +763,7 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
 
 ---
 
-## 7. W5 —— 节编辑框架
+## 7. W5 —— 节编辑框架（已完成 2026-09-13）
 
 **需求原文（issue 第 1 条）**：
 
@@ -798,6 +798,57 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
 - 单测（`test-paginate.mjs`）：分节 + 页码重排 / 连续编号 / 每节不同版心（横竖混排）的页数计算。
 - `verify:p1`：Word COM 读回每节的页面尺寸/方向、`w:pgNumType`、页脚是否存在，与模型对账。
 - `verify:pages`：横竖混排 + 页码重排的样本，预览页数必须等于 Word 页数。
+
+### 7.4 结论（2026-09-13，已提交）
+
+**模型设计先出稿、用户 2026-09-13 过目并拍板**（存法 = `blocks` 保持扁平 + `DocModel.sections` 设置数组；
+「关联前节」与另两项置灰的互斥；不拆波、一波做完；界面形态 = 常驻「节」上下文工具条）。设计原样落地，
+**两处设计稿的猜测被 docx 库实测证伪**（见下，已按正确做法落地）。改动 **22 个文件、+1813/−161**：
+新增 `src/lib/section.ts`（节清单）与 `src/lib/edit/section.ts`（纯模型操作）；改 `types.ts`、`edit/model.ts`、
+`md/{parse,serialize}.ts`、`render/{measure,paginate,css}.ts`、`docx/export.ts`、`components/WordPaper.vue`、
+`App.vue`、`index.ts`、`README.md`、8 个 `scripts/*`。
+
+**本波定下的接口事实（后续照做，别重新设计）**：
+
+- **模型**：`SectionBreakBlock` 只剩 `{ t, id }`（`restartNumbering` 已删，它从未进过 md）；新增
+  `PageOrientation` 与 `SectionSettings`（`pageNumbers` / `linkPrevious` / `restartAtOne` / `orientation`，
+  全可选）；`DocModel.sections?: SectionSettings[]`，**下标 = 节号**，`sections` 若存在则
+  `长度 = 分节符数 + 1`。**整篇全默认时这个字段整个不写**（与围栏 `minLines=1`、格内 `{@listItem|…}`
+  同一条「默认值不落模型」的约定）；`resolveSections()` 必须对 `sections` 缺失 / 偏短兜底
+  （手搓模型、旧 md、旧 docx 读回）。默认值：`numbers=on / link=on / restart=off / portrait`；
+  首节 `linkPrevious` 解析时强制 `false`。
+- **docx 库两个实测坑**：① `createPageSize` 在 `orientation=landscape` 时**自己互换** w/h ——
+  所以要传**纵向尺寸 + orientation**，写互换值会被换两遍（设计稿原提的「两者都写且互换」是错的）。
+  ② 库对**每一节**都无条件写一个空 `<w:pgNumType/>`（API 抑制不了，语义等于不写），所以「是否重排」的
+  字节判据只能看 `w:start="1"` 在不在。
+- **「关联前节」= 不写 `<w:footerReference>`**（实测：不传 `footers` 就真的不写，能表达继承）；
+  `link=off + numbers=off` 写**空页脚**（否则会继承上一节的页码，「无页码」做不到）。
+- **逐节几何**：量测**按节分段**（遇分节符先 flush 完 `getClientRects` 再改探针宽度），缓存签名**含版心宽度**
+  （`PLAN.md` 9.x 那条「换规格必须清缓存」从此由签名保证）；`paginate` 吃 `options.sections`
+  （下标 = 节号，缺项兜底 contentHeight / 显示页码 / 不重排），`PageLayout.showPageNumber` 由
+  `resolveSections` 解析后原样搬运；预览每页走**行内几何**，打印用两档**命名 `@page`**
+  （`wtp-portrait` / `wtp-landscape`），一页一张纸的行为未变。
+- **md**：分节符 `---` 后可跟 kwargs（只写非默认值，描述**它开启的**那一节）；首节用**文档首行**
+  `::section …`（只认第一处非空行）。
+- **顺手修掉的真缺陷**：`sameLayout` 原来只比片段与页码，单行节 / 空节切方向时量测与片段完全相同 →
+  判「没变化」→ 不重建 DOM（模型已横、纸还竖）。已把逐节几何并入比较。
+- UI：`App.vue` 新增 `.section-toolbar`（编辑模式常驻，内容来自 `selection-change` 的 `section` 上下文：
+  `第 N 节 / 共 M 节` + 方向 + 三开关）；首节「关联前节」与「从 1 开始」都置灰，`link=是` 时页码与
+  「从 1 开始」置灰；结构操作后补 `void nextTick(emitSelection)`。
+
+**机器验收（全绿）**：`type-check` 0 错；`test-paginate` 96 → **109**；`test-edit-model` 433 → **505**；
+`verify:docx` 全 ok（逐节 `w:pgSz` / `w:orient` / `w:pgNumType` / `footerReference` 均在字节层核对）；
+`verify:p1` Word COM `[PASS]`（4 节，方向 / 页脚 / 域 / 页码逐节吻合）。
+
+**独立验收结论「可接受、无阻断项」**：11 项定向证伪全过 —— 读 `node_modules/docx` 源码复核 orientation 那两条、
+自写探针 63 项（模型不变式 + md 往返字节稳定 + 兜底）、自造 6 节 docx 独立推算字节期望（补了仓库样本缺的那类
+组合）、**3 条变异测试全部被断言抓住**；未越界（未动 `PLAN.md`、`check-docx.ps1` 仍纯 ASCII、无格式化改动），
+验收方全程对仓库**零改动**（提交前逐文件 sha256 比对相同）。它另确认 `assert-docx` / `verify-page-count`
+等 5 个脚本的断言是**按新语义重写、不是放宽**。
+
+**没做机器验证的**：`verify-browser` / `verify-editor` 新增的逐节几何（横竖页宽高不同）、命名 `@page`、
+开关页码只影响本节、节工具条的回显与置灰；`verify:p2` / `p3` / `pages` 依旧没跑（Edge 坏，见 9.7）——
+一律待**人工核对**。次要项见第 8 节第 10 条。
 
 ---
 
@@ -875,6 +926,16 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
    同一个「输出只写非默认值」的约定，见 6.13。
    另：8 条②的**幻影格**问题本波只堵了一半 —— 键盘跨格（`stepCell`）现在会跳过渲染补出来的幻影格，
    但**在幻影格里打字仍然不落模型**（`findContainer` 找不到那些格）。
+10. **W5 验收发现的三处**（记在这里免得只躺在验收结论里）：
+    ① **`--- 文字` 会被静默吃字**：`SECTION_BREAK_RE` 放宽成 `/^-{3,}(?:\s+(.*))?$/` 之后，`--- 备注`
+    这种行被当成带 kwargs 的分节符、其后的文字被丢掉；在 HEAD 下它是普通正文。UI 产不出这种行（编辑器
+    只写 `---` 或不写），只有手写 md / `--source` 喂外部 md 才会踩到 —— 风险低，但属静默丢字。
+    要修就把判据收紧成「`---` 尾部只能是一串已知的 `key=value`」，其余情况**落回正文**，与 `parse.ts`
+    里「围栏没闭合绝不当表格、绝不吞后文」是同一条原则。
+    ② 内置样本（`verify-docx.mjs`）只覆盖了 3 类非首节组合，缺「`link=off` + `numbers=on` + `restart=off`
+    （独立页脚、页码接着数）」那一类；验收方用独立探针在字节层单独验过它是对的。
+    ③ `types.ts` 里 `sections` 的注释只说了「单节全默认时省略」，而实现是**整篇全默认就省略**（多节也省）；
+    措辞与实现不符，属文档问题。
 
 ---
 
@@ -936,7 +997,7 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
 | W4a-2 | 表格：预览渲染 + 量测 + 分页 + 编辑读回收口 + demo 样本放表 + 「插入表格」按钮 + 软换行 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收「可接受」并修掉一处必修缺陷；**版式一致性改人工核对**，结论见 6.9） |
 | W4b-1 | 表格：结构操作（增删行列、unit/note radio、行高两档）+ 上下文工具条 + 格内 Shift+Enter + 边界护栏 | **已完成**（2026-09-13，本次提交；机器验全绿，独立验收与增量复核均判「可接受」，结论见 6.11） |
 | W4b-2 | 表格：Tab / 方向键跨格导航 + 追加三条（删除整表的按钮、格内可套用其它样式、水平/垂直两组对齐） | **已完成**（2026-09-13，提交 `12ac99d`；独立验收「可接受」，5 条变异全被断言抓住，一条非阻断缺陷已在提交前修掉；结论见 6.13） |
-| W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |
+| W5 | 节编辑框架（逐节页码三开关 + 纸张方向 + 常驻「节」工具条） | **已完成**（2026-09-13，本次提交；模型设计先过用户闸门，机器验全绿，独立验收「可接受、无阻断项」并用 3 条变异确认断言有效；版式改人工核对，结论见 7.4） |
 
 **收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。
 往后的维护约定：每开一波之前先回来读一遍对应小节；每完成一波，把该波标题改成「（已完成 YYYY-MM-DD）」、
