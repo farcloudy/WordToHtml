@@ -20,6 +20,7 @@ export interface TextInline {
   t: 'text'
   text: string
   bold?: boolean
+  underline?: boolean
   /** 十六进制颜色，不带 #，例如 'FF0000' */
   color?: string
   rev?: RevMark

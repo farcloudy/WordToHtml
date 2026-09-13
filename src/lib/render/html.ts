@@ -5,8 +5,8 @@
  * 这样「量到的」和「看到的」一定是同一套 DOM 结构。
  *
  * 编辑层也依赖这一套结构：读回 DOM 时靠 .wtp-num / .wtp-comment /
- * .wtp-rev-* 这些类名与 data-* 属性还原模型，所以它们的形态是接口的一部分，
- * 改类名或去掉 data-* 会同时打断编辑与量测。
+ * .wtp-rev-* 这些类名、data-* 属性与 <b> / <u> 这两个行内标签还原模型，
+ * 所以它们的形态是接口的一部分，改类名、去掉 data-* 或改标签名会同时打断编辑与量测。
  */
 
 import type { Inline } from '../types'
@@ -69,6 +69,7 @@ export function renderInlinesHtml(
     }
     if (inline.color) inner = `<span style="color:#${inline.color}">${inner}</span>`
     if (inline.bold) inner = `<b>${inner}</b>`
+    if (inline.underline) inner = `<u>${inner}</u>`
     out += inner
   }
 

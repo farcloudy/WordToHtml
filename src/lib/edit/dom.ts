@@ -5,7 +5,7 @@
  * 段落被分页切开时，同一块会在不同页上出现多片，每片带着自己的 data-from / data-to
  * （显示坐标，含自动编号前缀）。这个文件负责两件只跟浏览器有关的事：
  *
- *   1. 把一片 DOM 读回模型的 inline 序列（加粗、改色、修订、批注锚点都认）；
+ *   1. 把一片 DOM 读回模型的 inline 序列（加粗、下划线、改色、修订、批注锚点都认）；
  *   2. 把插入符 / 选区在「显示坐标」与真实 DOM 位置之间来回换算 ——
  *      重排会重建 DOM，插入符必须靠坐标还回去，不能靠节点引用。
  *
@@ -71,6 +71,7 @@ export function cssColorToHex(value: string): string | undefined {
 
 interface InlineContext {
   bold: boolean
+  underline: boolean
   color?: string
   rev?: RevMark
 }
@@ -82,6 +83,9 @@ function contextOf(el: HTMLElement, inherited: InlineContext): InlineContext {
   if (weight === 'bold' || weight === '700' || weight === '800' || weight === '900') {
     next.bold = true
   }
+  // 只看 <u> 与行内 style：修订/批注的着色来自样式表，不该被读成下划线
+  if (el.tagName === 'U') next.underline = true
+  if (el.style.textDecorationLine.includes('underline')) next.underline = true
   const color = cssColorToHex(el.style.color)
   if (color) next.color = color
   if (el.tagName === 'FONT') {
@@ -104,13 +108,17 @@ function inlineOf(text: string, ctx: InlineContext): Inline {
     t: 'text',
     text,
     ...(ctx.bold ? { bold: true } : {}),
+    ...(ctx.underline ? { underline: true } : {}),
     ...(ctx.color ? { color: ctx.color } : {}),
     ...(ctx.rev ? { rev: ctx.rev } : {}),
   }
 }
 
 /** 把一片预览 DOM 读回 inline 序列。自动编号（.wtp-num）不是模型内容，跳过。 */
-export function readInlines(root: Node, inherited: InlineContext = { bold: false }): Inline[] {
+export function readInlines(
+  root: Node,
+  inherited: InlineContext = { bold: false, underline: false },
+): Inline[] {
   const out: Inline[] = []
   for (const child of Array.from(root.childNodes)) {
     if (child.nodeType === TEXT_NODE) {

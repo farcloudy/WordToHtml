@@ -33,6 +33,7 @@ function escapeText(text: string): string {
     .replace(/\{/g, '\\{')
     .replace(/\}/g, '\\}')
     .replace(/\*\*/g, '\\*\\*')
+    .replace(/__/g, '\\_\\_')
     .replace(/\[\[/g, '\\[[')
 }
 
@@ -54,6 +55,7 @@ function serializeInlines(
 
     let s = escapeText(inline.text)
     if (inline.bold) s = `**${s}**`
+    if (inline.underline) s = `__${s}__`
     if (inline.color) s = `{#${inline.color}|${s}}`
     if (inline.rev) s = inline.rev.kind === 'ins' ? `{+${s}}` : `{-${s}}`
     out += s

@@ -76,6 +76,7 @@ export {
   mergeIntoPrevious,
   rangeColor,
   rangeIsBold,
+  rangeIsUnderline,
   removeBlock,
   removeBreak,
   removeComment,
@@ -87,6 +88,8 @@ export {
   updateComment,
 } from './edit/model'
 export type { BlockPoint, EditorSelection } from './edit/model'
+
+export { formatAmount } from './edit/amount'
 
 export {
   cssColorToHex,

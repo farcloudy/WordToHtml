@@ -343,7 +343,7 @@ export const DEFAULT_SPEC: Spec = {
       sizePt: 10.5,
       bold: false,
       align: 'both',
-      firstLineChars: 2,
+      firstLineChars: 0,
       lineRule: 'atLeast',
       linePt: 12,
       spaceBeforeLines: 0,

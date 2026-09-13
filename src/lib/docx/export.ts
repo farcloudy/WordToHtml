@@ -28,6 +28,7 @@ import {
   Packer,
   Paragraph,
   TextRun,
+  UnderlineType,
 } from 'docx'
 import type {
   ICommentOptions,
@@ -178,6 +179,9 @@ function textBlockParagraph(
     const base = {
       text: inline.text,
       ...(inline.bold ? { bold: true } : {}),
+      // 下划线与加粗同为一处 run 属性：docx 的 underline 是对象，只有写了 type
+      // 才会输出 <w:u>（不写等于不加下划线，没有「true」这种简写）
+      ...(inline.underline ? { underline: { type: UnderlineType.SINGLE } } : {}),
       ...(inline.color ? { color: inline.color } : {}),
     }
 

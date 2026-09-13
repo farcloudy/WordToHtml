@@ -20,6 +20,7 @@
  *
  * 行内标记：
  *   **文字**          加粗
+ *   __文字__          下划线
  *   {红|文字}         改色，支持中文色名或 #RRGGBB
  *   {+文字}           插入修订
  *   {-文字}           删除修订
@@ -62,6 +63,7 @@ function normalizeColor(token: string): string | undefined {
 
 interface InlineContext {
   bold: boolean
+  underline: boolean
   color?: string
   rev?: RevMark
   comments: CommentDef[]
@@ -168,6 +170,7 @@ function parseInline(src: string, ctx: InlineContext): Inline[] {
       t: 'text',
       text: buffer,
       ...(ctx.bold ? { bold: true } : {}),
+      ...(ctx.underline ? { underline: true } : {}),
       ...(ctx.color ? { color: ctx.color } : {}),
       ...(ctx.rev ? { rev: ctx.rev } : {}),
     })
@@ -189,6 +192,16 @@ function parseInline(src: string, ctx: InlineContext): Inline[] {
       if (close >= 0 && close > i + 2) {
         flush()
         out.push(...parseInline(src.slice(i + 2, close), { ...ctx, bold: true }))
+        i = close + 2
+        continue
+      }
+    }
+
+    if (src.startsWith('__', i)) {
+      const close = findClosing(src, i + 2, '__')
+      if (close >= 0 && close > i + 2) {
+        flush()
+        out.push(...parseInline(src.slice(i + 2, close), { ...ctx, underline: true }))
         i = close + 2
         continue
       }
@@ -267,6 +280,7 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
 
   const baseCtx = {
     bold: false,
+    underline: false,
     comments,
     author,
     now,

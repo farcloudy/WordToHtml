@@ -5,8 +5,11 @@
  *   1. 正常输入**不触发重排** —— 用「给片段元素打标记，敲完字标记还在」来证明
  *      DOM 没被重建；插入符自然也不会丢；
  *   2. 真的需要重排时（行数变了），插入符还能按块 id + 字符偏移找回来；
- *   3. 结构性操作（回车分段、退格合并）、工具栏（加粗／改色）、修订模式、
- *      批注、撤销，都能落到模型上，并且导出用的就是这份模型。
+ *   3. 结构性操作（回车分段、退格合并）、工具栏（加粗／下划线／改色）、修订模式、
+ *      批注、撤销，都能落到模型上，并且导出用的就是这份模型；
+ *   4. 快捷键：Ctrl+U 下划线、Ctrl+Shift+E 修订模式、Alt+4 金额格式（含无效输入的提示条）、
+ *      工具栏「插入空格」下拉的三个特殊空格码点；
+ *   5. 打印：编辑器外壳全部隐藏、每张纸各占一页、纸张尺寸取自规格表（真打一份 PDF 数页数）。
  *
  * 每一步都同时看两边：DOM 上看到了什么，模型里记下了什么。只看 DOM 会漏掉
  * 「界面改了、导出没改」，只看模型会漏掉「模型改了、界面没跟上」。
@@ -629,6 +632,384 @@ try {
   eq('最后一张确实没有片段', tail.lastFragments, 0)
   eq('空白页页码重排为 1', tail.lastNumber, '1')
   await checkNoOverflow('H6 文末分节符后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== J. Ctrl+U：切换选中文本的下划线 ===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+u')
+  await page.waitForTimeout(200)
+  const ulOn = await getModel()
+  const ulBlockOn = heroBlocks(ulOn).find((b) => textOfBlock(b).startsWith('我方'))
+  const ulInline = ulBlockOn
+    ? ulBlockOn.inlines.find((i) => i.t === 'text' && i.underline)
+    : null
+  ok(
+    '模型里前两个字标了下划线',
+    ulInline !== null && ulInline !== undefined && ulInline.text === '我方',
+    JSON.stringify(ulInline ?? null),
+  )
+  const ulDomOn = await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('我方于2026年9月1日')
+    return frag ? Array.from(frag.querySelectorAll('u')).map((el) => el.textContent) : []
+  })
+  ok('版面上那两个字在 <u> 里', ulDomOn.includes('我方'), JSON.stringify(ulDomOn))
+  ok(
+    '下划线没有改动文字',
+    ulBlockOn !== undefined && textOfBlock(ulBlockOn).startsWith('我方于2026年9月1日'),
+    JSON.stringify(ulBlockOn ? textOfBlock(ulBlockOn) : null),
+  )
+
+  // 再按一次：切换回不带下划线（工具栏按钮的语义是「切换」，不是「只加不减」）
+  await page.keyboard.press('Control+u')
+  await page.waitForTimeout(200)
+  const ulOff = await getModel()
+  const ulBlockOff = heroBlocks(ulOff).find((b) => textOfBlock(b).startsWith('我方'))
+  ok(
+    '再按一次取消下划线',
+    !(ulBlockOff?.inlines ?? []).some((i) => i.t === 'text' && i.underline),
+    JSON.stringify(ulBlockOff?.inlines ?? null),
+  )
+  eq('版面上也不再有 <u>', await page.evaluate(() => document.querySelectorAll('.wtp-content u').length), 0)
+
+  // 与加粗叠加：两种格式互不覆盖
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+u')
+  await page.waitForTimeout(150)
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+b')
+  await page.waitForTimeout(200)
+  const ulBothModel = await getModel()
+  const ulBothBlock = heroBlocks(ulBothModel).find((b) => textOfBlock(b).startsWith('我方'))
+  const ulBothInline = ulBothBlock
+    ? ulBothBlock.inlines.find((i) => i.t === 'text' && i.text === '我方')
+    : null
+  ok(
+    '加粗与下划线同时落在同两个字上',
+    ulBothInline !== undefined &&
+      ulBothInline !== null &&
+      ulBothInline.bold === true &&
+      ulBothInline.underline === true,
+    JSON.stringify(ulBothInline ?? null),
+  )
+  const ulBothDom = await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('我方于2026年9月1日')
+    return frag ? (frag.querySelector('u')?.innerHTML ?? '') : ''
+  })
+  ok('版面上是 <u><b>我方</b></u>', ulBothDom.includes('<b>我方</b>'), ulBothDom)
+  await checkNoOverflow('J 下划线后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== K. Ctrl+Shift+E：翻转修订模式（App 的复选框同步） ===')
+  await openApp()
+  const trackSel = 'label.checkbox input[type="checkbox"]'
+  eq('初始未勾选修订模式', await page.isChecked(trackSel), false)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Shift+E')
+  await page.waitForTimeout(150)
+  eq('快捷键把修订模式打开了', await page.isChecked(trackSel), true)
+  await page.keyboard.insertText('（快捷键开的修订）')
+  await page.waitForTimeout(250)
+  const trackModel = await getModel()
+  const trackInline = heroBlocks(trackModel)
+    .flatMap((b) => b.inlines)
+    .find(
+      (i) => i.t === 'text' && i.rev && i.rev.kind === 'ins' && i.text.includes('快捷键开的修订'),
+    )
+  ok('打开后新增文字标成 ins 修订', trackInline !== undefined)
+  await page.keyboard.press('Control+Shift+E')
+  await page.waitForTimeout(150)
+  eq('再按一次关掉', await page.isChecked(trackSel), false)
+  // 换个没有任何修订标记的段落敲字：在刚被标成 ins 的字后面接着敲，
+  // 读回时新字会并进那个 ins 区间（DOM 上下文继承，见 README 的已知取舍）
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.keyboard.insertText('（关闭后新增）')
+  await page.waitForTimeout(250)
+  const untracked = await getModel()
+  const untrackedInline = heroBlocks(untracked)
+    .flatMap((b) => b.inlines)
+    .find((i) => i.t === 'text' && i.text.includes('（关闭后新增）'))
+  ok(
+    '关掉之后新增的文字不再带修订标记',
+    untrackedInline !== undefined && untrackedInline.rev === undefined,
+    JSON.stringify(untrackedInline ?? null),
+  )
+  await checkNoOverflow('K 修订模式开关后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== L. Alt+4：选中的数字改成千分位两位小数 ===')
+  await openApp()
+  // 造一段只含数字的段落：回车分段后敲进去，选区就落在这一段上
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(150)
+  await page.keyboard.insertText('12345.6')
+  await page.waitForTimeout(150)
+  await page.evaluate(() => window.__wtpTest.selectIn('12345.6', 0, 7))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(250)
+  const amountModel = await getModel()
+  ok(
+    '模型里的数字改成了 12,345.60',
+    heroBlocks(amountModel).some((b) => textOfBlock(b) === '12,345.60'),
+    JSON.stringify(heroBlocks(amountModel).map(textOfBlock)),
+  )
+  const amountDom = await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('12,345.60')
+    return frag ? window.__wtpTest.textOf(frag) : null
+  })
+  eq('版面上显示的也是 12,345.60', amountDom, '12,345.60')
+  const amountCaret = await page.evaluate(() => window.__wtpTest.caretInfo())
+  ok(
+    '改完这串数字仍被选中（连着按结果稳定）',
+    amountCaret !== null && amountCaret.text === '12,345.60',
+    JSON.stringify(amountCaret),
+  )
+
+  // 第二次：已带逗号的数字要能再次解析，结果不变
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(250)
+  const amountAgain = await getModel()
+  ok(
+    '带逗号的数字再格式化还是它自己',
+    heroBlocks(amountAgain).filter((b) => textOfBlock(b) === '12,345.60').length === 1,
+    JSON.stringify(heroBlocks(amountAgain).map(textOfBlock)),
+  )
+
+  // 负数与进位
+  await page.evaluate(() => window.__wtpTest.selectIn('12,345.60', 0, 9))
+  await page.waitForTimeout(60)
+  await page.keyboard.insertText('-999.999')
+  await page.waitForTimeout(150)
+  await page.evaluate(() => window.__wtpTest.selectIn('-999.999', 0, 8))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(250)
+  const amountRound = await getModel()
+  ok(
+    '进位正确：-999.999 → -1,000.00',
+    heroBlocks(amountRound).some((b) => textOfBlock(b) === '-1,000.00'),
+    JSON.stringify(heroBlocks(amountRound).map(textOfBlock)),
+  )
+
+  // 无效输入：不改模型，弹提示条
+  const beforeBad = JSON.stringify(await getModel())
+  await page.evaluate(() => window.__wtpTest.selectIn('苏州市公安局', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(200)
+  const toast = await page.evaluate(() => {
+    const el = document.querySelector('.toast')
+    return el ? el.textContent.trim() : null
+  })
+  eq('选中非数字时弹出提示条', toast, '选中内容不是有效数字')
+  eq('无效输入不改模型', JSON.stringify(await getModel()), beforeBad)
+
+  // 折叠的光标（没有选中任何文字）同样不改模型，同样提示
+  await page.evaluate(() => window.__wtpTest.setCaret('苏州市公安局', 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(200)
+  eq('没有选中文字时提示无效', await page.evaluate(() => document.querySelector('.toast')?.textContent.trim() ?? null), '选中内容不是有效数字')
+  eq('折叠光标下模型不变', JSON.stringify(await getModel()), beforeBad)
+
+  // 提示条约 2 秒后自己消失
+  await page.waitForTimeout(2300)
+  eq('提示条自动消失', await page.evaluate(() => document.querySelectorAll('.toast').length), 0)
+  await checkNoOverflow('L 金额格式化后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== M. 工具栏：插入三种特殊空格（模型里是确切码点） ===')
+  await openApp()
+  /** 走真实的下拉 change（焦点会离开正文，靠选区/落点记录回退） */
+  async function pickSpace(kind) {
+    await page.selectOption('.toolbar select', kind)
+    await page.waitForTimeout(250)
+  }
+  /** 直接在正文里改下拉值触发 change（焦点不动，走实时选区那条路） */
+  async function fireSpaceChange(kind) {
+    await page.evaluate((k) => {
+      const sel = document.querySelector('.toolbar select')
+      sel.value = k
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+    }, kind)
+    await page.waitForTimeout(250)
+  }
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await fireSpaceChange('em')
+  const emModel = await getModel()
+  const emBlock = heroBlocks(emModel).find((b) => textOfBlock(b).includes('\u2003'))
+  ok('模型里插入了 U+2003（全宽空格）', emBlock !== undefined, JSON.stringify(heroBlocks(emModel).map(textOfBlock)))
+  eq(
+    '插入的是全宽空格，不多不少一个',
+    emBlock ? Array.from(textOfBlock(emBlock)).filter((c) => c.codePointAt(0) === 0x2003).length : -1,
+    1,
+  )
+  ok('空格落在插入符处（段末）', textOfBlock(emBlock).endsWith('\u2003'), JSON.stringify(textOfBlock(emBlock)))
+  const caretAfterSpace = await page.evaluate(() => window.__wtpTest.caretInfo())
+  ok(
+    '插入符落在刚插入的空格之后',
+    caretAfterSpace !== null && caretAfterSpace.offset === textOfBlock(emBlock).length,
+    JSON.stringify(caretAfterSpace),
+  )
+  const domHasEm = await page.evaluate(() => {
+    const frag = window.__wtpTest.fragmentByText('\u2003')
+    return frag ? window.__wtpTest.textOf(frag) : null
+  })
+  ok('版面上也读得到这个码点', domHasEm !== null && domHasEm.includes('\u2003'), JSON.stringify(domHasEm))
+
+  // 另外两个：半宽与四分之一宽。这次走真实下拉（焦点被拿走，考的是选区/落点记录的兜底）
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await pickSpace('en')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await pickSpace('quarterEm')
+  const spacesModel = await getModel()
+  const spacesBlock = heroBlocks(spacesModel).find((b) => textOfBlock(b).includes('\u2002'))
+  const points = spacesBlock ? Array.from(textOfBlock(spacesBlock)).map((c) => c.codePointAt(0)) : []
+  ok('模型里有 U+2002', points.includes(0x2002), JSON.stringify(points))
+  ok('模型里有 U+2005', points.includes(0x2005), JSON.stringify(points))
+  ok('三种空格都插在段末，顺序与操作一致', spacesBlock
+    ? textOfBlock(spacesBlock).endsWith('\u2003\u2002\u2005')
+    : false, JSON.stringify(textOfBlock(spacesBlock)))
+  ok('普通空格没有混进来', !points.includes(0x20), JSON.stringify(points))
+
+  // 下拉必须复位回占位项，否则再选同一项不会再触发 change
+  eq('下拉复位回占位项', await page.evaluate(() => document.querySelector('.toolbar select').value), '')
+
+  // 有选区时替换选区（与 insertText / replaceRange 的既有语义一致）
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await fireSpaceChange('en')
+  const replaced = await getModel()
+  const replacedBlock = heroBlocks(replaced).find((b) => textOfBlock(b).includes('于2026年9月1日'))
+  ok(
+    '有选区时用空格替换掉选中的字',
+    replacedBlock !== undefined && textOfBlock(replacedBlock).startsWith('\u2002于2026年9月1日'),
+    JSON.stringify(replacedBlock ? textOfBlock(replacedBlock) : null),
+  )
+  const pagesAfterSpaces = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  ok('插入空格没有把页数搞乱', pagesAfterSpaces >= 1)
+  await checkNoOverflow('M 插特殊空格后')
+
+  // 还没在版面上放过插入符：既不该改模型，也该给一句提示
+  await openApp()
+  const beforeNoCaret = JSON.stringify(await getModel())
+  await pickSpace('em')
+  eq('没有插入符时不改模型', JSON.stringify(await getModel()), beforeNoCaret)
+  eq(
+    '没有插入符时给出提示',
+    await page.evaluate(() => document.querySelector('.toast')?.textContent.trim() ?? null),
+    '请先把插入符放到版面上',
+  )
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== N. 打印：只出 A4 纸，且不多不少 ===')
+  await openApp()
+
+  /** 打印媒体下这些选择器的 display（元素不存在时给 'missing'，别把「没有」当成「隐藏了」） */
+  const printDisplay = () =>
+    page.evaluate(() => {
+      const sels = [
+        '.bar',
+        '.styles',
+        '.toolbar',
+        '.pane-head',
+        '.legend',
+        'textarea',
+        '.wtp-comments',
+        '.wtp-measure-root',
+        '.wtp-break',
+      ]
+      const out = {}
+      for (const sel of sels) {
+        const el = document.querySelector(sel)
+        out[sel] = el ? getComputedStyle(el).display : 'missing'
+      }
+      out.pages = document.querySelectorAll('.wtp-page').length
+      const first = document.querySelector('.wtp-page')
+      const second = document.querySelectorAll('.wtp-page')[1]
+      out.firstBreak = first ? getComputedStyle(first).breakBefore : 'missing'
+      out.secondBreak = second ? getComputedStyle(second).breakBefore : 'missing'
+      out.boxShadow = first ? getComputedStyle(first).boxShadow : 'missing'
+      return out
+    })
+
+  // @page：尺寸来自规格表，边距归 0（白边由纸张自己的 padding 提供，不能留两份）
+  const pageRules = () =>
+    page.evaluate(() => {
+      const out = []
+      for (const sheet of document.styleSheets) {
+        let rules
+        try {
+          rules = sheet.cssRules
+        } catch {
+          continue
+        }
+        for (const rule of rules) {
+          if (rule.conditionText !== 'print') continue
+          for (const inner of rule.cssRules ?? []) {
+            if (inner.constructor.name !== 'CSSPageRule') continue
+            out.push({ size: inner.style.size, margin: inner.style.margin })
+          }
+        }
+      }
+      return out
+    })
+
+  await page.emulateMedia({ media: 'print' })
+  const printEdit = await printDisplay()
+  for (const sel of ['.bar', '.styles', '.toolbar', '.wtp-comments', '.wtp-measure-root', '.wtp-break']) {
+    eq(`打印时隐藏 ${sel}`, printEdit[sel], 'none')
+  }
+  eq('第一张纸前面不再断页', printEdit.firstBreak, 'auto')
+  eq('后续每张纸都在新的一页开始', printEdit.secondBreak, 'page')
+  eq('打印时纸张不带屏幕上的阴影', printEdit.boxShadow, 'none')
+  eq('打印时版面页数不变', printEdit.pages, await page.evaluate(() => document.querySelectorAll('.wtp-page').length))
+
+  const rules = await pageRules()
+  ok('打印样式里有 @page', rules.length > 0, JSON.stringify(rules))
+  ok(
+    '@page 尺寸取自规格表（A4）',
+    rules.some((r) => r.size.includes('210mm') && r.size.includes('297mm')),
+    JSON.stringify(rules),
+  )
+  ok(
+    '@page 边距为 0（不额外加白边）',
+    rules.every((r) => /^0(px)?$/.test(r.margin)),
+    JSON.stringify(rules),
+  )
+
+  // 真打一份 PDF 数页数：不多一张空白页，也不少一页
+  const pagesToPrint = await page.evaluate(() => document.querySelectorAll('.wtp-page').length)
+  const pdf = await page.pdf({ printBackground: true, preferCSSPageSize: true })
+  const pdfText = pdf.toString('latin1')
+  const pdfPages = (pdfText.match(/\/Type\s*\/Page[^s]/g) ?? []).length
+  eq('打印出来的页数 = 版面页数', pdfPages, pagesToPrint)
+  const mediaBox = /\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(pdfText)
+  ok(
+    '纸张尺寸是 A4（595.28 × 841.89 磅）',
+    mediaBox !== null &&
+      Math.abs(Number(mediaBox[1]) - 595.28) < 1 &&
+      Math.abs(Number(mediaBox[2]) - 841.89) < 1,
+    mediaBox ? `MediaBox ${mediaBox[1]} × ${mediaBox[2]}` : 'PDF 里没找到 MediaBox',
+  )
+
+  // 源码视图（左侧面板、textarea、语法说明）同样一张都不该印出来。
+  // 切模式要在回到屏幕媒体时做：顶栏在打印媒体下是隐藏的，点不到。
+  await page.emulateMedia({ media: 'screen' })
+  await page.click('.tabs button:nth-child(2)')
+  await page.waitForTimeout(300)
+  await page.emulateMedia({ media: 'print' })
+  const printSource = await printDisplay()
+  for (const sel of ['.pane-head', '.legend', 'textarea']) {
+    eq(`源码视图下打印也隐藏 ${sel}`, printSource[sel], 'none')
+  }
+  await page.emulateMedia({ media: 'screen' })
 } finally {
   await browser?.close()
   await server.close()
@@ -640,4 +1021,4 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`)
   process.exit(1)
 }
-console.log('[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗改色、修订、批注、撤销均落到模型。')
+console.log('[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、金额格式、特殊空格、打印均落到模型。')

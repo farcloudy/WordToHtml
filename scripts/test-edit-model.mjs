@@ -4,12 +4,16 @@
  * lib/edit/model.ts 是纯函数（只吃模型、不改 DOM），所以能在 node 里直接验。
  * 这里盯的是几条容易悄悄出错的地方：
  *   · 按区间替换时，夹住区间的批注锚点必须成对留下（否则渲染会把余下的文字吞进高亮）；
- *   · 切分 / 合并的边界（开头、结尾、加粗等内联格式的边界）；
- *   · 加粗的判断、颜色的一致性；
- *   · 修订模式下删除不真删，而是标成 del。
+ *   · 切分 / 合并的边界（开头、结尾、加粗/下划线等内联格式的边界）；
+ *   · 加粗、下划线、颜色的判断与增删；
+ *   · 金额格式化（千分位 + 两位小数）的取舍；
+ *   · 修订模式下删除不真删，而是标成 del；
+ *   · 特殊空格（U+2003/2002/2005）能原样写进 docx 的 document.xml。
  *
  * 用法：node scripts/test-edit-model.mjs   （需先 npm run build:lib）
  */
+
+import JSZip from 'jszip'
 
 import {
   addComment,
@@ -19,6 +23,7 @@ import {
   commentScopes,
   deleteRange,
   findBlock,
+  formatAmount,
   insertBreakAfter,
   insertText,
   mergeIntoPrevious,
@@ -27,12 +32,15 @@ import {
   plainText,
   rangeColor,
   rangeIsBold,
+  rangeIsUnderline,
   removeBreak,
   removeComment,
   replyComment,
   replaceRange,
+  resolveSpec,
   setBlockKind,
   splitBlock,
+  toBase64,
   toMd,
   updateComment,
 } from '../dist-lib/wordtohtml.mjs'
@@ -201,6 +209,109 @@ console.log('\n=== 5. 加粗判断与改色 ===')
   eq('恢复默认色', rangeColor(block, 0, 4), undefined)
 }
 
+console.log('\n=== 5b. 下划线：增 / 删 / 与加粗互不干扰 ===')
+{
+  const model = docFrom('abcdef')
+  const block = findBlock(model, 't0')
+  eq('初始没有下划线', rangeIsUnderline(block, 0, 6), false)
+
+  applyFormat(model, 't0', 0, 2, { underline: true })
+  eq('区间内全带下划线 → true', rangeIsUnderline(block, 0, 2), true)
+  eq('跨到没下划线的部分 → false', rangeIsUnderline(block, 1, 3), false)
+  eq('空区间 → false', rangeIsUnderline(block, 2, 2), false)
+  eq('加下划线不改文字', plainText(block), 'abcdef')
+  eq('区间被切开后只落了两个字',
+    block.inlines.filter((i) => i.t === 'text' && i.underline).map((i) => i.text).join(''), 'ab')
+  ok('没被选中的那截不带下划线',
+    block.inlines.find((i) => i.t === 'text' && i.text === 'cdef')?.underline === undefined)
+
+  // 在下划线区间之后再套加粗：两段格式各归各的
+  applyFormat(model, 't0', 2, 4, { bold: true })
+  eq('后一段加粗了', rangeIsBold(block, 2, 4), true)
+  eq('后一段仍没有下划线', rangeIsUnderline(block, 2, 4), false)
+  eq('前一段仍只有下划线', rangeIsBold(block, 0, 2), false)
+
+  // 改色不动下划线（applyFormat 是逐字段合并，不是整段重置）
+  applyFormat(model, 't0', 0, 6, { color: 'FF0000' })
+  eq('改色后下划线还在', rangeIsUnderline(block, 0, 2), true)
+  eq('改色后加粗还在', rangeIsBold(block, 2, 4), true)
+  eq('全文都变成红色', rangeColor(block, 0, 6), 'FF0000')
+
+  // false 与 null 都是清除
+  applyFormat(model, 't0', 0, 2, { underline: null })
+  eq('null 清掉下划线', rangeIsUnderline(block, 0, 2), false)
+  applyFormat(model, 't0', 2, 4, { underline: true })
+  applyFormat(model, 't0', 2, 4, { underline: false })
+  eq('false 也清掉下划线', rangeIsUnderline(block, 2, 4), false)
+  eq('清完之后文字没变', plainText(block), 'abcdef')
+
+  // 跨块（同一段被分页切成两片后重排回来）时按块独立判断
+  const two = docFrom('上下划线', '下方没有')
+  applyFormat(two, 't0', 0, 5, { underline: true })
+  eq('第一段有下划线', rangeIsUnderline(findBlock(two, 't0'), 0, 5), true)
+  eq('第二段不受影响', rangeIsUnderline(findBlock(two, 't1'), 0, 4), false)
+}
+
+console.log('\n=== 5c. 下划线的 md 往返 ===')
+{
+  const m1 = parseMd('__整段带下划线__')
+  eq('解析出下划线', JSON.stringify(m1.blocks[0].inlines),
+    JSON.stringify([{ t: 'text', text: '整段带下划线', underline: true }]))
+  eq('序列化回同一份源码', toMd(m1), '__整段带下划线__')
+
+  // 与加粗嵌套，两种标记都认（序列化时下划线在加粗外层，与渲染的 <u><b> 同序）
+  const m2 = parseMd('**__又粗又下划线__**')
+  eq('加粗与下划线能嵌套',
+    JSON.stringify(m2.blocks[0].inlines),
+    JSON.stringify([{ t: 'text', text: '又粗又下划线', bold: true, underline: true }]))
+  eq('嵌套也能往返', toMd(m2), '__**又粗又下划线**__')
+  eq('往返结构一致',
+    JSON.stringify(normalizeBlocks(parseMd(toMd(m2)))),
+    JSON.stringify(normalizeBlocks(m2)))
+
+  // 不成对的 __ 是普通文字（与 ** 的既有约定一致）
+  eq('落单的双下划线按原文处理', plainText(parseMd('a__b').blocks[0]), 'a__b')
+  // 下划线里的文字要能带颜色
+  const m3 = parseMd('{红|__红且下划线__}')
+  eq('下划线能套在颜色里',
+    JSON.stringify(m3.blocks[0].inlines),
+    JSON.stringify([{ t: 'text', text: '红且下划线', underline: true, color: 'FF0000' }]))
+
+  // 正文里本来就有 __ 时要转义，否则会被解析成下划线标记
+  const m4 = docFrom('字段__名__')
+  eq('正文里的 __ 会被转义', toMd(m4), '字段\\_\\_名\\_\\_')
+  eq('转义后能原样解析回来',
+    JSON.stringify(normalizeBlocks(parseMd(toMd(m4)))),
+    JSON.stringify(normalizeBlocks(m4)))
+}
+
+console.log('\n=== 5d. formatAmount：千分位 + 固定两位小数 ===')
+{
+  const cases = [
+    ['12345.6', '12,345.60'],
+    ['1234', '1,234.00'],
+    ['12,345.60', '12,345.60'],
+    ['0', '0.00'],
+    ['0.5', '0.50'],
+    ['0.005', '0.01'],
+    ['999.999', '1,000.00'],
+    ['1234567.891', '1,234,567.89'],
+    ['-1234.5', '-1,234.50'],
+    ['-0.001', '0.00'],
+    ['0001234', '1,234.00'],
+    ['1,234,567', '1,234,567.00'],
+    [' 1234.5 ', '1,234.50'],
+  ]
+  for (const [input, want] of cases) {
+    eq(`formatAmount(${JSON.stringify(input)})`, formatAmount(input), want)
+  }
+
+  const bad = ['', '   ', 'abc', '1 234', '1.2.3', '12,34', '1e3', '￥1234', '１２３４', '1234元', '-', '.5', '1234.']
+  for (const input of bad) {
+    eq(`formatAmount(${JSON.stringify(input)}) → null`, formatAmount(input), null)
+  }
+}
+
 console.log('\n=== 6. 批注与回复 ===')
 {
   const model = docFrom('abcdef')
@@ -293,6 +404,25 @@ console.log('\n=== 9. 批注改写 / 换页标记 ===')
   eq('附件/分页符/分节符都能序列化', toMd(round), '% 附件一\n===\n---')
   eq('再解析回来还是同一份结构', JSON.stringify(normalizeBlocks(parseMd(toMd(round)))),
     JSON.stringify(normalizeBlocks(round)))
+}
+
+console.log('\n=== 10. 特殊空格能原样写进 docx ===')
+{
+  // 三种空格都是普通文本字符，export.ts 不为它们做任何特殊处理 —— 这一项验的就是
+  // 「不做特殊处理也不出事」：它们必须原样留在 document.xml 里，不能被当成空白吃掉。
+  const spaces = ['\u2003', '\u2002', '\u2005']
+  const model = parseMd(`前${spaces[0]}中${spaces[1]}后${spaces[2]}末`)
+  const base64 = await toBase64(model, resolveSpec(), { title: '特殊空格' })
+  const zip = await JSZip.loadAsync(Buffer.from(base64, 'base64'))
+  const xml = await zip.file('word/document.xml').async('string')
+
+  for (const ch of spaces) {
+    ok(`U+${ch.codePointAt(0).toString(16).toUpperCase()} 写进了 document.xml`, xml.includes(ch))
+  }
+  ok(
+    '三个空格按顺序留在同一段文字里',
+    xml.includes(`前${spaces[0]}中${spaces[1]}后${spaces[2]}末`),
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

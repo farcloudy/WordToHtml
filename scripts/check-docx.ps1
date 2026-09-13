@@ -4,7 +4,8 @@
   Why this exists: it is the hardest verification available here. It does not look
   at our code at all, only at Word's own judgement about style names, East Asian
   fonts, font sizes, line spacing rules, spacing before/after, first-line indent
-  in character units, page-number fields, tracked changes and comments.
+  in character units, page-number fields, tracked changes, comments and
+  per-paragraph underline.
 
   IMPORTANT: keep this file pure ASCII.
   Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI (GBK on this machine), so
@@ -99,11 +100,21 @@ try {
   $i = 0
   foreach ($p in $doc.Paragraphs) {
     $r = $p.Range
+    # Underline of the text only, excluding the trailing paragraph mark: the mark
+    # carries its own formatting, so a fully underlined paragraph would otherwise
+    # read back as wdUndefined (9999999, mixed). -1 because the mark is 1 char.
+    # A paragraph that is only the mark has no text at all -> report 0 (none).
+    $underline = 0
+    if (($r.End - $r.Start) -gt 1) {
+      $inner = $doc.Range($r.Start, $r.End - 1)
+      $underline = [int]$inner.Font.Underline
+    }
     $paragraphs += [ordered]@{
       index     = $i
       style     = $p.Style.NameLocal
       text      = $r.Text.TrimEnd([char]13, [char]7, [char]10)
       bold      = [int]$r.Font.Bold
+      underline = $underline
       alignment = [int]$p.Alignment
     }
     $i++

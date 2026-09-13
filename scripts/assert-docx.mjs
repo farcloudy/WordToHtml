@@ -162,6 +162,49 @@ eq('批注锚定文字', dump.comments[0]?.scope ?? '', '通知书原件')
 eq('批注内容', dump.comments[0]?.text ?? '', '日期需与通知书原件核对')
 console.log(`ok   插入="${insText}" 删除="${delText}" 批注锚定="${dump.comments[0]?.scope}"`)
 
+/* ------------------------------ 三b、下划线 ------------------------------- */
+
+console.log('\n=== 3b. 下划线（w:u 是否真的生效） ===')
+{
+  // Word 的 Font.Underline：0 = 无，1 = 单线，9999999（wdUndefined）= 区间内混排。
+  // 只对两种干净的段落表态：整段带下划线的必须报 1，完全没有下划线的必须报 0。
+  // 混排的段落（同一段里既有下划线又有普通字）Word 报 wdUndefined，不在这里下结论。
+  const WD_UNDERLINE_NONE = 0
+  const WD_UNDERLINE_SINGLE = 1
+
+  const blocks = model.blocks.filter((b) => b.t === 'textBlock')
+  const wrong = []
+  let underlined = 0
+  let plain = 0
+  for (let i = 0; i < pairs; i += 1) {
+    const texts = (blocks[i]?.inlines ?? []).filter((x) => x.t === 'text' && x.text !== '')
+    if (texts.length === 0) continue
+    const got = body[i]?.underline
+    if (texts.every((x) => x.underline === true)) {
+      underlined += 1
+      if (got !== WD_UNDERLINE_SINGLE) {
+        wrong.push(`段落${i} 整段带下划线，Word 却报 Underline=${JSON.stringify(got)}`)
+      }
+    } else if (texts.every((x) => x.underline !== true)) {
+      plain += 1
+      if (got !== WD_UNDERLINE_NONE) {
+        wrong.push(`段落${i} 没有下划线，Word 却报 Underline=${JSON.stringify(got)}`)
+      }
+    }
+  }
+
+  if (underlined === 0) wrong.push('样本里没有整段带下划线的段落 —— 这一项等于没验')
+  if (wrong.length > 0) {
+    for (const w of wrong) failures.push(w)
+    console.log(`FAIL 下划线：${wrong.length} 处不符`)
+  } else {
+    console.log(
+      `ok   下划线：${underlined} 段整段带下划线（Word 报 single）、` +
+        `${plain} 段完全不带（Word 报 none）`,
+    )
+  }
+}
+
 /* ---------------------------- 四、纸张、页码、分节 ------------------------- */
 
 console.log('\n=== 4. 纸张 / 页边距 / 页码 / 分节 ===')

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
@@ -72,6 +72,16 @@ const COLORS: { label: string; value: string }[] = [
   { label: '灰', value: '808080' },
 ]
 
+/**
+ * 可插入的特殊空格。三个码点的宽度是排版意义上的（全宽/半宽/四分之一），
+ * 与字体无关；普通空格会被 HTML 折叠，这三个不会。
+ */
+const SPACES = [
+  { kind: 'em', label: '全宽空格（U+2003）' },
+  { kind: 'en', label: '半宽空格（U+2002）' },
+  { kind: 'quarterEm', label: '四分之一宽空格（U+2005）' },
+] as const
+
 /** edit = 直接在 A4 版面上写（面向用户）；source = 类 md 源码（给开发/排错用） */
 const mode = ref<'edit' | 'source'>('edit')
 const source = ref(SAMPLE)
@@ -84,6 +94,9 @@ const paper = ref<InstanceType<typeof WordPaper> | null>(null)
 const selection = ref<EditorSelection | null>(null)
 const commentDraft = ref('')
 const mdView = ref('')
+const toastText = ref('')
+/** 提示条的计时器；关掉页面时也要清掉，别留一个 setTimeout 在那里 */
+let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 const specOverride = computed<DeepPartial<Spec>>(() => {
   const preset = MARGIN_PRESETS.find((p) => p.key === marginPreset.value) ?? MARGIN_PRESETS[0]
@@ -118,6 +131,36 @@ function insertComment(): void {
   if (text === '') return
   const id = paper.value?.addCommentOnSelection(text) ?? -1
   if (id >= 0) commentDraft.value = ''
+}
+
+/**
+ * 提示条：只有一条，约 2 秒后自己消失。连续触发时重置同一个计时器而不是再起一个
+ * —— 否则前一个 setTimeout 会把后一条消息提前清掉。
+ */
+function showToast(message: string): void {
+  toastText.value = message
+  if (toastTimer !== null) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    toastTimer = null
+    toastText.value = ''
+  }, 2000)
+}
+
+/**
+ * 下拉选完就复位回占位项：不复位的话「再选同一项」不会再触发 change，
+ * 想连插两个同宽空格就做不到。
+ */
+function onInsertSpace(event: Event): void {
+  const select = event.target as HTMLSelectElement
+  const entry = SPACES.find((s) => s.kind === select.value)
+  select.value = ''
+  if (!entry) return
+  if (!paper.value?.insertSpecialSpace(entry.kind)) showToast('请先把插入符放到版面上')
+}
+
+/** 修订模式由 App 持有（顶栏那个复选框也绑着它），快捷键只是换个入口 */
+function toggleTrackChanges(): void {
+  trackChanges.value = !trackChanges.value
 }
 
 /** 切到源码视图前，把当前模型序列化成 md —— 所见即所得改完总要看得到「它长什么样」 */
@@ -156,6 +199,10 @@ onMounted(() => {
   if (import.meta.env.DEV) {
     ;(window as unknown as Record<string, unknown>).__wtpPaper = paper.value
   }
+})
+
+onBeforeUnmount(() => {
+  if (toastTimer !== null) clearTimeout(toastTimer)
 })
 </script>
 
@@ -296,6 +343,16 @@ onMounted(() => {
 
       <span class="sep" />
 
+      <span class="field">
+        插入
+        <select title="在插入符处插入一个特殊空格" @change="onInsertSpace">
+          <option value="">空格…</option>
+          <option v-for="s in SPACES" :key="s.kind" :value="s.kind">{{ s.label }}</option>
+        </select>
+      </span>
+
+      <span class="sep" />
+
       <span class="field comment-field">
         批注
         <input
@@ -329,8 +386,8 @@ onMounted(() => {
               单独一行表示分节（新起一页、页码从 1 重排）
             </li>
             <li>
-              <code>**文字**</code> 加粗；<code>{红|文字}</code> 改色（中文色名或
-              <code>#RRGGBB</code>）
+              <code>**文字**</code> 加粗；<code>__文字__</code> 下划线；<code>{红|文字}</code>
+              改色（中文色名或 <code>#RRGGBB</code>）
             </li>
             <li><code>{+新增}</code> 插入修订；<code>{-删除}</code> 删除修订</li>
             <li><code>[[文字|批注内容]]</code> 批注</li>
@@ -351,6 +408,8 @@ onMounted(() => {
             :track-changes="trackChanges"
             @paginated="pageCount = $event"
             @selection-change="onSelectionChange"
+            @toggle-track-changes="toggleTrackChanges"
+            @toast="showToast"
           />
         </div>
         <details v-if="mode === 'source'" class="legend md-mirror">
@@ -359,6 +418,9 @@ onMounted(() => {
         </details>
       </section>
     </main>
+
+    <!-- 提示条：无效输入、插入失败这类一句话反馈。固定定位，不占版面 -->
+    <div v-if="toastText" class="toast" role="status">{{ toastText }}</div>
   </div>
 </template>
 
@@ -644,5 +706,64 @@ textarea {
   overflow: auto;
   padding: 20px;
   background: #e9eaec;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  z-index: 20;
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: rgba(35, 39, 45, 0.92);
+  color: #fff;
+  font-size: 13px;
+  /* 纯提示，别挡住下面的点击 */
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+/*
+ * 打印：只出 WordPaper 渲染的那几张 A4 纸。
+ *
+ * 纸张尺寸与「页面上不留白边」由 lib/render/css.ts 注入的 @page 负责（那边的尺寸来自
+ * 规格表，不能在这里写死）；这里只隐藏编辑器外壳。App 的样式是 scoped 的，
+ * 能选中自己的顶栏/工具栏/源码 pane，但选不中子组件内部的 .wtp-* 节点 ——
+ * 那部分（批注侧栏、页间换页标记）交给组件自己的打印样式。
+ */
+@media print {
+  .bar,
+  .styles,
+  .toolbar,
+  .pane-head,
+  .legend,
+  textarea,
+  .toast {
+    display: none !important;
+  }
+
+  /* 屏幕上这些容器都靠固定高度 + overflow 撑出滚动区，打印时必须放开，
+     否则只会印出第一屏、后面几页被裁掉 */
+  .app {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+
+  .panes,
+  .pane,
+  .canvas {
+    display: block;
+    overflow: visible;
+  }
+
+  .pane + .pane {
+    border-left: 0;
+  }
+
+  .canvas {
+    padding: 0;
+    background: #fff;
+  }
 }
 </style>

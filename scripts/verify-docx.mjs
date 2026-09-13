@@ -31,6 +31,12 @@ const SAMPLE = [
   '',
   '经核查，{+我单位}对债务人名下资产进行了全面梳理，**重点**如下：',
   '',
+  // 下划线的两种形态都要走一遍：整段带下划线（Word 会报 Underline=single），
+  // 以及与加粗混排的一段（Word 报 wdUndefined，用来确认读回值确实区分得出来）
+  '__本段整段带下划线__',
+  '',
+  '**加粗**与__下划线__并存的一段。',
+  '',
   '### 不动产',
   '',
   '#### 房产',
@@ -132,8 +138,31 @@ writeFileSync(outPath, buffer)
   const grids = [...docXml.matchAll(/<w:docGrid\b[^>]*>/g)].map((m) => m[0])
   if (grids.length === 0) problems.push('document.xml 里没有 w:docGrid（「行」就没有基准）')
 
+  /*
+   * 下划线必须在 OOXML 层面看得见。Word 报的 Font.Underline 只能说明「渲染成了下划线」，
+   * 说不出是哪一层写出来的（样式里也可能有），所以这里直接看写进文件的字节：
+   * 每一处带下划线的 inline 都应该有且只有一个 <w:u w:val="single"/>。
+   */
+  const underlineTags = [...docXml.matchAll(/<w:u\b[^>]*\/>/g)].map((m) => m[0])
+  const modelUnderlined = model.blocks
+    .filter((b) => b.t === 'textBlock')
+    .flatMap((b) => b.inlines)
+    .filter((i) => i.t === 'text' && i.underline).length
+  // 只有内置样本才要求「必须验到下划线」：这个脚本也接受外部源码（verify:pages 把
+  // 界面里的源码原样喂进来），而别人的源码里没有下划线是正常的。
+  if (sourceIndex < 0 && modelUnderlined === 0) {
+    problems.push('内置样本里没有带下划线的文字 —— 这一项等于没验')
+  }
+  if (underlineTags.length !== modelUnderlined) {
+    problems.push(
+      `下划线 run 数不符：document.xml 里 ${underlineTags.length} 处，模型里 ${modelUnderlined} 处`,
+    )
+  }
+  const notSingle = underlineTags.filter((tag) => !/w:val="single"/.test(tag))
+  if (notSingle.length > 0) problems.push(`这些 w:u 不是 single：${notSingle.join('、')}`)
+
   if (problems.length > 0) {
-    console.error('[FAIL] 行单位段距没有正确写进 docx：')
+    console.error('[FAIL] docx 的字节与模型/规格表对不上：')
     for (const p of problems) console.error(`  - ${p}`)
     process.exit(1)
   }
@@ -141,6 +170,7 @@ writeFileSync(outPath, buffer)
     `[ok] 行单位段距：${styleIds.length + 1} 处 spacing 带 beforeLines/afterLines，` +
       `${grids.length} 处 docGrid（${grids[0]}）`,
   )
+  console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
 }
 
 // 临时副本名带上 pid：Word 退出后会短暂占住文件，用固定名会让下一次运行

@@ -86,6 +86,37 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
     `::highlight(${KEEP_SELECTION_HIGHLIGHT}) { background: rgba(31, 111, 235, 0.32); }`,
   )
 
+  /*
+   * 打印：一张纸正好一页 .wtp-page，别的一概不出。
+   *
+   * @page 的尺寸取自规格表（纸张是可覆盖的，写死 A4 就错了）；margin 归 0 ——
+   * 纸上的白边由 .wtp-page 自己的 padding（= 页边距）提供，页盒这边再留一次
+   * 就成了双份，内容会被挤小。
+   *
+   * 分页不能靠 @page，我们的每页就是一个固定高度的 div：让每一页都在自己之前断页。
+   * 用 break-before 而不是 break-after —— 页与页之间还夹着 .wtp-break（打印时
+   * display:none，但仍是子元素），末尾那枚会让 :last-child 落空，「最后一页不再断」
+   * 就失效并多印一张空白纸；:first-child 则不受影响（每页的第一个子元素就是它自己）。
+   * 同时关掉屏幕上那些 flex / 阴影 / 间隙，flex 容器的子项断页行为不可靠。
+   *
+   * 全部带 !important：SFC 的 <style scoped> 会给选择器加上 data-v 属性，特异性
+   * 高过这里的一层类名（.wtp-break[data-v-x] 会盖掉 .wtp-break），打印样式必须压得住它。
+   */
+  out.push(
+    `@media print {`,
+    `  @page { size: ${spec.page.size.width} ${spec.page.size.height}; margin: 0; }`,
+    `  html, body { background: #fff; }`,
+    `  .${ns}-root { display: block !important; }`,
+    `  .${ns}-pages { display: block !important; gap: 0 !important; }`,
+    `  .${ns}-page { margin: 0 !important; box-shadow: none !important; ` +
+      `overflow: hidden !important; break-before: page !important; }`,
+    // 第一页就是第一张纸，前面不能再断一次（放在后面，压住上一条）
+    `  .${ns}-page:first-child { break-before: auto !important; }`,
+    // 批注侧栏、页间换页标记、隐藏的量测容器都不是纸上的东西
+    `  .${ns}-comments, .${ns}-break, .${ns}-measure-root, .${ns}-probe { display: none !important; }`,
+    `}`,
+  )
+
   return out.join('\n')
 }
 

@@ -7,7 +7,7 @@
  *
  *   · 打字、输入法、选区、原生剪贴板都留给浏览器 —— 手感是原生的；
  *   · 每次 input 再把 DOM 读回模型（见 lib/edit/dom.ts、lib/edit/model.ts）；
- *   · 结构性操作（回车、退格合并、工具栏加粗改色、批注）直接改模型，再重排渲染。
+ *   · 结构性操作（回车、退格合并、工具栏加粗／下划线／改色、批注）直接改模型，再重排渲染。
  *
  * 「正常输入不得触发重排」这条约束靠两点落实：
  *   1. 渲染只读 viewDoc / pages 这两个浅响应式快照，编辑中的模型（doc）不参与渲染，
@@ -19,6 +19,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 
 import { toBlob } from '../lib/docx/export'
+import { formatAmount } from '../lib/edit/amount'
 import {
   currentRange,
   displayPointOf,
@@ -40,6 +41,7 @@ import {
   mergeIntoPrevious,
   rangeColor,
   rangeIsBold,
+  rangeIsUnderline,
   removeBreak as removeBreakOp,
   removeComment as removeCommentOp,
   replyComment as replyCommentOp,
@@ -61,7 +63,7 @@ import type { BreakKind, MeasuredItem, PageFragment, PageLayout } from '../lib/r
 import { contentBoxPx, resolveSpec } from '../lib/spec'
 import type { BlockKind, DeepPartial, Spec } from '../lib/spec'
 import { commentScopes } from '../lib/types'
-import type { DocModel, Inline, RevMark, TextBlock } from '../lib/types'
+import type { DocModel, Inline, RevMark, TextBlock, TextInline } from '../lib/types'
 
 const props = withDefaults(
   defineProps<{
@@ -84,6 +86,10 @@ const props = withDefaults(
 const emit = defineEmits<{
   paginated: [count: number]
   'selection-change': [selection: EditorSelection | null]
+  /** 按了 ctrl+shift+E：修订模式由调用方持有，组件只报告「该翻转了」 */
+  'toggle-track-changes': []
+  /** 一句话提示（无效输入之类），组件不做提示 UI，交给调用方 */
+  toast: [message: string]
 }>()
 
 const resolved = computed<Spec>(() => resolveSpec(props.spec))
@@ -618,6 +624,16 @@ function onKeydown(event: KeyboardEvent): void {
     toggleBold()
     return
   }
+  if (mod && (event.key === 'u' || event.key === 'U')) {
+    event.preventDefault()
+    toggleUnderline()
+    return
+  }
+  if (mod && event.shiftKey && (event.key === 'e' || event.key === 'E')) {
+    event.preventDefault()
+    emit('toggle-track-changes')
+    return
+  }
   if (mod && (event.key === 'z' || event.key === 'Z')) {
     event.preventDefault()
     if (event.shiftKey) redo()
@@ -627,6 +643,13 @@ function onKeydown(event: KeyboardEvent): void {
   if (mod && (event.key === 'y' || event.key === 'Y')) {
     event.preventDefault()
     redo()
+    return
+  }
+  // alt+4：数字改写成千分位两位小数。键盘布局不同时 alt+4 的 key 可能不是 '4'，
+  // 所以两种判据都要看
+  if (event.altKey && !mod && (event.key === '4' || event.code === 'Digit4')) {
+    event.preventDefault()
+    if (!formatSelectionAsAmount()) emit('toast', '选中内容不是有效数字')
     return
   }
   if (event.key === 'Tab') {
@@ -759,12 +782,101 @@ function toggleBold(): void {
   )
 }
 
+function toggleUnderline(): void {
+  const rootEl = root.value
+  if (!rootEl) return
+  const ranges = selectedRanges(rootEl)
+  if (ranges.length === 0) return
+  const allUnderline = ranges.every((range) => {
+    const block = findBlock(doc.value, range.blockId)
+    if (!block) return false
+    const p = prefixLength(range.blockId)
+    return rangeIsUnderline(block, Math.max(0, range.from - p), Math.max(0, range.to - p))
+  })
+  forSelection((model, blockId, from, to) =>
+    applyFormat(model, blockId, from, to, { underline: !allUnderline }),
+  )
+}
+
 function setColor(hex: string | null): void {
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, {
       color: hex ? hex.replace(/^#/, '').toUpperCase() : null,
     }),
   )
+}
+
+/**
+ * 把选中的数字改写成「千分位 + 两位小数」（alt+4）。
+ * 不是合法数字、没有选中、或选中的不在同一段里时什么都不改，返回 false 交给调用方提示。
+ */
+function formatSelectionAsAmount(): boolean {
+  if (!props.editable) return false
+  const rootEl = root.value
+  if (!rootEl) return false
+  const ranges = selectedRanges(rootEl)
+  const target = ranges.length === 1 ? ranges[0] : undefined
+  if (!target) return false
+  const block = findBlock(doc.value, target.blockId)
+  if (!block) return false
+  const p = prefixLength(block.id)
+  const from = Math.max(0, target.from - p)
+  const to = Math.max(from, target.to - p)
+  if (to <= from) return false
+
+  const amount = formatAmount(textOf(sliceStrict(block.inlines, from, to)))
+  if (amount === null) return false
+
+  // 新数字继承原文的格式（加粗／颜色／下划线／修订标记），与「改几个字」同一路数
+  const first = sliceStrict(block.inlines, from, to).find(
+    (inline): inline is TextInline => inline.t === 'text',
+  )
+  const piece: Inline = first ? { ...first, text: amount } : { t: 'text', text: amount }
+
+  pushHistory()
+  replaceRange(block, from, to, [piece])
+  // 改完仍把这串数字选中：连着按几次结果稳定（12,345.60 再解析还是它自己）
+  refreshLayout({
+    anchor: { blockId: block.id, offset: p + from },
+    anchorEnd: { blockId: block.id, offset: p + from + amount.length },
+    force: true,
+  })
+  return true
+}
+
+const SPECIAL_SPACES: Record<'em' | 'en' | 'quarterEm', string> = {
+  em: '\u2003',
+  en: '\u2002',
+  quarterEm: '\u2005',
+}
+
+/**
+ * 在插入符处插入一个特殊空格；有选区时替换选区。
+ * 插入符落在刚插入的空格之后（按块 id + 字符偏移找回，与其它结构性操作同一套）。
+ */
+function insertSpecialSpace(kind: 'em' | 'en' | 'quarterEm'): boolean {
+  if (!props.editable) return false
+  const rootEl = root.value
+  if (!rootEl) return false
+
+  // 焦点被工具栏下拉拿走时实时选区可能已经收起来了，回退到最近记录的选区／落点
+  const live = selectedRanges(rootEl)
+  const target = live.length > 0 ? live[0] : stickyRanges[0]
+  const caret = caretPoint()
+  const blockId = target?.blockId ?? caret?.blockId
+  if (blockId === undefined) return false
+  const block = findBlock(doc.value, blockId)
+  if (!block) return false
+
+  const p = prefixLength(block.id)
+  const from = target ? Math.max(0, target.from - p) : Math.max(0, (caret?.offset ?? 0) - p)
+  const to = target ? Math.max(from, target.to - p) : from
+  const char = SPECIAL_SPACES[kind]
+
+  pushHistory(caret)
+  replaceRange(block, from, to, [{ t: 'text', text: char }])
+  refreshLayout({ anchor: { blockId: block.id, offset: p + from + char.length }, force: true })
+  return true
 }
 
 /** 选中的文字加一条批注。焦点可能在批注输入框里，所以实时选区取不到就回退到记录 */
@@ -1010,7 +1122,10 @@ defineExpose({
   // 编辑层
   setBlockKind,
   toggleBold,
+  toggleUnderline,
   setColor,
+  formatSelectionAsAmount,
+  insertSpecialSpace,
   addCommentOnSelection,
   addCommentAt,
   replyComment,

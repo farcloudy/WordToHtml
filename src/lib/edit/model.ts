@@ -234,6 +234,23 @@ export function rangeIsBold(block: TextBlock, from: number, to: number): boolean
   return seen
 }
 
+/** 判断 [from,to) 内的文字是否全部带下划线（空区间返回 false） */
+export function rangeIsUnderline(block: TextBlock, from: number, to: number): boolean {
+  if (to <= from) return false
+  let seen = false
+  let cursor = 0
+  for (const inline of block.inlines) {
+    if (inline.t !== 'text') continue
+    const start = cursor
+    const end = cursor + inline.text.length
+    cursor = end
+    if (end <= from || start >= to) continue
+    seen = true
+    if (!inline.underline) return false
+  }
+  return seen
+}
+
 /** 判断 [from,to) 内的文字是否全是同一个颜色；不一致返回 undefined */
 export function rangeColor(block: TextBlock, from: number, to: number): string | undefined {
   if (to <= from) return undefined
@@ -259,13 +276,14 @@ export function rangeColor(block: TextBlock, from: number, to: number): string |
 /**
  * 给 [from,to) 套格式。颜色传 null 表示「恢复默认色」（清掉 color）。
  * 加粗传 true/false，未传的字段保持原样。
+ * 下划线同理：true 加上，false 与 null 都是清掉。
  */
 export function applyFormat(
   doc: DocModel,
   blockId: string,
   from: number,
   to: number,
-  patch: { bold?: boolean; color?: string | null },
+  patch: { bold?: boolean; underline?: boolean | null; color?: string | null },
 ): void {
   const block = findBlock(doc, blockId)
   if (!block || to <= from) return
@@ -279,6 +297,10 @@ export function applyFormat(
       if (patch.bold !== undefined) {
         if (patch.bold) next.bold = true
         else delete next.bold
+      }
+      if (patch.underline !== undefined) {
+        if (patch.underline) next.underline = true
+        else delete next.underline
       }
       if (patch.color !== undefined) {
         if (patch.color) next.color = patch.color
