@@ -44,7 +44,8 @@
 ## 1. 写入时状态（2026-09-13）
 
 - **P1 / P2 / P3 已验收**（规格表 → docx、A4 分页预览、编辑层），见 README 的进度表。
-- **W1 已实现，但尚未提交**。工作区有 18 个已修改文件 + 1 个新文件 `src/lib/edit/amount.ts`：
+- **W1 已完成并提交**（2026-09-13，`4ca96c8`，feat: 编辑器快捷键组、特殊空格与打印）。
+  它动了 18 个文件 + 1 个新文件 `src/lib/edit/amount.ts`（下面是提交时的清单）：
 
   ```
   M README.md                       M src/lib/docx/export.ts     M src/lib/render/css.ts
@@ -60,11 +61,18 @@
   W1 内容：`ctrl+U` 下划线（全链路新增 `TextInline.underline`）、`ctrl+shift+E` 修订模式、
   `alt+4` 金额格式化（`#,#00.00`，失败弹提示条）、`ctrl+P` 打印只出 A4 纸、工具栏「插入空格」
   三种特殊空格（U+2003 / U+2002 / U+2005），外加把 `listItem`（列表段落）的首行缩进由 2 字符改成 0。
-- 全量 `npm run verify` **已跑过一次并通过**（`%TEMP%\wtp-verify.log` 末尾 `MARKER_EXIT=0`，五阶段全 PASS）。
-- W1 的独立验收代理只做了「输出受控的定向证伪」，当时因宿主崩溃被打断两次，最终定向报告见对话记录。
+- 全量 `npm run verify` 在 W1 实现阶段跑过一次并全绿（`%TEMP%\wtp-verify.log` 末尾
+  `MARKER_EXIT=0`，五阶段全 PASS）。
+- W1 的独立验收结论是**可接受**：七项定向证伪全过 —— 最要紧的一项（修订标记那份由样式表画的
+  `text-decoration: underline` 会不会被读回成用户下划线）用浏览器实测确认**无污染**
+  （`getComputedStyle` 是 underline 而读回 `underline: false`）；`ctrl+P` 未被拦截；
+  打印隐藏清单齐全（含新增的 `.toast`）且 `!important` 的说法成立；`check-docx.ps1` 仍纯 ASCII
+  且无 BOM；`formatAmount` 无精度丢失与溢出；`styles.xml` 的 `WT-ListItem` 无脏值；无越界改动。
+  两处非阻断的次要项见第 8 节第 4 条。
 
-**如果你打开这个仓库时工作区仍有未提交改动**：先 `git status --short` 与 `git diff` 看清是什么，
-再决定是「补做验收后提交」还是「这已经是提交过的旧状态」。不要直接 `git checkout`／`git stash` 丢掉它。
+**W1 提交之后工作区是干净的**。如果你打开这个仓库时看到未提交改动，那它属于某个后续波次的在制品：
+先 `git status --short` 与 `git diff` 看清是什么，再决定是「补做验收后提交」还是「接着做」；
+**不要**直接 `git checkout`／`git stash` 丢掉它。
 
 ---
 
@@ -370,6 +378,12 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
    软换行此前不支持（W4 只为单元格引入，之后是否推广到普通段落待定）；
    关掉修订模式后在刚被标为 `w:ins` 的文字后继续输入，新字会并进那个 `w:ins` 区间
    （要修得做逐字 diff，有回归风险，W1 已记入 README 的「已知取舍」）。
+4. **W1 验收发现的两处次要项**（非阻断，记在这里免得只躺在提交信息里）：
+   ① `formatAmount` 的分组校验偏松 —— `AMOUNT_RE` 的首段是不限长的 `\d+`，
+   `1234,567`、`12345,678` 这类非规范分组也被接受（结果仍会规范化，不会出错值）；要收紧就改那一处正则。
+   ② **下划线只认 `<u>` 标签与行内 `style.textDecorationLine`**，纯 CSS 类画的下划线不会被
+   `readInlines` 读回。当前无害（`render/html.ts` 固定用 `<u>`），但**将来若把下划线的渲染改成 class
+   就会静默丢格式** —— 动那处渲染前先回来看这条。
 
 ---
 
@@ -403,12 +417,13 @@ export function parseCellId(id: string): { tableId: string; row: number; col: nu
 
 | 波次 | 内容 | 状态 |
 | --- | --- | --- |
-| W1 | 快捷键组（ctrl+U / ctrl+shift+E / alt+4 / ctrl+P）+ 三种特殊空格；顺带把「列表段落」首行缩进改成 0 | 已实现，工作区未提交；全量 verify 已通过一次，独立验收的定向证伪见对话记录 |
+| W1 | 快捷键组（ctrl+U / ctrl+shift+E / alt+4 / ctrl+P）+ 三种特殊空格；顺带把「列表段落」首行缩进改成 0 | **已完成**（2026-09-13，提交 `4ca96c8`；独立验收结论「可接受」，两处次要项见第 8 节第 4 条） |
 | W2 | 样式与页边距绑定（两套模板）+ 双页并排 | 设计已定稿（第 4 节），未开工 |
 | W3 | 查找替换 + 导航窗格 | 需求明确，设计为提案（第 5 节），未开工 |
 | W4a | 表格：模型 + 渲染 + 量测 + 分页 + 导出 + md 语法 | 模型设计已过用户闸门（第 6 节），未开工 |
 | W4b | 表格：编辑交互 | 同上，未开工 |
 | W5 | 节编辑框架 | **需先出模型设计给用户过目**，未开工 |
 
-**收尾待办**：`README.md` 的「待做」一节应当加一行指向本文件（`PLAN.md`），方便以后自动发现；
-这件事等 W1 提交完再做，别把它的改动混进 W1 的提交里。
+**收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。
+往后的维护约定：每开一波之前先回来读一遍对应小节；每完成一波，把该波标题改成「（已完成 YYYY-MM-DD）」、
+补一行结论、并在上面这张表里改状态。
