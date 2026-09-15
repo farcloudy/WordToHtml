@@ -814,5 +814,8 @@ export function cloneDoc(doc: DocModel): DocModel {
     // sections 是文档级数组，漏拷会让撤销 / 渲染快照与编辑中的模型共享引用，
     // 于是「切到别的节改方向」会连带改到快照，撤销也回不去
     ...(doc.sections ? { sections: doc.sections.map((s) => ({ ...s })) } : {}),
+    // editor（`::editor` 的那两个开关）同理：漏拷会让撤销 / 快照复原时把开关丢回默认，
+    // 而界面上的开关还在原处 —— save_md 出来的 md 与眼前的界面就对不上了
+    ...(doc.editor ? { editor: { ...doc.editor } } : {}),
   }
 }

@@ -10,7 +10,9 @@
  *   4. 快捷键：Ctrl+U 下划线、Ctrl+Shift+E 修订模式、Alt+4 金额格式（含无效输入的提示条）、
  *      工具栏「插入空格」下拉的三个特殊空格码点；
  *   5. 打印：编辑器外壳全部隐藏、每张纸各占一页、纸张尺寸取自规格表（真打一份 PDF 数页数）；
- *   6. 切文件模板：页数变了、插入符与选区都按坐标找回、文字没丢。
+ *   6. 切文件模板：页数变了、插入符与选区都按坐标找回、文字没丢；
+ *   7. W6：功能区四页高度一致、自定义快捷键表（改绑 / 旧键失效 / 未知动作名）、F4 重复上一步、
+ *      顶栏文件名（导出名 = 文件名 + .docx）、`::editor` 与顶栏两个开关的双向同步。
  *
  * 每一步都同时看两边：DOM 上看到了什么，模型里记下了什么。只看 DOM 会漏掉
  * 「界面改了、导出没改」，只看模型会漏掉「模型改了、界面没跟上」。
@@ -2913,6 +2915,248 @@ try {
   await vAlignButton('顶端').click()
   await page.waitForTimeout(250)
   eq('点回顶端后偏移回到 0 附近', (await cellMetrics()).textOffset <= 2, true)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== AA. 功能区四页高度一致（W6 第①条）===')
+  /*
+   * 四页常驻，高度不齐会让下方版面随切页上下跳。最高的一页是「开始」（样式库那排 chip
+   * 要按各自的字号渲染），其余三页被 CSS 的内容区下限（.panel 的 min-height）抬到同档。
+   * 容差 ±1px：只允许亚像素取整的差别，不允许「矮一截」。
+   */
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(200)
+  const panelHeights = {}
+  for (const [label, cls] of [
+    ['开始', '.panel-start'],
+    ['插入', '.panel-insert'],
+    ['布局', '.panel-layout'],
+    ['表格', '.panel-table'],
+  ]) {
+    await openTab(label)
+    panelHeights[label] = await page.evaluate((sel) => {
+      const el = document.querySelector(sel)
+      return el ? el.offsetHeight : -1
+    }, cls)
+  }
+  const panelValues = Object.values(panelHeights)
+  ok(
+    '四页 offsetHeight 相等（±1px 容差）',
+    Math.max(...panelValues) - Math.min(...panelValues) <= 1 && Math.min(...panelValues) > 0,
+    JSON.stringify(panelHeights),
+  )
+  ok(
+    '四页都没被挤成两行（高度一致不是因为都换行了）',
+    await page.evaluate(() => {
+      const el = document.querySelector('.panel')
+      return el ? el.scrollHeight <= el.clientHeight + 1 : false
+    }),
+  )
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== AB. 自定义快捷键表（W6 第④条）===')
+  /*
+   * 表通过 URL 参数递进 demo（`?shortcuts=bold:ctrl+shift+b,…`），见 App.vue 的
+   * shortcutsFromUrl —— 组件本身只认 `shortcuts` 这个 prop，真实使用方直接传对象。
+   */
+  const loadCustom = async (search) => {
+    await page.goto(`${url}${search}`, { waitUntil: 'load' })
+    await page.waitForSelector('.wtp-page', { timeout: 30000 })
+    await page.evaluate(async () => {
+      await document.fonts.ready
+    })
+    await page.waitForTimeout(600)
+    await page.evaluate(TEST_HELPERS, {
+      normal: SEARCH_HIGHLIGHT,
+      current: SEARCH_CURRENT_HIGHLIGHT,
+    })
+  }
+  const inlineWithText = async (text) => {
+    const model = await getModel()
+    return heroBlocks(model)
+      .flatMap((b) => b.inlines)
+      .find((i) => i.t === 'text' && i.text === text)
+  }
+  await loadCustom(
+    '?shortcuts=bold:ctrl+shift+b,trackChanges:ctrl+alt+e,formatAmount:ctrl+alt+4,bolld:ctrl+i',
+  )
+  const trackBox = 'label.checkbox input[type="checkbox"]'
+  // A. 新组合生效
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+Shift+b')
+  await page.waitForTimeout(250)
+  ok(
+    '改绑后新组合 ctrl+shift+B 加粗生效（模型里带 b）',
+    (await inlineWithText('我方'))?.bold === true,
+    JSON.stringify(await inlineWithText('我方')),
+  )
+  // B. 旧组合失效：改绑到一个浏览器没有原生行为的动作上才验得干净
+  //    （加粗这条不行 —— 解绑 ctrl+B 之后 Chromium 的原生加粗会接手，见 README）
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Shift+e')
+  await page.waitForTimeout(200)
+  eq('旧组合 ctrl+shift+E 不再翻「修订模式」', await page.isChecked(trackBox), false)
+  await page.keyboard.press('Control+Alt+e')
+  await page.waitForTimeout(200)
+  eq('改绑后新组合 ctrl+alt+E 翻「修订模式」', await page.isChecked(trackBox), true)
+  await page.keyboard.press('Control+Alt+e')
+  await page.waitForTimeout(200)
+  eq('再按一次关掉（回到未勾选）', await page.isChecked(trackBox), false)
+  // C. 旧组合失效、且这条在模型上看得见：金额格式化的 alt+4
+  await page.evaluate(() => window.__wtpTest.selectIn('人民币5000万元', 3, 7))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Alt+4')
+  await page.waitForTimeout(250)
+  ok('旧组合 alt+4 不再格式化金额（模型里还是 5000）', JSON.stringify(await getModel()).includes('5000'))
+  await page.evaluate(() => window.__wtpTest.selectIn('人民币5000万元', 3, 7))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+Alt+4')
+  await page.waitForTimeout(300)
+  ok('新组合 ctrl+alt+4 格式化金额', JSON.stringify(await getModel()).includes('5,000.00'))
+  // D. 未知动作名：忽略 + 默认表不受影响（另起一次加载，只给那个写错的动作名）
+  await loadCustom('?shortcuts=bolld:ctrl+i')
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+b')
+  await page.waitForTimeout(250)
+  ok(
+    '表里有未知动作名时 ctrl+B 仍然加粗（默认表没被悄悄改掉）',
+    (await inlineWithText('我方'))?.bold === true,
+    JSON.stringify(await inlineWithText('我方')),
+  )
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== AC. F4 重复上一步（W6 第③条）===')
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  const modelBeforeF4 = JSON.stringify(await getModel())
+  await page.keyboard.press('F4')
+  await page.waitForTimeout(250)
+  eq('没有可重复的操作时弹提示条', await page.locator('.toast').count(), 1)
+  eq('没有可重复的操作时模型一个字节都不改', JSON.stringify(await getModel()), modelBeforeF4)
+  await page.waitForTimeout(2200)
+  // 选中一处加粗 → 换一处选中 → F4 也在那一处加粗
+  await page.evaluate(() => window.__wtpTest.selectIn('经核查，债务人名下资产', 0, 3))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('Control+b')
+  await page.waitForTimeout(250)
+  ok('第一次加粗生效', (await inlineWithText('经核查'))?.bold === true)
+  await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 3))
+  await page.waitForTimeout(60)
+  await page.keyboard.press('F4')
+  await page.waitForTimeout(300)
+  ok(
+    'F4 在另一处也加粗了（重放的是格式操作本身，作用在当前选区）',
+    (await inlineWithText('债务人'))?.bold === true,
+    JSON.stringify(await inlineWithText('债务人')),
+  )
+  ok(
+    '原来那处仍在（模型里两处都带 b）',
+    (await inlineWithText('经核查'))?.bold === true,
+    JSON.stringify(await inlineWithText('经核查')),
+  )
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  ok(
+    '撤销一步只退回这一次重放（第二处不再加粗）',
+    (await inlineWithText('债务人'))?.bold !== true,
+    JSON.stringify(await inlineWithText('债务人')),
+  )
+  ok(
+    '撤销没有把第一次加粗也退掉（重放自己记了一步）',
+    (await inlineWithText('经核查'))?.bold === true,
+    JSON.stringify(await inlineWithText('经核查')),
+  )
+  await checkNoOverflow('AC F4 重放之后')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== AD. 顶栏文件名（W6 第②条）===')
+  await openApp()
+  eq('顶栏不再有 slogan（<strong>）', await page.locator('.bar strong').count(), 0)
+  const nameBox = page.locator('.bar .file-name')
+  eq('顶栏有一个文件名输入框', await nameBox.count(), 1)
+  eq('初始值 = 样本首行标题', await nameBox.inputValue(), '关于爱康光电资产核查情况的说明')
+  await nameBox.fill('核查情况说明（终稿）')
+  await page.waitForTimeout(120)
+  // 能拦到下载事件就验「真的下载成什么名字」；拦不到就退而验输入框（结论里说明是哪一种）
+  const exportClick = () => page.locator('.bar button.primary').click()
+  let suggested = null
+  let downloadSeen = true
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 8000 }),
+      exportClick(),
+    ])
+    suggested = download.suggestedFilename()
+  } catch {
+    downloadSeen = false
+  }
+  if (downloadSeen) {
+    eq('导出文件名 = 顶栏文件名 + .docx', suggested, '核查情况说明（终稿）.docx')
+  } else {
+    ok('（下载事件拦不到）退而验输入框的值变了', (await nameBox.inputValue()) === '核查情况说明（终稿）')
+  }
+  await nameBox.fill('')
+  await page.waitForTimeout(120)
+  if (downloadSeen) {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 8000 }),
+      exportClick(),
+    ])
+    eq('文件名空着时兜底「未命名.docx」', download.suggestedFilename(), '未命名.docx')
+  }
+  await nameBox.fill('已写后缀.docx')
+  await page.waitForTimeout(120)
+  if (downloadSeen) {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 8000 }),
+      exportClick(),
+    ])
+    eq('已经写了 .docx 就不会叠成 .docx.docx', download.suggestedFilename(), '已写后缀.docx')
+  }
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== AE. ::editor：开关写进 md（W6 第⑤条）===')
+  /*
+   * 界面这条路：源码视图里改文档开头的 `::editor …` → 模型重建 → 组件把开关报给 App
+   * （顶栏跟着走）；反过来在顶栏改开关 → 写回模型 → 源码视图里那行跟着出现/消失。
+   */
+  await openApp()
+  const toSourceView = () => page.locator('.tabs button', { hasText: '类 md 源码' }).click()
+  const toEditView = () => page.locator('.tabs button', { hasText: '所见即所得' }).click()
+  const sourceText = () => page.locator('textarea').inputValue()
+  await toSourceView()
+  await page.locator('textarea').fill('::editor trackChanges=on\n\n## 甲\n\n乙')
+  await page.waitForTimeout(400)
+  await toEditView()
+  await page.waitForTimeout(300)
+  eq('源码里的 trackChanges=on 把顶栏「修订模式」勾上了', await page.isChecked(trackBox), true)
+  const flagsModel = await getModel()
+  eq('模型里 editor.trackChanges === true', flagsModel.editor?.trackChanges, true)
+  eq('模型里 nav 不落字段（默认 true）', flagsModel.editor?.nav, undefined)
+  eq('nav 默认开着时导航窗格在', await page.locator('.nav-pane').count(), 1)
+  await page.locator(trackBox).click()
+  await page.waitForTimeout(250)
+  eq('取消勾选后模型里 editor 整个没了', JSON.stringify((await getModel()).editor ?? null), 'null')
+  await toSourceView()
+  await page.waitForTimeout(300)
+  ok('序列化结果里那一行也没了', !(await sourceText()).includes('::editor'), (await sourceText()).slice(0, 60))
+  await page.locator('textarea').fill('::editor nav=off\n\n## 甲\n\n乙')
+  await page.waitForTimeout(400)
+  await toEditView()
+  await page.waitForTimeout(300)
+  const navModel = await getModel()
+  eq('nav=off 落进模型', navModel.editor?.nav, false)
+  eq('导航窗格被收起', await page.locator('.nav-pane').count(), 0)
+  eq(
+    '顶栏「导航」按钮不再是激活态',
+    await page.locator('.bar button.tool.is-on', { hasText: '导航' }).count(),
+    0,
+  )
+  await toSourceView()
+  await page.waitForTimeout(300)
+  ok('序列化里有 nav=off', (await sourceText()).includes('nav=off'), (await sourceText()).slice(0, 60))
 } finally {
   await browser?.close()
   await server.close()
@@ -2935,5 +3179,8 @@ console.log(
     '关页码后该节不再有页码元素而别的节不受影响、默认值不落模型字段）、' +
     '接受/拒绝修订（无修订时置灰、拒绝删除修订、接受插入修订、撤销能还原）、' +
     '功能区标签页（四页常驻、各页各管一摊、光标进出表格时版面不跳）、' +
-    '格内垂直对齐（最小两行 + 单行文字时三档真的生效，且不改格高）均落到模型。',
+    '格内垂直对齐（最小两行 + 单行文字时三档真的生效，且不改格高）、' +
+    'W6：功能区四页 offsetHeight 相等、自定义快捷键表（改绑后新组合生效 / 旧组合失效 / 未知动作名不改默认表）、' +
+    'F4 重复上一步（空转提示、换处重放、撤销只退这一步）、顶栏文件名（无 slogan、导出名 = 文件名 + .docx、空名兜底）、' +
+    '::editor 写进 md（源码 → 顶栏开关、顶栏开关 → 源码那一行）均落到模型。',
 )

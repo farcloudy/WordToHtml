@@ -195,6 +195,28 @@ export interface CommentDef {
   resolved?: boolean
 }
 
+/**
+ * 编辑器的两个开关（写进 md 文档首行的 `::editor`）。
+ * 默认值**不落字段**（与围栏的 `minLines=1` / `cantSplit=yes` 同一个约定）：
+ * `trackChanges` 缺省 false、`nav` 缺省 true。
+ */
+export interface EditorSettings {
+  /** 修订模式 */
+  trackChanges?: boolean
+  /** 导航窗格 */
+  nav?: boolean
+}
+
+/** 解析成实际值（缺省补齐）。调用方要的是「开关到底是开还是关」，不是字段有没有 */
+export interface EditorFlags {
+  trackChanges: boolean
+  nav: boolean
+}
+
+export function resolveEditorFlags(editor?: EditorSettings): EditorFlags {
+  return { trackChanges: editor?.trackChanges === true, nav: editor?.nav !== false }
+}
+
 export interface DocModel {
   blocks: Block[]
   comments: CommentDef[]
@@ -207,6 +229,8 @@ export interface DocModel {
    * 缺项一律按全默认处理。
    */
   sections?: SectionSettings[]
+  /** 编辑器开关（文档级，不是某一节），来源与去处都是 md 首行的 `::editor` */
+  editor?: EditorSettings
 }
 
 export const emptyDoc = (): DocModel => ({ blocks: [], comments: [] })

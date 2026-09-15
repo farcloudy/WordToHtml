@@ -52,6 +52,7 @@ export {
   nextBlockId,
   parseCellId,
   plainText,
+  resolveEditorFlags,
   sliceInlines,
 } from './types'
 export type {
@@ -62,6 +63,8 @@ export type {
   CommentEndInline,
   CommentStartInline,
   DocModel,
+  EditorFlags,
+  EditorSettings,
   Inline,
   InlineHolder,
   PageBreakBlock,
@@ -157,6 +160,22 @@ export {
 export type { CellStep } from './edit/table'
 
 export { formatAmount } from './edit/amount'
+
+export {
+  DEFAULT_SHORTCUTS,
+  SHORTCUT_ACTIONS,
+  comboLabel,
+  matchShortcut,
+  parseCombo,
+  resolveShortcuts,
+} from './edit/shortcuts'
+export type {
+  Combo,
+  ShortcutAction,
+  ShortcutEvent,
+  ShortcutOverrides,
+  ShortcutTable,
+} from './edit/shortcuts'
 
 export { findMatches, replaceMatches, validateQuery } from './edit/search'
 export type { Match, SearchOptions, SearchScope } from './edit/search'

@@ -24,6 +24,10 @@
  *   --- …         分节符所开启的节：link=off / numbers=off / restart=on / orientation=landscape
  *   例：`--- link=off restart=on`（独立页脚 + 页码从 1 重排，= 旧 `---` 的含义）
  *
+ * 编辑器开关（语义见 types.ts 的 EditorSettings；同样只写非默认值、双向可逆）：
+ *   ::editor …    文档开头的 `trackChanges=on` / `nav=off`（默认：修订关、导航开）
+ *   与 `::section` 同在开头的指令区，谁先谁后都行；正文里出现的 `::editor` 落回正文。
+ *
  * 表格围栏块：
  *   :::table minLines=2
  *   > 单位：元
@@ -54,6 +58,7 @@ import type {
   CellVerticalAlign,
   CommentDef,
   DocModel,
+  EditorSettings,
   Inline,
   RevMark,
   SectionSettings,
@@ -62,7 +67,7 @@ import type {
   TableCellModel,
   TableRowModel,
 } from '../types'
-import { nextBlockId } from '../types'
+import { nextBlockId, resolveEditorFlags } from '../types'
 import { normalizeSectionSettings } from '../edit/section'
 
 export interface ParseOptions {
@@ -336,6 +341,16 @@ const PAGE_BREAK_RE = /^={3,}\s*$/
 const SECTION_DIRECTIVE_RE = /^::\s*section\b(.*)$/
 
 /**
+ * 文档开头的编辑器开关：`::editor trackChanges=on nav=on`（只写非默认值）。
+ *
+ * 与 `::section` 同住「开头的指令区」：两者都在文档最前面认，谁先谁后都行
+ * （序列化固定写 `::editor` 在前、`::section` 在后，但手工写的 md 不该因此被吃掉）。
+ * 一旦出现正文，指令区就关闭 —— 正文里写「::editor …」落回正文，与「围栏没闭合绝不当表格」
+ * 同一条原则。
+ */
+const EDITOR_DIRECTIVE_RE = /^::\s*editor\b(.*)$/
+
+/**
  * 解析分节 kwargs：`link=on|off` / `numbers=on|off` / `restart=on|off` / `orientation=portrait|landscape`。
  * 认不出的键与值一律忽略（不报错）；认出默认值也不落字段 —— 归一化交给
  * normalizeSectionSettings（与 setSectionSetting 同一个约定，模型里不留冗余值）。
@@ -360,6 +375,34 @@ function parseSectionKwargs(attrs: string, isFirst: boolean): SectionSettings {
   }
   normalizeSectionSettings(out, isFirst)
   return out
+}
+
+/**
+ * 解析 `::editor` 的 kwargs：`trackChanges=on|off` / `nav=on|off`。
+ *
+ * 只认这两个键与 on/off 两个值，其余一律忽略（不报错）；认出**默认值也不落字段** ——
+ * 默认值不落字段是「模型 → md → 模型」字节稳定的前提（与分节 kwargs 同一套约定）。
+ * 两个键全是默认值时返回 undefined（整个 editor 字段都不写进模型）。
+ */
+function parseEditorKwargs(attrs: string): EditorSettings | undefined {
+  const out: EditorSettings = {}
+  for (const m of attrs.matchAll(/([A-Za-z]+)\s*=\s*(\S+)/g)) {
+    const key = m[1]
+    const value = m[2]
+    if (key === 'trackChanges') {
+      if (value === 'on') out.trackChanges = true
+      else if (value === 'off') out.trackChanges = false
+    } else if (key === 'nav') {
+      if (value === 'on') out.nav = true
+      else if (value === 'off') out.nav = false
+    }
+  }
+  if (out.trackChanges === undefined && out.nav === undefined) return undefined
+  const flags = resolveEditorFlags(out)
+  const normalized: EditorSettings = {}
+  if (flags.trackChanges) normalized.trackChanges = true
+  if (!flags.nav) normalized.nav = false
+  return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
 /** 表格围栏的起始行：`:::table`，后面可跟 minLines=1|2、cantSplit=yes|no */
@@ -572,7 +615,12 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
   // 逐节设置，下标 = 节号。首节由文档首行的 ::section 指令描述；每遇到一个 `---`
   // 就往后面追加一项（它开启的那一节）。全默认时最后不写进模型（见函数末尾）。
   const sections: SectionSettings[] = [{}]
-  let firstLineSeen = false
+  let editor: EditorSettings | undefined
+  /**
+   * 还在「文档开头的指令区」里吗？`::editor` 与 `::section` 都只在这段里认，
+   * 出现第一行正文就关闭 —— 免得正文里写「::editor …」被吃掉。
+   */
+  let inHeader = true
 
   const baseCtx = {
     bold: false,
@@ -597,14 +645,20 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
     const line = (lines[li] ?? '').trimEnd()
     if (line.trim() === '') continue
 
-    // 文档首行（第一处非空行）可能是 `::section …`，描述首节。只在第一行认。
-    if (!firstLineSeen) {
-      firstLineSeen = true
+    // 文档开头的指令区：`::editor …`（编辑器开关）与 `::section …`（首节设置）都在这里认，
+    // 谁先谁后都行；第一行正文一到就关闭（下面的 inHeader = false）。
+    if (inHeader) {
+      const editorHead = EDITOR_DIRECTIVE_RE.exec(line)
+      if (editorHead) {
+        editor = parseEditorKwargs(editorHead[1] ?? '')
+        continue
+      }
       const head = SECTION_DIRECTIVE_RE.exec(line)
       if (head) {
         sections[0] = parseSectionKwargs(head[1] ?? '', true)
         continue
       }
+      inHeader = false
     }
 
     const fence = TABLE_FENCE_RE.exec(line)
@@ -659,5 +713,7 @@ export function parseMd(source: string, options: ParseOptions = {}): DocModel {
   // 两种形态都能存在的话，「模型 → md → 模型」会在两者之间漂移（见 edit/section.ts）。
   const doc: DocModel = { blocks, comments }
   if (sections.some((s) => Object.keys(s).length > 0)) doc.sections = sections
+  // editor 同理：全默认时 parseEditorKwargs 已经返回 undefined，这里只落非默认值
+  if (editor) doc.editor = editor
   return doc
 }

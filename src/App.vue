@@ -6,10 +6,11 @@ import WordPaper from './components/WordPaper.vue'
 import { toMd } from './lib/md/serialize'
 import { BLOCK_KINDS, DOC_TEMPLATES, ptToPx, resolveSpec } from './lib/spec'
 import type { Align, BlockKind, DeepPartial, Spec } from './lib/spec'
-import type { CellVerticalAlign } from './lib/types'
+import type { CellVerticalAlign, EditorFlags } from './lib/types'
 import type { EditorSelection } from './lib/edit/model'
 import type { OutlineEntry } from './lib/edit/outline'
 import type { SearchScope } from './lib/edit/search'
+import type { ShortcutOverrides } from './lib/edit/shortcuts'
 
 const SAMPLE = [
   '# 关于爱康光电资产核查情况的说明',
@@ -138,6 +139,60 @@ const mode = ref<'edit' | 'source'>('edit')
 const tab = ref<'start' | 'insert' | 'layout' | 'table'>('start')
 const source = ref(SAMPLE)
 const author = ref('张三')
+
+/**
+ * 文件名（顶栏上那一行，就是个可编辑的标题）。初始值 = 样本的第一行标题，
+ * 导出 docx 用的名字由它推出来（见 docxName）。
+ */
+const fileName = ref((SAMPLE.split('\n')[0] ?? '').replace(/^#\s*/, ''))
+
+/**
+ * 导出 docx 用的文件名：空着兜底「未命名」（不许导出成 `.docx`）；
+ * 用户自己已经写了 `.docx` 后缀就不再叠一个。
+ */
+const docxName = computed(() => {
+  const raw = fileName.value.trim()
+  const base = raw === '' ? '未命名' : raw
+  return /\.docx$/i.test(base) ? base : `${base}.docx`
+})
+
+/**
+ * 浏览器验收用的入口：`?shortcuts=bold:ctrl+shift+b,repeat:f9` 覆盖默认快捷键表。
+ *
+ * 只有 demo 用得上 —— 真实使用方直接把 `shortcuts` 这个 prop 递给组件。做成 URL 参数
+ * 是因为验收脚本要在**首次渲染之前**把表交进去；未知动作名照原样透传（组件会忽略 + warn，
+ * 那一幕本身也要验）。一个动作一项，`:` 分隔动作名与组合键，`+` 是组合键自己的分隔符。
+ */
+function shortcutsFromUrl(search: string): ShortcutOverrides | undefined {
+  /*
+   * 自己切 query，**不用 URLSearchParams**：后者按表单编码把 `+` 解成空格，
+   * 而组合键的修饰键分隔符正是 `+`（`bold:ctrl+shift+b` 会被解成「ctrl shift b」，
+   * 于是整张表静默退回默认值）。`%2B` 走 decodeURIComponent 也能还原成 `+`，两种写法都认。
+   */
+  for (const field of search.replace(/^\?/, '').split('&')) {
+    if (!field.startsWith('shortcuts=')) continue
+    let raw = ''
+    try {
+      raw = decodeURIComponent(field.slice('shortcuts='.length))
+    } catch {
+      return undefined
+    }
+    const out: Record<string, string> = {}
+    for (const pair of raw.split(',')) {
+      const at = pair.indexOf(':')
+      if (at < 0) continue
+      const action = pair.slice(0, at).trim()
+      const combo = pair.slice(at + 1).trim()
+      if (action === '' || combo === '') continue
+      out[action] = combo
+    }
+    return Object.keys(out).length > 0 ? (out as ShortcutOverrides) : undefined
+  }
+  return undefined
+}
+
+const shortcutsProp = shortcutsFromUrl(window.location.search)
+
 /** 当前文件模板（样式 + 页边距是一体的，所以只有一个下拉）。默认第一套，与既有行为一致 */
 const templateKey = ref(DOC_TEMPLATES[0].key)
 const trackChanges = ref(false)
@@ -292,6 +347,35 @@ function insertSpace(kind: 'em' | 'en' | 'quarterEm'): void {
 /** 修订模式由 App 持有（顶栏那个复选框也绑着它），快捷键只是换个入口 */
 function toggleTrackChanges(): void {
   trackChanges.value = !trackChanges.value
+  writeEditorFlags()
+}
+
+/**
+ * 组件报上来的编辑器开关（模型里 `::editor` 解析出来的值，已补齐默认值）。
+ * 模型是权威：这里不反问、不覆盖，只跟着它走 —— 载入时 App 自己的默认值
+ * 因此顶不掉模型里写的值。（组件只在模型载入/重建后发这个事件，所以不会形成回环。）
+ */
+function onEditorFlags(flags: EditorFlags): void {
+  trackChanges.value = flags.trackChanges
+  navOpen.value = flags.nav
+}
+
+/**
+ * 用户改了顶栏的开关：改自己的状态之外，还要写回模型 —— 这样「切到源码视图 / save_md」
+ * 序列化出来的 md 才带得上 `::editor` 那一行（模型是导出的真相）。
+ */
+function writeEditorFlags(): void {
+  paper.value?.setEditorFlags({ trackChanges: trackChanges.value, nav: navOpen.value })
+}
+
+function toggleNav(): void {
+  navOpen.value = !navOpen.value
+  writeEditorFlags()
+}
+
+function closeNav(): void {
+  navOpen.value = false
+  writeEditorFlags()
 }
 
 /* -------------------------------------------------------------------------- */
@@ -460,7 +544,7 @@ function switchMode(next: 'edit' | 'source'): void {
 async function onExport(): Promise<void> {
   exporting.value = true
   try {
-    await paper.value?.downloadDocx('关于爱康光电资产核查情况的说明.docx')
+    await paper.value?.downloadDocx(docxName.value)
   } finally {
     exporting.value = false
   }
@@ -494,7 +578,18 @@ onBeforeUnmount(() => {
 <template>
   <div class="app">
     <header class="bar">
-      <strong>WordToHtml · 公文 A4 编辑器</strong>
+      <!--
+        顶栏那一行就是文件名（原先是「WordToHtml · 公文 A4 编辑器」这句 slogan）。
+        样式仍像标题，但可以直接改 —— 导出 docx 的文件名就是它 + .docx。
+      -->
+      <input
+        v-model="fileName"
+        class="file-name"
+        type="text"
+        spellcheck="false"
+        aria-label="文件名"
+        title="文件名（导出 docx 用它 + .docx）"
+      />
       <div class="tabs">
         <button type="button" :class="{ 'is-on': mode === 'edit' }" @click="switchMode('edit')">
           所见即所得
@@ -509,7 +604,7 @@ onBeforeUnmount(() => {
         class="tool"
         :class="{ 'is-on': navOpen }"
         title="显示/隐藏左侧导航窗格"
-        @click="navOpen = !navOpen"
+        @click="toggleNav"
       >
         导航
       </button>
@@ -526,7 +621,7 @@ onBeforeUnmount(() => {
         <input v-model="author" type="text" size="6" />
       </label>
       <label class="field checkbox">
-        <input v-model="trackChanges" type="checkbox" />
+        <input v-model="trackChanges" type="checkbox" @change="writeEditorFlags" />
         修订模式
       </label>
       <span class="spacer" />
@@ -1077,7 +1172,7 @@ onBeforeUnmount(() => {
       <section v-if="outline.length > 0 && navOpen" class="pane nav-pane">
         <div class="pane-head nav-head">
           <span>导航</span>
-          <button type="button" class="nav-collapse" title="折叠导航窗格" @click="navOpen = false">
+          <button type="button" class="nav-collapse" title="折叠导航窗格" @click="closeNav">
             «
           </button>
         </div>
@@ -1135,6 +1230,7 @@ onBeforeUnmount(() => {
             :author="author"
             :editable="mode === 'edit'"
             :track-changes="trackChanges"
+            :shortcuts="shortcutsProp"
             @paginated="pageCount = $event"
             @selection-change="onSelectionChange"
             @toggle-track-changes="toggleTrackChanges"
@@ -1142,6 +1238,7 @@ onBeforeUnmount(() => {
             @open-search="onOpenSearch"
             @search-state="searchState = $event"
             @outline-change="outline = $event"
+            @editor-flags="onEditorFlags"
           />
         </div>
 
@@ -1301,8 +1398,30 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
-.bar strong {
+/*
+ * 顶栏那一行的文件名。看着像标题（原来那句 slogan 的样子），其实是个输入框：
+ * 无边框、背景透明，聚焦时才画一圈，免得顶栏整天挂着一个框。
+ */
+.bar .file-name {
+  width: 320px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #1f2329;
+  font: inherit;
   font-size: 14px;
+  font-weight: 600;
+}
+
+.bar .file-name:hover {
+  border-color: #d5d9df;
+}
+
+.bar .file-name:focus {
+  border-color: #1f6feb;
+  background: #fff;
+  outline: none;
 }
 
 .tabs {
@@ -1457,22 +1576,22 @@ button.primary:disabled {
   font-size: 13px;
 }
 
-/* 表格的上下文工具条：复用主工具栏的观感，次要色 + 更紧的行距，别另起一套设计 */
+/*
+ * 四页功能区**必须一样高**（四页常驻，高度不齐会让下方版面随切页上下跳）。
+ *
+ * 最高的一页是「开始」：样式库那排 chip 按各条样式自己的字体字号渲染（chipStyle 把字号
+ * 夹在 12–15px），最高的一枚是 15 × 1.35 行高 + 上下内边距 5 + 边框 1 = 32px。
+ * 所以这里把内容区的下限钉成同一个数：矮的几页被 min-height 抬到这一档，
+ * 样式库本身不动 —— 它就需要这么高（把「开始」压矮是不行的）。
+ * 四页的高度一致有浏览器断言守着（verify-editor 的「四页高度」）。
+ */
+.panel {
+  min-height: 32px;
+}
+
+/* 次要工具条（布局 / 表格）：只保留背景色差异，尺寸与主工具条同档，否则高度参差 */
 .sub-toolbar {
-  gap: 12px;
-  padding: 6px 16px;
   background: #f6f7f9;
-  font-size: 12px;
-}
-
-.sub-toolbar .tool {
-  padding: 2px 8px;
-  font-size: 12px;
-}
-
-.sub-toolbar .tool:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 
 .tk-hint {

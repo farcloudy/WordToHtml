@@ -38,6 +38,12 @@ import type { OutlineEntry } from '../lib/edit/outline'
 import { findMatches, replaceMatches, validateQuery } from '../lib/edit/search'
 import type { Match, SearchOptions, SearchScope } from '../lib/edit/search'
 import {
+  SHORTCUT_ACTIONS,
+  matchShortcut,
+  resolveShortcuts,
+} from '../lib/edit/shortcuts'
+import type { ShortcutAction, ShortcutOverrides, ShortcutTable } from '../lib/edit/shortcuts'
+import {
   addComment,
   applyFormat,
   blockLength,
@@ -109,11 +115,14 @@ import {
   defaultCellAlignH,
   nextBlockId,
   parseCellId,
+  resolveEditorFlags,
   sliceInlines,
 } from '../lib/types'
 import type {
   CellVerticalAlign,
   DocModel,
+  EditorFlags,
+  EditorSettings,
   Inline,
   PageOrientation,
   RevMark,
@@ -138,8 +147,10 @@ const props = withDefaults(
     editable?: boolean
     /** 修订模式：新增标 w:ins，删除不真删、标成 w:del 留在原处 */
     trackChanges?: boolean
+    /** 自定义快捷键表：只写要改的动作（见 lib/edit/shortcuts.ts），留空即用默认表 */
+    shortcuts?: ShortcutOverrides
   }>(),
-  { source: '', author: '管理员', editable: false, trackChanges: false },
+  { source: '', author: '管理员', editable: false, trackChanges: false, shortcuts: undefined },
 )
 
 const emit = defineEmits<{
@@ -155,6 +166,13 @@ const emit = defineEmits<{
   'search-state': [state: { total: number; current: number; error: string | null }]
   /** 大纲变了（按指纹比对，同一份大纲只发一次），导航窗格用它 */
   'outline-change': [entries: OutlineEntry[]]
+  /**
+   * 模型里 `::editor` 解析出来的两个开关（已补齐默认值）。模型是权威 ——
+   * 调用方据此设自己的「修订模式 / 导航」状态，载入时就不该用自己的默认值顶掉模型里的值。
+   * 只在**模型载入 / 重建**之后发；调用方改动开关时走 setEditorFlags 回写（那条路不发事件，
+   * 否则两边互相写会把用户刚改的值覆盖回去）。
+   */
+  'editor-flags': [flags: EditorFlags]
 }>()
 
 const resolved = computed<Spec>(() => resolveSpec(props.spec))
@@ -168,6 +186,12 @@ const doc = shallowRef<DocModel>(props.model ?? parseMd(props.source, { author: 
 /** 渲染用的冻结快照，只在重排时整体换新 */
 const viewDoc = shallowRef<DocModel>(doc.value)
 const viewNumbering = shallowRef<Map<string, string>>(new Map())
+
+/**
+ * 实际生效的快捷键表（默认表 + 调用方的覆盖）。表是纯函数算出来的，
+ * 所以做成 computed：调用方换表时重新解析一次，顺带把「未知动作名 / 冲突」的 warn 打出来。
+ */
+const shortcuts = computed<ShortcutTable>(() => resolveShortcuts(props.shortcuts))
 
 const host = ref<HTMLElement | null>(null)
 const root = ref<HTMLElement | null>(null)
@@ -1110,52 +1134,96 @@ function onCompositionEnd(): void {
   }, 0)
 }
 
+/**
+ * 这次按键命中哪个动作。表按动作集的固定顺序扫，所以「两个动作绑同一个组合键」时
+ * 先到先得（resolveShortcuts 已经把后到的解绑并 warn 过一遍，这里只是照表办事）。
+ * Tab 与方向键**不在表里**：它们是编辑器手感（跨格移动），不是可配置的动作。
+ */
+function shortcutActionOf(event: KeyboardEvent): ShortcutAction | null {
+  const table = shortcuts.value
+  for (const action of SHORTCUT_ACTIONS) {
+    if (matchShortcut(event, table[action])) return action
+  }
+  return null
+}
+
+/* -------------------------------------------------------------------------- */
+/* F4：重复上一步                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 最后一次**可重复的格式操作**（不含删除 / 并段 / 插入这类破坏性、结构性的操作 ——
+ * 重放它们会把撤销栈搞乱）。记的是「调用本身」，所以 F4 作用的是**当前**落点 / 选区
+ * （Word 的 F4 也是这个语义），不是操作发生时的位置。
+ */
+let repeatAction: (() => boolean) | null = null
+
+/**
+ * 记下并执行一次可重复的操作。只有**真的改了模型**（返回 true）才记 —— 否则
+ * 「没选中文字时点一下加粗」也会占住 F4，之后按 F4 只会静默空转，
+ * 连「没有可重复的操作」这句提示都出不来。
+ */
+function repeatable(run: () => boolean): void {
+  if (run()) repeatAction = run
+}
+
+/** F4 的处理：没有可重复的操作就空转 + 一句提示（与金额格式化失败同一套提示条） */
+function repeatLast(): void {
+  if (!repeatAction) {
+    emit('toast', '没有可重复的操作')
+    return
+  }
+  repeatAction()
+}
+
 function onKeydown(event: KeyboardEvent): void {
   if (!props.editable || composing) return
 
   const mod = event.ctrlKey || event.metaKey
-  if (mod && (event.key === 'b' || event.key === 'B')) {
+  const action = shortcutActionOf(event)
+  if (action) {
     event.preventDefault()
-    toggleBold()
+    switch (action) {
+      case 'bold':
+        toggleBold()
+        break
+      case 'underline':
+        toggleUnderline()
+        break
+      case 'trackChanges':
+        emit('toggle-track-changes')
+        break
+      // ctrl+F 是浏览器查找、ctrl+G 是「查找下一个」，不 preventDefault 就抢不回来
+      case 'find':
+        emit('open-search', 'find')
+        break
+      case 'replace':
+        emit('open-search', 'replace')
+        break
+      case 'undo':
+        undo()
+        break
+      case 'redo':
+        redo()
+        break
+      case 'formatAmount':
+        if (!formatSelectionAsAmount()) emit('toast', '选中内容不是有效数字')
+        break
+      case 'repeat':
+        repeatLast()
+        break
+    }
     return
   }
-  if (mod && (event.key === 'u' || event.key === 'U')) {
-    event.preventDefault()
-    toggleUnderline()
-    return
-  }
-  if (mod && event.shiftKey && (event.key === 'e' || event.key === 'E')) {
-    event.preventDefault()
-    emit('toggle-track-changes')
-    return
-  }
-  // ctrl+F 是浏览器查找、ctrl+G 是「查找下一个」，不 preventDefault 就抢不回来
-  if (mod && !event.shiftKey && (event.key === 'f' || event.key === 'F')) {
-    event.preventDefault()
-    emit('open-search', 'find')
-    return
-  }
-  if (mod && !event.shiftKey && (event.key === 'g' || event.key === 'G')) {
-    event.preventDefault()
-    emit('open-search', 'replace')
-    return
-  }
-  if (mod && (event.key === 'z' || event.key === 'Z')) {
-    event.preventDefault()
-    if (event.shiftKey) redo()
-    else undo()
-    return
-  }
-  if (mod && (event.key === 'y' || event.key === 'Y')) {
+  /*
+   * ctrl+shift+Z 是「重做」的另一条惯例键（ctrl+Z 的兄弟键）。动作表是「一个动作一个组合键」，
+   * 塞不进第二条，所以放在表外兜底：表里没命中才轮到它 —— 调用方要是把某个动作改绑到
+   * ctrl+shift+Z，那一条自然优先。必须拦下：放给浏览器会落到原生重做，而本项目不用原生
+   * 撤销栈，那一刀会把 DOM 与模型分开。
+   */
+  if (mod && event.shiftKey && !event.altKey && (event.key === 'z' || event.key === 'Z')) {
     event.preventDefault()
     redo()
-    return
-  }
-  // alt+4：数字改写成千分位两位小数。键盘布局不同时 alt+4 的 key 可能不是 '4'，
-  // 所以两种判据都要看
-  if (event.altKey && !mod && (event.key === '4' || event.code === 'Digit4')) {
-    event.preventDefault()
-    if (!formatSelectionAsAmount()) emit('toast', '选中内容不是有效数字')
     return
   }
   if (event.key === 'Tab') {
@@ -1566,25 +1634,33 @@ function forSelection(
   })
 }
 
-function setBlockKind(kind: BlockKind): void {
+/**
+ * 段落样式 / 格内样式。跨段落 + 跨格的选区都走 setContainerKind（格子设格子的 kind、
+ * 段落设段落的 kind）；返回值 = 「这一下有没有落到模型上」，供 F4 决定要不要记它。
+ */
+function applyBlockKind(kind: BlockKind): boolean {
   const rootEl = root.value
-  if (!rootEl) return
+  if (!rootEl) return false
   const range = currentRange(rootEl)
-  if (!range) return
+  if (!range) return false
   const ids = new Set(selectedRanges(rootEl).map((r) => r.blockId))
   if (ids.size === 0) ids.add(range.start.blockId)
   pushHistory()
-  // 跨段落 + 跨格的选区都要生效：走 setContainerKind（格子设格子的 kind，段落设段落的 kind）
   for (const id of ids) setContainerKindOp(doc.value, id, kind)
   refreshLayout({ anchor: range.start, anchorEnd: range.end, force: true })
   void nextTick(emitSelection)
+  return true
 }
 
-function toggleBold(): void {
+function setBlockKind(kind: BlockKind): void {
+  repeatable(() => applyBlockKind(kind))
+}
+
+function applyBold(): boolean {
   const rootEl = root.value
-  if (!rootEl) return
+  if (!rootEl) return false
   const ranges = selectedRanges(rootEl)
-  if (ranges.length === 0) return
+  if (ranges.length === 0) return false
   const allBold = ranges.every((range) => {
     const container = findContainer(doc.value, range.blockId)
     if (!container) return false
@@ -1594,13 +1670,18 @@ function toggleBold(): void {
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, { bold: !allBold }),
   )
+  return true
 }
 
-function toggleUnderline(): void {
+function toggleBold(): void {
+  repeatable(applyBold)
+}
+
+function applyUnderline(): boolean {
   const rootEl = root.value
-  if (!rootEl) return
+  if (!rootEl) return false
   const ranges = selectedRanges(rootEl)
-  if (ranges.length === 0) return
+  if (ranges.length === 0) return false
   const allUnderline = ranges.every((range) => {
     const container = findContainer(doc.value, range.blockId)
     if (!container) return false
@@ -1610,14 +1691,27 @@ function toggleUnderline(): void {
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, { underline: !allUnderline }),
   )
+  return true
 }
 
-function setColor(hex: string | null): void {
+function toggleUnderline(): void {
+  repeatable(applyUnderline)
+}
+
+function applyColor(hex: string | null): boolean {
+  const rootEl = root.value
+  if (!rootEl) return false
+  if (selectedRanges(rootEl).length === 0) return false
   forSelection((model, blockId, from, to) =>
     applyFormat(model, blockId, from, to, {
       color: hex ? hex.replace(/^#/, '').toUpperCase() : null,
     }),
   )
+  return true
+}
+
+function setColor(hex: string | null): void {
+  repeatable(() => applyColor(hex))
 }
 
 /**
@@ -2093,23 +2187,28 @@ function removeTableColumn(): void {
 }
 
 /** 行高两档（最小一行 / 最小两行）；锚点不变 */
-function setTableMinLines(minLines: 1 | 2): void {
+function applyTableMinLines(minLines: 1 | 2): boolean {
   const target = tableTarget()
-  if (!target) return
-  if (target.table.minLines === minLines) return
+  if (!target) return false
+  if (target.table.minLines === minLines) return false
   pushHistory(target.point)
   setMinLines(target.table, minLines)
   finishTableOp(target, target.row, target.col, target.offset)
+  return true
+}
+
+function setTableMinLines(minLines: 1 | 2): void {
+  repeatable(() => applyTableMinLines(minLines))
 }
 
 /** radio 开关：增删表头行（unit，插在最前）/ 附注行（note，加在最后）；锚点按行号位移重算 */
-function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
+function applyTableRoleRow(role: 'unit' | 'note', on: boolean): boolean {
   const target = tableTarget()
-  if (!target) return
+  if (!target) return false
   const table = target.table
   const index = table.rows.findIndex((row) => row.role === role)
-  if (on && index >= 0) return
-  if (!on && index < 0) return
+  if (on && index >= 0) return false
+  if (!on && index < 0) return false
 
   pushHistory(target.point)
   setRoleRow(table, role, on)
@@ -2118,21 +2217,26 @@ function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
     if (on) {
       // 新行插在 0 号位，光标所在行整体 +1
       finishTableOp(target, target.row + 1, target.col, target.offset)
-      return
+      return true
     }
     // 删掉表头行：光标就在它上面 → 落到第 0 行（此时是第一个 body 行）、偏移归 0；否则整体 -1
     if (target.row === index) finishTableOp(target, 0, target.col, 0)
     else finishTableOp(target, target.row - 1, target.col, target.offset)
-    return
+    return true
   }
 
   // note 加在最后、删的也是最后一行，光标不在附注行时行号不变
   if (!on && target.row === index) {
     const bodies = bodyRowIndexes(table)
     finishTableOp(target, bodies[bodies.length - 1] ?? 0, target.col, target.offset)
-    return
+    return true
   }
   finishTableOp(target, target.row, target.col, target.offset)
+  return true
+}
+
+function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
+  repeatable(() => applyTableRoleRow(role, on))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2175,33 +2279,43 @@ function tableAnchorAfterRemoval(index: number): DisplayPoint | null {
  * 水平对齐三档（只有左 / 居中 / 右，不做两端对齐）。
  * 与当前**实际生效值**相同 → 清除该维覆盖（回默认：unit 右 / note 左 / body 跟该格样式）。
  */
-function setTableCellAlignH(value: Align): void {
+function applyTableCellAlignH(value: Align): boolean {
   const target = tableTarget()
-  if (!target) return
+  if (!target) return false
   const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
-  if (!cell) return
+  if (!cell) return false
   const role = target.table.rows[target.row]?.role ?? 'body'
   const styleAlign = resolved.value.styles[cell.kind ?? 'listItem'].align
   const effective = cell.align?.h ?? defaultCellAlignH(role, styleAlign)
   const next = effective === value ? null : value
-  if ((cell.align?.h ?? null) === next) return
+  if ((cell.align?.h ?? null) === next) return false
   pushHistory(target.point)
   setCellAlign(cell, 'h', next)
   finishTableOp(target, target.row, target.col, target.offset)
+  return true
+}
+
+function setTableCellAlignH(value: Align): void {
+  repeatable(() => applyTableCellAlignH(value))
 }
 
 /** 垂直对齐三档；同样「点当前值 = 回默认 top」 */
-function setTableCellAlignV(value: CellVerticalAlign): void {
+function applyTableCellAlignV(value: CellVerticalAlign): boolean {
   const target = tableTarget()
-  if (!target) return
+  if (!target) return false
   const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
-  if (!cell) return
+  if (!cell) return false
   const effective = cell.align?.v ?? 'top'
   const next = effective === value ? null : value
-  if ((cell.align?.v ?? null) === next) return
+  if ((cell.align?.v ?? null) === next) return false
   pushHistory(target.point)
   setCellAlign(cell, 'v', next)
   finishTableOp(target, target.row, target.col, target.offset)
+  return true
+}
+
+function setTableCellAlignV(value: CellVerticalAlign): void {
+  repeatable(() => applyTableCellAlignV(value))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2495,6 +2609,33 @@ function clearSearch(): void {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 编辑器开关（模型里的 ::editor）                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 把模型里的编辑器开关报给调用方。**只在模型载入 / 重建之后发**（挂载与 source/model 变更），
+ * 让「模型赢」：调用方用自己的默认状态顶不掉模型里写的值。
+ */
+function emitEditorFlags(): void {
+  emit('editor-flags', resolveEditorFlags(doc.value.editor))
+}
+
+/**
+ * 把开关写回模型（供调用方在用户改开关时调）。缺省值要**删字段** —— 默认值不落字段是
+ * 「模型 → md → 模型」字节稳定的前提；全默认时整个 editor 字段都不留。
+ *
+ * 这里**不发 editor-flags**：调用方是「先改自己的状态、再回写模型」，再发事件就形成回环，
+ * 把用户刚改的值覆盖回旧的。
+ */
+function setEditorFlags(flags: EditorFlags): void {
+  const next: EditorSettings = {}
+  if (flags.trackChanges) next.trackChanges = true
+  if (!flags.nav) next.nav = false
+  if (next.trackChanges === undefined && next.nav === undefined) delete doc.value.editor
+  else doc.value.editor = next
+}
+
+/* -------------------------------------------------------------------------- */
 /* 生命周期                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -2510,6 +2651,7 @@ onMounted(async () => {
   }
   document.addEventListener('selectionchange', onSelectionChange)
   refreshLayout({ force: true })
+  emitEditorFlags()
 })
 
 onBeforeUnmount(() => {
@@ -2523,6 +2665,8 @@ watch([() => props.source, () => props.model], () => {
   undoStack.length = 0
   redoStack.length = 0
   refreshLayout({ force: true })
+  // 模型换了，开关跟着换（模型是权威）
+  emitEditorFlags()
 })
 
 watch(
@@ -2581,6 +2725,8 @@ defineExpose({
   /** 最近一次分页用到的量测值（行数、行高、段距），排错用 */
   getMeasurements: (): MeasuredItem[] => measured.value,
   pageCount: (): number => pages.value.length,
+  // 编辑器开关（模型里的 ::editor），调用方在用户改开关时回写
+  setEditorFlags,
   // 编辑层
   setBlockKind,
   toggleBold,

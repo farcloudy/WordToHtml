@@ -14,6 +14,7 @@ import type {
   Block,
   CommentDef,
   DocModel,
+  EditorSettings,
   Inline,
   SectionSettings,
   TableBlock,
@@ -130,10 +131,29 @@ function sectionKwargs(raw: SectionSettings | undefined, isFirst: boolean): stri
   return tokens.join(' ')
 }
 
+/**
+ * 编辑器开关 → `::editor` 的 kwargs（**只写非默认值**，token 顺序固定
+ * trackChanges 在前、nav 在后）。全默认时返回空串 —— 这一行整个不写。
+ *
+ * 顺序固定 + 只写非默认值 ⇒「模型 → md → 模型 → md」字节稳定。
+ */
+function editorKwargs(editor: EditorSettings | undefined): string {
+  if (!editor) return ''
+  const tokens: string[] = []
+  if (editor.trackChanges === true) tokens.push('trackChanges=on')
+  if (editor.nav === false) tokens.push('nav=off')
+  return tokens.join(' ')
+}
+
 export function toMd(doc: DocModel): string {
   const comments = new Map(doc.comments.map((c) => [c.id, c]))
   const lines: string[] = []
   const sections = doc.sections ?? []
+
+  // 编辑器开关写在文档最前面（它是整个文档的，不属于任何一节）；指令区里
+  // `::editor` 在 `::section` 之前，解析侧两者谁先谁后都认
+  const editorLine = editorKwargs(doc.editor)
+  if (editorLine !== '') lines.push(`::editor ${editorLine}`)
 
   // 首节写在文档第一行（只有非默认时才写），其余各节跟着各自的 `---` 走
   const head = sectionKwargs(sections[0], true)

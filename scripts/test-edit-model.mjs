@@ -16,6 +16,8 @@
 import JSZip from 'jszip'
 
 import {
+  DEFAULT_SHORTCUTS,
+  SHORTCUT_ACTIONS,
   addComment,
   applyFormat,
   blockLength,
@@ -44,11 +46,13 @@ import {
   insertSectionBreakAfter,
   insertText,
   joinWithNext,
+  matchShortcut,
   mergeIntoPrevious,
   normalizeBlocks,
   normalizeTable,
   outlineSignature,
   parseCellId,
+  parseCombo,
   parseMd,
   plainText,
   rangeColor,
@@ -64,9 +68,11 @@ import {
   replyComment,
   replaceMatches,
   replaceRange,
+  resolveEditorFlags,
   resolveRevisions,
   resolveSectionSettings,
   resolveSections,
+  resolveShortcuts,
   resolveSpec,
   revisionSpanAt,
   sectionCountOf,
@@ -1578,7 +1584,11 @@ console.log('\n=== 21. 节编辑：模型操作 / 不变式 / md 往返（W5）=
 {
   /** 「块 + 逐节设置」的完整形状（normalizeBlocks 只管 blocks，W5 起 sections 也算结构） */
   const shape = (doc) =>
-    JSON.stringify({ blocks: normalizeBlocks(doc), sections: doc.sections ?? null })
+    JSON.stringify({
+      blocks: normalizeBlocks(doc),
+      sections: doc.sections ?? null,
+      editor: doc.editor ?? null,
+    })
 
   // ---- A. sectionIndexOf：段落 / 格子里 / 分节符上 / 不存在的 id ----
   const doc = parseMd('甲\n\n---\n\n乙\n\n:::table\n| 丙 |\n:::\n\n---\n\n丁')
@@ -1841,6 +1851,189 @@ console.log('\n=== 25. 跨段删除：deleteSpan / joinWithNext（issues/2026091
   eq('下一块是表格 → 不能并', canJoinWithNext(canTable, canTable.blocks[0].id), false)
   eq('前一块是表格 → 不能并', canMergeIntoPrevious(canTable, canTable.blocks[tableAt + 1].id), false)
   eq('不存在的块 → 两个谓词都说不', `${canMergeIntoPrevious(canTable, 'nope')}/${canJoinWithNext(canTable, 'nope')}`, 'false/false')
+}
+
+console.log('\n=== 26. ::editor：编辑器开关的解析与序列化（W6）===')
+{
+  const shapeOf = (doc) =>
+    JSON.stringify({
+      blocks: normalizeBlocks(doc),
+      sections: doc.sections ?? null,
+      editor: doc.editor ?? null,
+    })
+
+  // 默认值不写：文档里没有这一行时模型里也没有 editor
+  const plain = parseMd('甲')
+  eq('没有 ::editor 就没有 editor 字段', plain.editor, undefined)
+  eq('默认也不写回 md', toMd(plain), '甲')
+  eq('默认开关解析成「修订关、导航开」', JSON.stringify(resolveEditorFlags(plain.editor)), JSON.stringify({ trackChanges: false, nav: true }))
+
+  // 只写非默认值：trackChanges=on 单独出现
+  const track = parseMd('::editor trackChanges=on\n\n甲')
+  eq('trackChanges=on 读出来', JSON.stringify(track.editor), '{"trackChanges":true}')
+  eq('序列化写回一行（在最前面）', toMd(track), '::editor trackChanges=on\n甲')
+  eq('再往返一次字节稳定', toMd(parseMd(toMd(track))), '::editor trackChanges=on\n甲')
+  eq('往返结构一致', shapeOf(parseMd(toMd(track))), shapeOf(track))
+
+  // 只写非默认值：nav=off 单独出现
+  const nav = parseMd('::editor nav=off\n\n甲')
+  eq('nav=off 读出来', JSON.stringify(nav.editor), '{"nav":false}')
+  eq('序列化只写 nav=off', toMd(nav), '::editor nav=off\n甲')
+  eq('nav=off 的开关解析', JSON.stringify(resolveEditorFlags(nav.editor)), JSON.stringify({ trackChanges: false, nav: false }))
+
+  // 两者同时出现，且 key 顺序固定 trackChanges → nav
+  const both = parseMd('::editor nav=off trackChanges=on\n\n甲')
+  eq('两个键都读出来', JSON.stringify(both.editor), '{"trackChanges":true,"nav":false}')
+  eq('序列化顺序固定 trackChanges 在前', toMd(both), '::editor trackChanges=on nav=off\n甲')
+
+  // 显式写出的默认值被归一化掉（与围栏 minLines=1 / 格内 {@listItem|…} 同一个约定）
+  const obvious = parseMd('::editor trackChanges=off nav=on\n\n甲')
+  eq('显式写出的默认值不落字段', obvious.editor, undefined)
+  eq('也不写回 md', toMd(obvious), '甲')
+
+  // 未知 key / 值忽略，不报错也不落字段
+  const junk = parseMd('::editor nope=1 trackChanges=maybe nav=off\n\n甲')
+  eq('未知 key 被忽略、值只认 on/off', JSON.stringify(junk.editor), '{"nav":false}')
+
+  // 非首行出现的 ::editor 落回正文（与「围栏没闭合绝不当表格」同一条原则）
+  const body = parseMd('甲\n\n::editor trackChanges=on')
+  eq('正文里的 ::editor 不当指令', toMd(body), '甲\n::editor trackChanges=on')
+  eq('也不产生 editor 字段', body.editor, undefined)
+  // 指令区里两行都在最前面，谁先谁后都认
+  const withSection = parseMd('::editor nav=off\n\n::section numbers=off\n\n甲')
+  eq('::editor 与 ::section 同住指令区（nav）', JSON.stringify(withSection.editor), '{"nav":false}')
+  eq('::editor 与 ::section 同住指令区（section）', JSON.stringify(settingsOf(withSection, 0)), '{"pageNumbers":false}')
+  eq('序列化把 ::editor 写在 ::section 之前', toMd(withSection), '::editor nav=off\n::section numbers=off\n甲')
+  eq('交叉顺序往返也稳定', shapeOf(parseMd('::section numbers=off\n::editor nav=off\n\n甲')), shapeOf(withSection))
+
+  // 正文首行之后的 ::editor 不再被认（指令区已关）
+  const afterContent = parseMd('::editor nav=off\n\n甲\n\n::editor trackChanges=on')
+  eq('指令区之后的 ::editor 落回正文', afterContent.editor ? JSON.stringify(afterContent.editor) : '(无)', '{"nav":false}')
+  eq('正文那一行留在块里', toMd(afterContent), '::editor nav=off\n甲\n::editor trackChanges=on')
+
+  // cloneDoc 必须连 editor 一起拷：撤销栈 / 渲染快照都走它
+  const cloned = cloneDoc(both)
+  eq('cloneDoc 拷了 editor', JSON.stringify(cloned.editor), JSON.stringify(both.editor))
+  if (cloned.editor) cloned.editor.nav = true
+  eq('拷贝之后改它不影响原稿', JSON.stringify(both.editor), '{"trackChanges":true,"nav":false}')
+
+  /*
+   * `::editor` 只影响编辑器界面，**不许影响导出的 docx**。比内层 XML 而不是整个 zip：
+   * zip 里带 docx 库写的创建时间戳，两次导出的字节本来就不会相同。
+   */
+  const spec = resolveSpec()
+  const plainDoc = parseMd('# 甲\n\n乙')
+  const flagDoc = parseMd('::editor trackChanges=on nav=off\n\n# 甲\n\n乙')
+  eq('两种形状的块数一致', flagDoc.blocks.length, plainDoc.blocks.length)
+  const docxXml = async (doc) => {
+    const base64 = await toBase64(doc, spec, { title: '开关不进 docx' })
+    const zip = await JSZip.loadAsync(Buffer.from(base64, 'base64'))
+    return (
+      (await zip.file('word/document.xml')?.async('string')) +
+      '\u0000' +
+      (await zip.file('word/styles.xml')?.async('string'))
+    )
+  }
+  const plainXml = await docxXml(plainDoc)
+  const flagXml = await docxXml(flagDoc)
+  ok(
+    '带 ::editor 的 docx 内层 XML 与不带的一模一样',
+    plainXml === flagXml,
+    `长度 ${plainXml.length} vs ${flagXml.length}`,
+  )
+}
+
+console.log('\n=== 27. 快捷键表：解析 / 匹配 / 覆盖 / 冲突（W6）===')
+{
+  const ev = (key, opts = {}) => ({
+    key,
+    code: opts.code ?? '',
+    ctrlKey: opts.ctrl ?? false,
+    metaKey: opts.meta ?? false,
+    shiftKey: opts.shift ?? false,
+    altKey: opts.alt ?? false,
+  })
+
+  // ---- parseCombo：大小写不敏感、修饰键归一、主键 ----
+  eq('Ctrl+B', JSON.stringify(parseCombo('Ctrl+B')), '{"mod":true,"shift":false,"alt":false,"key":"b"}')
+  eq('大小写不敏感', JSON.stringify(parseCombo('cTrL+b')), JSON.stringify(parseCombo('Ctrl+B')))
+  eq('Cmd / Meta / ⌘ / Win 都归一到 mod', [
+    parseCombo('Cmd+U'),
+    parseCombo('Meta+U'),
+    parseCombo('⌘+U'),
+    parseCombo('Win+U'),
+    parseCombo('Ctrl+U'),
+  ].every((c) => c && c.mod && c.key === 'u'), true)
+  eq('Alt+4 的数字键', JSON.stringify(parseCombo('Alt+4')), '{"mod":false,"shift":false,"alt":true,"key":"4"}')
+  eq('F4 单独一个键', JSON.stringify(parseCombo('F4')), '{"mod":false,"shift":false,"alt":false,"key":"f4"}')
+  eq('前后空格无所谓', JSON.stringify(parseCombo(' Ctrl + Shift + E ')), '{"mod":true,"shift":true,"alt":false,"key":"e"}')
+  eq('空串认不出来', parseCombo(''), null)
+  eq('只有修饰键认不出来', parseCombo('Ctrl+'), null)
+  eq('认不出的修饰键不猜（Foo+B 不是加粗）', parseCombo('Foo+B'), null)
+  eq('主键不合法认不出来', parseCombo('Ctrl+Shift'), null)
+
+  // ---- matchShortcut：修饰键逐项严格比对 ----
+  const defaultBold = parseCombo(DEFAULT_SHORTCUTS.bold)
+  eq('ctrl+B 命中', matchShortcut(ev('b', { ctrl: true }), defaultBold), true)
+  eq('大写的 B 也命中', matchShortcut(ev('B', { ctrl: true }), defaultBold), true)
+  eq('meta+B（Cmd）也命中', matchShortcut(ev('b', { meta: true }), defaultBold), true)
+  eq('多按了 Shift 就不命中', matchShortcut(ev('B', { ctrl: true, shift: true }), defaultBold), false)
+  eq('不带修饰键不命中', matchShortcut(ev('b'), defaultBold), false)
+  eq('没绑（null）不命中', matchShortcut(ev('b', { ctrl: true }), null), false)
+  const alt4 = parseCombo(DEFAULT_SHORTCUTS.formatAmount)
+  eq('Alt+4 的 key 命中', matchShortcut(ev('4', { alt: true }), alt4), true)
+  eq('Alt+4 的 code 命中（布局/输入法下 key 不是数字）', matchShortcut(ev('。', { code: 'Digit4', alt: true }), alt4), true)
+  eq('code 不是那枚数字就不命中', matchShortcut(ev('。', { code: 'Digit5', alt: true }), alt4), false)
+  const f4 = parseCombo(DEFAULT_SHORTCUTS.repeat)
+  eq('F4 命中', matchShortcut(ev('F4', { code: 'F4' }), f4), true)
+
+  // ---- 默认表：九个动作都在，且与既有硬编码逐条对齐 ----
+  eq('动作集有九个', SHORTCUT_ACTIONS.length, 9)
+  const table = resolveShortcuts()
+  eq(
+    '默认表逐条对齐',
+    SHORTCUT_ACTIONS.map((a) => `${a}=${table[a] ? DEFAULT_SHORTCUTS[a] : 'null'}`).join(','),
+    SHORTCUT_ACTIONS.map((a) => `${a}=${DEFAULT_SHORTCUTS[a]}`).join(','),
+  )
+  eq('默认表里没有空绑定', SHORTCUT_ACTIONS.every((a) => table[a] !== null), true)
+
+  // ---- 覆盖：改绑生效、旧组合失效 ----
+  const warns = []
+  const realWarn = console.warn
+  console.warn = (...args) => warns.push(args.join(' '))
+  try {
+    const custom = resolveShortcuts({ bold: 'ctrl+shift+b' })
+    eq('新组合生效', matchShortcut(ev('B', { ctrl: true, shift: true }), custom.bold), true)
+    eq('旧组合失效', matchShortcut(ev('b', { ctrl: true }), custom.bold), false)
+    eq('别的动作没被牵连', matchShortcut(ev('u', { ctrl: true }), custom.underline), true)
+    eq('只改了一个动作时会 warn？', warns.length, 0)
+
+    // 未知动作名忽略 + warn，默认表不受影响
+    warns.length = 0
+    const unknown = resolveShortcuts({ bolld: 'Ctrl+B' })
+    eq('未知动作名不悄悄改默认表（ctrl+B 仍加粗）', matchShortcut(ev('b', { ctrl: true }), unknown.bold), true)
+    eq('未知动作名 warn 一句', warns.length, 1)
+    eq('warn 里点了名', warns[0].includes('bolld'), true)
+
+    // 认不出来的组合键：warn + 保留默认
+    warns.length = 0
+    const broken = resolveShortcuts({ underline: 'Ctrl+Shift' })
+    eq('认不出来的组合键保留默认', matchShortcut(ev('u', { ctrl: true }), broken.underline), true)
+    eq('认不出来要 warn', warns.length, 1)
+
+    // 冲突：先到先得（动作顺序 bold 在 underline 之前）
+    warns.length = 0
+    const clash = resolveShortcuts({ bold: 'Ctrl+U' })
+    eq('先到的保住这个键', matchShortcut(ev('u', { ctrl: true }), clash.bold), true)
+    eq('后到的解绑（不是偷偷退回默认）', clash.underline, null)
+    eq('冲突 warn 一句', warns.length, 1)
+
+    // 组合键字符串本身不合法但能解析的边界：F 键与单字符
+    eq('F9 认得出', JSON.stringify(parseCombo('f9')), '{"mod":false,"shift":false,"alt":false,"key":"f9"}')
+    eq('F25 不存在', parseCombo('F25'), null)
+  } finally {
+    console.warn = realWarn
+  }
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

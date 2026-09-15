@@ -40,6 +40,11 @@ function argValue(flag) {
 }
 
 const SAMPLE = [
+  // W6：文档开头的指令区可以同时有 `::editor`（编辑器开关）与 `::section`（首节设置）。
+  // 这一行只影响编辑器界面、不进 docx；放进来是为了让「模型 → md → 模型」的往返把
+  // `::editor` 也走上（只写非默认值：修订开、导航默认开所以不写）。
+  '::editor trackChanges=on',
+  '',
   '# 关于爱康光电资产核查情况的说明',
   '',
   '@ 苏州市公安局经济犯罪侦查支队：',
@@ -172,9 +177,15 @@ const model2 = parseMd(md2, { author: '张三', now })
 /*
  * 往返比对必须把 `sections` 也算进去：逐节设置是 W5 新加的文档级状态，
  * 只看 blocks 的话「方向/页码开关丢了」这类缺陷会静默通过。
- * 形状里用 `?? null` 归一：全默认时 sections 整个不写，两种形态必须等价。
+ * `editor`（W6 的 `::editor`）同理，而且它整个不属于 blocks。
+ * 形状里用 `?? null` 归一：全默认时整个字段不写，两种形态必须等价。
  */
-const shape = (doc) => JSON.stringify({ blocks: normalizeBlocks(doc), sections: doc.sections ?? null })
+const shape = (doc) =>
+  JSON.stringify({
+    blocks: normalizeBlocks(doc),
+    sections: doc.sections ?? null,
+    editor: doc.editor ?? null,
+  })
 const before = shape(model)
 const after = shape(model2)
 if (before !== after) {
