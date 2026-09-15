@@ -298,14 +298,27 @@ export function splitBlock(
   return created.id
 }
 
-/** 把当前块并入前一块；返回合并后的落点（前一块的末尾）。前一块是分节符时不合并。 */
-export function mergeIntoPrevious(doc: DocModel, blockId: string): BlockPoint | null {
+/**
+ * 能不能把 blockId 并入前一块（前一块也得是段落）。
+ *
+ * 单独给个谓词是为了让调用方**先问再改**：`mergeIntoPrevious` 一进去就动模型，
+ * 而调用方的撤销快照必须记在动模型之前 —— 问都不问就记，记下的是「已经并完的样子」，
+ * 撤销就成了空操作（2026-09-15 修，当时的撤销探针抓到的）。
+ */
+export function canMergeIntoPrevious(doc: DocModel, blockId: string): boolean {
   const index = findBlockIndex(doc, blockId)
   const block = doc.blocks[index]
   const prev = doc.blocks[index - 1]
-  if (index <= 0 || !block || !prev || block.t !== 'textBlock' || prev.t !== 'textBlock') {
-    return null
-  }
+  return index > 0 && !!block && !!prev && block.t === 'textBlock' && prev.t === 'textBlock'
+}
+
+/** 把当前块并入前一块；返回合并后的落点（前一块的末尾）。前一块是分节符时不合并。 */
+export function mergeIntoPrevious(doc: DocModel, blockId: string): BlockPoint | null {
+  if (!canMergeIntoPrevious(doc, blockId)) return null
+  const index = findBlockIndex(doc, blockId)
+  const block = doc.blocks[index]
+  const prev = doc.blocks[index - 1]
+  if (!block || !prev || block.t !== 'textBlock' || prev.t !== 'textBlock') return null
   const at = blockLength(prev)
   prev.inlines = [...prev.inlines, ...block.inlines]
   doc.blocks.splice(index, 1)
@@ -316,6 +329,108 @@ export function mergeIntoPrevious(doc: DocModel, blockId: string): BlockPoint | 
 export function removeBlock(doc: DocModel, blockId: string): void {
   const index = findBlockIndex(doc, blockId)
   if (index >= 0) doc.blocks.splice(index, 1)
+}
+
+/**
+ * Delete 落在段尾：按 Word 语义删掉那个「段落标记」，也就是把下一段接上来。
+ *
+ * 只认「下一块也是段落」。下一块是表格、换页标记时返回 null —— 调用方据此**既不**改模型，
+ * **也不**把这次按键放给浏览器：原生在段落末尾向后删除会把相邻的片段元素并掉，
+ * 而 Vue 手里还留着那些节点的 vnode，页面就补不回来了。
+ *
+ * 返回合并后的落点（本段原来的末尾），与 mergeIntoPrevious 对称。
+ * 调用方要**先问 `canJoinWithNext` 再记撤销快照**（理由同 canMergeIntoPrevious）。
+ */
+export function joinWithNext(doc: DocModel, blockId: string): BlockPoint | null {
+  if (!canJoinWithNext(doc, blockId)) return null
+  const index = findBlockIndex(doc, blockId)
+  const block = doc.blocks[index]
+  const next = doc.blocks[index + 1]
+  if (!block || !next || block.t !== 'textBlock' || next.t !== 'textBlock') return null
+  const at = blockLength(block)
+  block.inlines = [...block.inlines, ...next.inlines]
+  doc.blocks.splice(index + 1, 1)
+  return { blockId, offset: at }
+}
+
+/** 段尾 Delete 能不能并下一段（下一块也得是段落）；调用方据此决定要不要记撤销快照 */
+export function canJoinWithNext(doc: DocModel, blockId: string): boolean {
+  const index = findBlockIndex(doc, blockId)
+  const block = doc.blocks[index]
+  const next = doc.blocks[index + 1]
+  return index >= 0 && !!block && !!next && block.t === 'textBlock' && next.t === 'textBlock'
+}
+
+/** 把偏移夹进 [0,len]（选区端点可能落在段外，先夹一次再交给后面） */
+function clampOffset(offset: number, len: number): number {
+  return Math.max(0, Math.min(offset, len))
+}
+
+/**
+ * Word 语义的跨段删除：从 start 一直删到 end，**首尾两段在切点处接起来**，
+ * 中间被整段覆盖的块（段落、表格、换页标记）一并消失 —— 这就是 Word 里
+ * 选中几个段落再按删除键的结果（段落标记被删掉，前后两段并成一段）。
+ *
+ * 修订模式下**不并段**：只把覆盖到的文字逐段标成 w:del 留在原处
+ * （模型里没有「段落标记」这件东西，不能假装把它删了）。
+ *
+ * 两端必须是**段落**：表格格子（cellId）与换页标记不吃这条 —— 格子的单段落模型表达不了
+ * 并格，那条路请调用方按容器各自删（见 WordPaper.vue 的 deleteSelection）。
+ *
+ * 返回删除后的落点（首段的切点）。两端颠倒的选区（反向选中）也认，内部先摆正。
+ */
+export function deleteSpan(
+  doc: DocModel,
+  start: BlockPoint,
+  end: BlockPoint,
+  rev?: RevMark,
+): BlockPoint | null {
+  let headIndex = findBlockIndex(doc, start.blockId)
+  let tailIndex = findBlockIndex(doc, end.blockId)
+  if (headIndex < 0 || tailIndex < 0) return null
+  let fromPoint = start
+  let toPoint = end
+  if (headIndex > tailIndex) {
+    ;[headIndex, tailIndex] = [tailIndex, headIndex]
+    ;[fromPoint, toPoint] = [toPoint, fromPoint]
+  }
+  const head = doc.blocks[headIndex]
+  const tail = doc.blocks[tailIndex]
+  if (!head || !tail || head.t !== 'textBlock' || tail.t !== 'textBlock') return null
+  const from = clampOffset(fromPoint.offset, blockLength(head))
+  const to = clampOffset(toPoint.offset, blockLength(tail))
+  const point: BlockPoint = { blockId: head.id, offset: from }
+
+  if (headIndex === tailIndex) {
+    deleteRange(doc, head.id, from, to, rev)
+    return point
+  }
+
+  if (rev) {
+    deleteRange(doc, head.id, from, blockLength(head), rev)
+    for (let i = headIndex + 1; i < tailIndex; i += 1) {
+      const middle = doc.blocks[i]
+      if (middle?.t === 'textBlock') deleteRange(doc, middle.id, 0, blockLength(middle), rev)
+    }
+    deleteRange(doc, tail.id, 0, to, rev)
+    return point
+  }
+
+  // 普通模式：首段留下 [0,from)，尾段 [to,len) 接在它后面，中间（含尾段自己）整段摘掉。
+  // 走 replaceRange 而不是自己拼 inlines —— 跨切点的批注锚点由它配对（见该函数的说明）。
+  replaceRange(head, from, blockLength(head), sliceStrict(tail.inlines, to, blockLength(tail)))
+  const doomed = doc.blocks.slice(headIndex + 1, tailIndex + 1)
+  // 分节符不能直接摘：doc.sections 的下标必须跟着走（见 edit/section.ts）
+  for (const block of doomed) {
+    if (block.t === 'sectionBreak') removeSectionBreak(doc, block.id)
+  }
+  for (const block of doomed) {
+    if (block.t === 'sectionBreak') continue
+    // 按对象身份找下标：上面摘分节符已经让下标位移了
+    const at = doc.blocks.indexOf(block)
+    if (at >= 0) doc.blocks.splice(at, 1)
+  }
+  return point
 }
 
 export function setBlockKind(doc: DocModel, blockId: string, kind: BlockKind): void {

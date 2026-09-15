@@ -883,9 +883,9 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
    ③ 切模板的断言分散在 `verify-browser` 与 `verify-editor` 两个脚本里。
    ②③ 属整洁度问题，不影响结论。
 
-6. **页尾删除会让断点处的字符重复（分页缺陷，2026-09-13 复现并定位，未修）**。在一个跨页长段落
-   （demo 样本里那段「关于对外投资部分，…」正文）的**页尾**连按 Backspace，断点处的字符会被复制进模型、
-   越删越多（用户截图里是 `…被告的的民的的民…`），模型长度在 −1／+1 之间震荡。
+6. **页尾删除会让断点处的字符重复（分页缺陷）—— 2026-09-15 已修（对应 `issues/20260915.md`）**。
+   在一个跨页长段落（demo 样本里那段「关于对外投资部分，…」正文）的**页尾**连按 Backspace，断点处的字符
+   会被复制进模型、越删越多（用户截图里是 `…被告的的民的的民…`），模型长度在 −1／+1 之间震荡。
    **根因是三条叠在一起**：① 删除后新分页里这一格的 `from/to` 常常与上一轮**完全相同**（上一页末行让出的
    字位正好被下一页首字顶上来）；② `retagFragments` 在 `input` 时**命令式改写** `data-from`／`data-to`
    （值是重排前的），而 Vue 重渲染时按「新旧 prop 值相同」**跳过属性更新**，于是属性停在旧值、`v-html`
@@ -893,13 +893,46 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
    `replaceRange` 把多出的字符复制进模型。同一毛病的另一半：`retagFragments` 的
    `data.to = cursor + prefix + text` 而 `textContent` 已含 `.wtp-num` 前缀，**前缀被算两遍** ——
    编号段落跨页时表现为**丢字**（不是重复）。
-   **修的方向**：问题不在算术，而在「片段的 `data-from/to` 有两条权威」—— 让分页结果成为唯一权威
-   （重渲染后无条件把属性同步回 `pages.value`，或让 `retagFragments` 不再写属性），并确认按
-   `(blockId, from)` 编的 v-for key 不会让 Vue 复用错元素；验收要加一条「跨页段落页尾连按 N 次 Backspace，
-   模型长度必须恰好 −N（现在会少减甚至增加），且断点窗口不得出现重复」。
-   复现探针（只读、**临时件未提交**、产物在 `.qwen/tmp/`）：`probe-pagination.mjs`（逐步快照）、
-   `probe-pagination2.mjs`（`beforeinput`/`input`/mutation 事件时序）、`probe-pagination3.mjs`（dump 片段
-   DOM 文字，给出 919/918 的铁证）。更完整的机制说明见项目记忆 `pagination-boundary-duplication.md`。
+
+   **修法（2026-09-15 落地）**：走了上面「修的方向」里那条**让分页结果当唯一权威**，没有去动算术：
+
+   - `retagFragments` 只按 DOM 现算（前缀不再重复加一次），它写的坐标只在**下一次重排之前**有效；
+     重排之后由新增的 **`applyFragmentRanges()`** 按 `pages.value` 把每个段落片段的 `data-from/to`
+     无条件重写一遍（在 `refreshLayout` 的 `nextTick` 里、`placeCaret` **之前**；没有 anchor 也要跑）。
+     这样「Vue 按旧 vnode 跳过属性写入」这条路径就再也留不下脏值。表格片段与格子不归它管
+     （格子坐标恒为 `0..格内文字长度`，由 `renderTableFragment` 整段重渲染）。
+   - 光修坐标还不够 —— 同一天发现另**一类**删除缺陷（同属本 issue）：**浏览器原生删除会把相邻的片段
+     元素并成一个、把其余的直接删掉**，而 Vue 手里还留着那些节点的 vnode，于是「页面文字没了、模型还
+     在」再也补不回来（真按键复现：选中整页 15 个片段按 Delete → DOM 只剩 1 个空 div、模型只少了第 1 段）。
+     更底层的原因与坐标缺陷是同一个：**DOM 被改在 Vue 背后**。所以跨块删除改由模型层接管：
+     `edit/model.ts` 新增 **`deleteSpan`**（Word 语义：段落标记被删掉、首尾接起来、中间整段消失；修订模式
+     下不并段、只标 `w:del`）与 **`joinWithNext`**（段尾 Delete = 删段落标记，与既有的
+     `mergeIntoPrevious` 对称）；`WordPaper.vue` 在 **beforeinput**（跨片段选区）、**compositionstart**、
+     **keydown Backspace / Delete**、**onPaste** 四处接管。落在片段左右缘的那两个键尤其重要：
+     每页一个 `contenteditable`，原生的删除**跨不过页边界**，页尾 Delete / 页首 Backspace 原本是空操作。
+     表格格子掺在选区里时退回「各容器各自删掉选中的文字」（格子的单段落模型表达不了并格）。
+   - **接口事实**：① 片段的 `data-from/to` 在**两次重排之间**是 `retagFragments` 写的，重排之后一定是
+     `pages.value`；判断「插入符是否顶到片段左/右缘」必须按 **`fragmentOf(选区起点)`** 找片段，不能用
+     按数值区间找的 `fragmentAt`（相邻两片共用边界时会命中前一片，跨页那一退就接不了管）；
+     ② 段尾 Delete 在修订模式下**不改模型**（模型里没有段落标记可留痕），但默认行为一律 `preventDefault`
+     —— 放给浏览器就是并 DOM；③ 下一块是表格/换页标记时 `joinWithNext` 返回 `null`，调用方不改模型也不放行。
+   - **验证**：`test-edit-model` 505 → **537**（`deleteSpan` 的段内/跨段/反向选区/端点越界/夹着分页符与
+     分节符（`sections` 跟着摘）/修订模式/端点落在格子里/中间整表一并删、`joinWithNext` 的四种边界、
+     两个「先问再改」的谓词）；
+     `verify-editor` 新增「删除的边界」一节（浏览器实测：页尾连按 5 次 Backspace 模型恰好 −5 且每一步
+     逐块 `DOM == 模型`、页尾 Delete、页首 Backspace、段尾 Delete 并段、跨段选区删除、全选整页删除、
+     粘贴替换跨块选区，每个删除动作再各撤销一步验模型回得去）。本机浏览器**已经恢复可用**（Chrome 153 /
+     Edge 134 都能起；2026-09-13 那条「Edge 的程序化启动坏了、只能做代码级验证」的结论**已过期**，
+     项目记忆 `edge-headless-broken.md`
+     已同步更新），两个浏览器脚本的 `executablePath` 顺带改成 **Chrome**（可用 `WTP_BROWSER` 覆盖），
+     符合 9.3 的「禁止用 edge」。
+   - **顺手发现**：浏览器验收自 2026-09-13 起一直没跑，攒下 **6 条陈旧断言**（demo 样本放表之后页数/打印
+     页数变了、表格样本 id 的断言参数写反、Shift+Enter 落点、节工具条常驻各一条）。已在 HEAD 上跑基线
+     逐条确认是**先于本次改动**就红的，随本次一并修掉（见 11）。
+   - 复现探针（只读、**临时件未提交**、产物在 `.qwen/tmp/`）：`probe-pagination.mjs`（逐步快照）、
+     `probe-pagination2.mjs`（`beforeinput`/`input`/mutation 事件时序）、`probe-pagination3.mjs`（dump 片段
+     DOM 文字，给出 919/918 的铁证）、`probe-repro.mjs` / `probe-takeover.mjs`（本轮：修复前后逐场景快照 +
+     逐块 `DOM == 模型` 不变式）。更完整的机制说明见项目记忆 `pagination-boundary-duplication.md`。
 7. **W4a-1 验收发现的三处非阻断项**（记在这里免得只躺在验收结论里）：
    ① **`columns` 只能由 body 行回推**：手搓模型里 `columns` 大于所有 body 行的格数时，md 往返会把它收窄
    （md 语法没有表达「总列数」的地方）。真实路径（手写 md、将来的 UI）不受影响；真要修就给围栏加个 `columns=` kwarg。
@@ -1002,3 +1035,81 @@ W4b-1 刚加的那条 `.sub-toolbar` 已经有：落点提示 + 行/列 6 个按
 **收尾待办**：`README.md` 的「待做」一节加一行指向本文件（`PLAN.md`）—— **已完成**（随 `281f979` 提交）。
 往后的维护约定：每开一波之前先回来读一遍对应小节；每完成一波，把该波标题改成「（已完成 YYYY-MM-DD）」、
 补一行结论、并在上面这张表里改状态。
+
+---
+
+## 11. 2026-09-15 修复记录（`issues/20260915.md`，不属任何一波）
+
+**本机浏览器恢复可用**（Chrome 153 / Edge 134 都能无头启动；2026-09-13 那条「Edge 坏了、只能做
+代码级验证」已过期）。于是把停了三天没跑的浏览器验收重新跑起来，**一次跑出 6 条红断言**。
+先在 HEAD 上跑基线（`git stash` 掉本次改动）逐条确认：**全部先于本次改动就是红的**
+（`.qwen/tmp/baseline-editor.log`）。按性质分三类处理：
+
+### A. 顺手修掉的真缺陷
+
+1. **打印会多出一张空白纸**（W5 引入的回归，5 页文档打出 6 页）。成因是用排除法定出来的：
+   每张纸都挂了命名页 `page: wtp-portrait`，而**命名页切换会强制断页** —— 最后一页之后渲染器
+   从命名页切回默认页，那一刀就多切一张纸。页带 gap、body 的 8px 外边距、每张纸的高度、
+   `overflow: hidden`、`break-before/after` 都试过，只有把 `page` 去掉才回到 5 页（见
+   `.qwen/tmp/probe-print*.md`）。**改法**：`styleOfSection` 只给**横排**节挂 `page: wtp-landscape`，
+   纵排走默认 `@page`（两者尺寸等价）。横排节结束时仍会多一张空白纸（同一机制，且横竖混排本来
+   就要换纸），这是已知代价。断言：`verify-editor` 的「打印出来的页数 = 版面页数」转绿；
+   `verify-browser` 第 8 节的「每张纸都挂了命名页」改成「纵排纸不挂命名页」。
+
+2. **并段/并块之后撤销回不去**（三处是我这次新写的，一处是既有代码）。`pushHistory()` 必须在
+   **改模型之前**调，而 `mergeIntoPrevious` / `joinWithNext` / `deleteSelection` 都是「一进去就动模型」——
+   先调它们再记快照，记下的是「已经改完的样子」，撤销等于空操作。
+   我这次的接管路径里三处犯了这个错（beforeinput 的选区删除、compositionstart、段尾 Delete），
+   顺带发现**既有的「段首 Backspace 并段」也是这个毛病**（老代码就这么写的，一直没人发现）。
+   改法：模型层给两个谓词 `canMergeIntoPrevious` / `canJoinWithNext`（`mergeIntoPrevious` / `joinWithNext`
+   内部也改成先问它们），组件一律「**先问 → 记快照 → 再改**」。**抓它的办法**：X 节里每个删除/并段动作
+   后面都跟一步 `ctrl+Z` 验模型回得去；当时先用聚焦探针 `.qwen/tmp/probe-undo.mjs` 试的 ——
+   它就是这么把这个 bug 抓出来的（A/B/C 通过、D 失败）。
+
+### B. 陈旧断言（判据过期，换了 oracle）
+
+3. **H5「换页只推进一页」**：demo 样本加表后管理人文件恰好 5 页、页尾余量够吸收，插两枚标记后
+   页数不变 —— 与 H4 里已经写明的理由同一条（「页数只可能不变或 +1」）。改成「页数不减少」。
+4. **「切模板后页数变了」**：两套模板现在巧合都是 5 页（管理人 934px 版心 / 公文 850px，见
+   `probe-existing-fails.md`）。改成从量测现取的 oracle：**版心几何变了** + **量测行数总和变了**
+   （33→34 行，证明整篇按新版心重量过）+ 页数不减少。`verify-browser` / `verify:pages` 里同一件事
+   也一并改了（它们原来也拿「两套模板页数不同」当判据）。顺带修掉 `verify-browser` 一条**读错媒体**
+   的断言：「第 2 张纸起都在新的一页开始」原来读的是屏幕媒体（那里 `break-before` 恒为 `auto`），
+   改读打印媒体。
+5. `eq('样本表 id 可用', wId !== '', wId)`：参数写反（拿 `true` 去比字符串），改成 `ok`。
+
+### C. 三个真缺陷，本次**不修**（都不属本 issue 的范围，记这里待办）
+
+6. **格内 Shift+Enter 之后接着打字，软换行会被复制一份**（W4b-1 的功能缺陷，越敲越多）。
+   机制（`.qwen/tmp/probe-cell-break.md` 有逐步快照）：软换行零宽，Chrome 把「末尾 `<br>` 之后」
+   的插入符正规化成「它之前」，于是敲的字进了上一行；读回时区间是 `[0, 4)`（文字长度、不含零宽
+   换行），而 `replaceRange` 的尾部规则会把「正好落在区间右端点上」的零宽 inline 留下 ——
+   新内容里那枚 + 留下的那枚 = 两枚。`verify-editor` 的 V4 三条断言里只有「敲的字排在 break 之后」
+   这一条红（另两条只比文字、抓不到），红得有道理。
+   两条可选修法：① 渲染时在末尾软换行之后再补一枚占位 `<br>`，并放宽 `readInlines` 的占位判据；
+   ② 让读回在「这一片覆盖整个容器」时整段换成 DOM 的内容（不做区间替换，绕开边界规则）。
+7. **「节」工具条不是真的常驻**：它 `v-if="mode === 'edit' && sectionCtx"`，而 `sectionCtx` 只在
+   `selection-change` 带出 section 上下文时才有 —— 刚打开页面（光标不在正文里）时整条工具条不出现，
+   与 W5 的结论、README 的「编辑模式常驻」不符。修法：让组件在没有落点时也回一个「首节」的上下文
+   （先定清楚这时显示什么），首节的「关联前节」「从 1 开始」照常置灰。
+   相应的断言（`verify-editor` S 节、`verify-browser` 第 8 节各一条）**保持红着**，别改成放水版。
+8. **预览页数与 Word 对不上（管理人文件：预览 5 页 vs Word 4 页）** —— `verify:pages` 恢复可跑之后
+   才暴露的，样本里加了表格（W4a-2）就有了：同一份源码，简易公文格式那套 5 页 ↔ 5 页吻合，
+   管理人文件那套预览**多一页**。这正落在 6.9 里「表格量测对账的具体数字**没做**机器验证」那一条上
+   —— 样本加表（W4a-2）之后 `verify:pages` 就再没跑过。与本次改动无关：删除路径不参与分页，
+   也没碰 docx 导出（预览页数只由 `paginate(measurements)` 决定，量测来自规格表的版心）。
+   本次**不修**（属表格版式保真，不是删除路径）。要查就从「预览里表格实高 vs Word 里逐行实高」入手：
+   行高 = `minLines ×` 该行各格样式行高，而 Word 的 `atLeast` 是「不小于」，多行格可能差零点几磅 ——
+   正好能把一页顶出去。查的方向：拿 `.qwen/tmp/pagination-report.json` 里的表格量测与
+   `verify:p1` 读回的 `w:trHeight` 逐行比。
+
+### 本次改动的验收口径
+
+`type-check` 0 错；`test-edit-model` 505 → **537**；`test-paginate` 109 全过；`verify:docx` 全 ok；
+`verify-editor` 新增 X 节（删除的边界 8 场景 + 每步撤销，逐块 `DOM == 模型`）—— 除上面第 6 条那一条
+外全绿；`verify-browser` 只剩第 7 条那一条红；`verify:pages` 除第 8 条那一条（预览 5 vs Word 4）外
+全过；`verify:p1` 全过。日志都在 `.qwen/tmp/verify-*.log` 与 `.qwen/tmp/baseline-editor.log`
+（后者是 HEAD 基线，用来证明那 6 条红断言先于本次改动）。
+
+**遗留的整洁问题**：`@page wtp-portrait` 这条命名页规则现在没有页会挂它了（留着不碍事；
+`verify-editor` S 节仍断言两档命名页的 size 互换 —— 那是**规则存在性**，与「每张纸挂不挂」不冲突）。

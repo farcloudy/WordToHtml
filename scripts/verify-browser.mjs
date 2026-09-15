@@ -39,7 +39,8 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
+// 无头浏览器用 Chrome（勿用 Edge），可用 WTP_BROWSER 覆盖
+const CHROME = process.env.WTP_BROWSER || 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const PORT = 5199
 
 const failures = []
@@ -229,7 +230,7 @@ console.log(`dev server: ${url}`)
 
 let browser
 try {
-  browser = await chromium.launch({ executablePath: EDGE, headless: true })
+  browser = await chromium.launch({ executablePath: CHROME, headless: true })
   const page = await browser.newPage({
     viewport: { width: 1700, height: 1100 },
     deviceScaleFactor: 2,
@@ -496,11 +497,22 @@ try {
   }
 
   console.log('\n=== 6. 两套模板的差异（切模板必须整篇重量）===')
+  /*
+   * 判据不能是「页数不同」—— 两套模板的页数可以巧合地相同（demo 样本加了表格之后就是 5 ↔ 5）。
+   * 真正要证的是「换的是整套版心」，所以比版心几何；「整篇真的重量过」由下面 verify:pages 的
+   * 「每套模板的预览页数 = Word 页数」来证 —— 不重量的话那一条必然对不上。
+   */
+  const boxOf = (report) => ({
+    w: report.pages[0]?.contentWidth ?? -1,
+    h: report.pages[0]?.contentHeight ?? -1,
+  })
+  const boxFirst = boxOf(first.report)
+  const boxSecond = boxOf(second.report)
   ok(
-    '两套模板的页数不相同',
-    first.report.pageCount !== second.report.pageCount,
-    `「${first.template.label}」${first.report.pageCount} 页 vs ` +
-      `「${second.template.label}」${second.report.pageCount} 页`,
+    '两套模板的版心几何不相同（换模板换的是整套版心）',
+    boxFirst.w !== boxSecond.w || boxFirst.h !== boxSecond.h,
+    `「${first.template.label}」${boxFirst.w}×${boxFirst.h} vs ` +
+      `「${second.template.label}」${boxSecond.w}×${boxSecond.h}`,
   )
   ok(
     '公文模板版心更矮 → 页数不少于管理人文件',
@@ -622,21 +634,17 @@ try {
   const secBar = page.locator('.section-toolbar')
   ok('编辑模式下「节」工具条常驻', (await secBar.count()) === 1)
   const screenView = await paperView()
+  // 只有横排节挂命名页：纵排挂 wtp-portrait 会让渲染器在最后一页之后从命名页切回默认页，
+  // 那个切换强制断页 —— 每份纵排文档打印出来都会多一张空白纸（2026-09-15 修）。
   ok(
-    '每张纸都挂了命名页（wtp-portrait / wtp-landscape）',
-    screenView.length > 0 &&
-      screenView.every((p) => p.page === 'wtp-portrait' || p.page === 'wtp-landscape'),
-    JSON.stringify(screenView.slice(0, 2)),
+    '纵排纸不挂命名页（走默认 @page，避免末尾多一张空白纸）',
+    screenView.length > 0 && screenView.every((p) => p.page === ''),
+    JSON.stringify(screenView.slice(0, 2).map((p) => p.page)),
   )
   ok(
     '样本默认方向是纵向（宽 < 高）',
     screenView.every((p) => p.width < p.height),
     JSON.stringify(screenView[0]),
-  )
-  ok(
-    '第 2 张纸起都在新的一页开始（一页一张纸靠它）',
-    screenView.slice(1).every((p) => p.breakBefore === 'page'),
-    JSON.stringify(screenView.map((p) => p.breakBefore)),
   )
 
   // 打印媒体下：命名页不许把分页改坏（break-before 与页数都得原样）
@@ -645,12 +653,14 @@ try {
   await page.emulateMedia({ media: 'screen' })
   eq('打印媒体下纸数不变', printPapers.length, screenView.length)
   ok(
-    '打印媒体下命名页仍在每张纸上',
-    printPapers.every((p) => p.page === 'wtp-portrait' || p.page === 'wtp-landscape'),
+    '打印媒体下命名页仍是「只有横排才挂」',
+    printPapers.every((p) => p.page === ''),
     JSON.stringify(printPapers.map((p) => p.page)),
   )
+  // 「一页一张纸」靠的是**打印媒体**下的 break-before: page（屏幕上是 auto，纸是横排的）；
+  // 早先这条断言读的是屏幕媒体，永远不可能成立（2026-09-15 修）。
   ok(
-    '打印媒体下第 2 张起仍在新的纸开始（命名页没有引入多余断页）',
+    '打印媒体下第 2 张起都在新的纸开始（一页一张纸靠它）',
     printPapers.slice(1).every((p) => p.breakBefore === 'page'),
     JSON.stringify(printPapers.map((p) => p.breakBefore)),
   )
@@ -665,7 +675,7 @@ try {
   await page.waitForTimeout(500)
   const mixed = await paperView()
   const landscape = mixed.filter((p) => p.page === 'wtp-landscape')
-  const portrait = mixed.filter((p) => p.page === 'wtp-portrait')
+  const portrait = mixed.filter((p) => p.page === '')
   ok('最后一节变成横排（宽 > 高）', landscape.length > 0 && landscape.every((p) => p.width > p.height), JSON.stringify(mixed))
   ok(
     '其余节仍是纵排（只有那一节被改）',
@@ -692,7 +702,7 @@ try {
   await page.waitForTimeout(400)
   ok(
     '还原后所有纸都是纵排',
-    (await paperView()).every((p) => p.page === 'wtp-portrait' && p.width < p.height),
+    (await paperView()).every((p) => p.page === '' && p.width < p.height),
   )
 
   console.log('\n=== 9. 产出物 ===')
@@ -761,5 +771,5 @@ console.log(
   '[PASS] 浏览器实测：两套模板的样式与版心一致、分页无溢出、切模板页数改变、' +
     '宽视口双页并排、窄视口回落一页一排、分节页码已重排、批注侧栏与锚点一致、' +
     '逐页几何按节（改方向后只有那一节的纸横过来且宽高对调、页数不变）、' +
-    '每张纸挂命名页且打印媒体下分页不被改坏。',
+    '命名页只在横排节上挂（纵排走默认 @page，末尾不会多一张空白纸）。',
 )

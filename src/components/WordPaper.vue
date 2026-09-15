@@ -41,12 +41,17 @@ import {
   addComment,
   applyFormat,
   blockLength,
+  canJoinWithNext,
+  canMergeIntoPrevious,
   cloneDoc,
   containerLength,
+  deleteRange,
+  deleteSpan,
   findBlock,
   findContainer,
   insertBreakAfter,
   insertText,
+  joinWithNext,
   mergeIntoPrevious,
   rangeColor,
   rangeIsBold,
@@ -60,7 +65,7 @@ import {
   splitBlock,
   updateComment as updateCommentOp,
 } from '../lib/edit/model'
-import type { EditorSelection, SectionSelectionContext } from '../lib/edit/model'
+import type { BlockPoint, EditorSelection, SectionSelectionContext } from '../lib/edit/model'
 import {
   bodyInsertIndex,
   bodyRowIndexes,
@@ -322,18 +327,24 @@ function fragmentStyle(frag: PageFragment, isFirst: boolean): Record<string, str
 
 /**
  * 一节的页面几何（纸宽高 + 页边距 + 方向）。纸宽/纸高/页边距（padding）逐节不同
- * （页面方向按节），所以不能写死在 CSS 里（W5 改动）。顺带挂上打印用的命名页 —— 混排方向靠它。
+ * （页面方向按节），所以不能写死在 CSS 里（W5 改动）。
+ *
+ * 打印用的命名页**只给横排节挂**（`page: wtp-landscape`）。纵排走**默认的 `@page`**
+ * —— 它本来就是规格表的纵向尺寸，两者等价；而给纵排也挂 `page: wtp-portrait` 会
+ * 让渲染器在最后一页之后从命名页切回默认页，那个切换**强制断页**，于是每份纵排文档
+ * 打印出来都多一张空白纸（横竖混排的文档里，横排节结束处同理，这是必要的代价）。
  */
 function styleOfSection(section: ResolvedSection | undefined): Record<string, string> {
   const spec = resolved.value
   const size = section?.page.size ?? spec.page.size
   const margin = section?.page.margin ?? spec.page.margin
-  return {
+  const style: Record<string, string> = {
     width: size.width,
     height: size.height,
     padding: `${margin.top} ${margin.right} ${margin.bottom} ${margin.left}`,
-    page: section?.settings.orientation === 'landscape' ? 'wtp-landscape' : 'wtp-portrait',
   }
+  if (section?.settings.orientation === 'landscape') style.page = 'wtp-landscape'
+  return style
 }
 
 /** 某一页的几何：按它所属的节取 */
@@ -501,13 +512,18 @@ function refreshLayout(options: RefreshOptions = {}): void {
   if (!changed) return
 
   const anchor = options.anchor
-  if (!anchor) return
   const anchorEnd = options.anchorEnd
   const afterBreak = options.afterBreak === true
+  /*
+   * 重排之后（DOM 已被 Vue 打过补丁）必须先把片段坐标按分页结果重写一遍，
+   * 再还原插入符 —— placeCaret 走的正是这些坐标。见 applyFragmentRanges 的说明。
+   */
   void nextTick(() => {
     if (current !== token) return
     const rootEl = root.value
     if (!rootEl) return
+    applyFragmentRanges()
+    if (!anchor) return
     if (anchorEnd && (anchorEnd.blockId !== anchor.blockId || anchorEnd.offset !== anchor.offset)) {
       placeRange(rootEl, anchor, anchorEnd)
     } else if (afterBreak) {
@@ -541,6 +557,9 @@ function fragmentRange(frag: HTMLElement, blockId: string): { from: number; to: 
  * 只对挂着 data-block-id 的元素工作，所以它天然只碰段落片段与**格子**：
  * 表格片段的外层没有 data-block-id（见 render/html.ts），不会被当成片段重写属性。
  * 格子永远是一格一个整体（不分页切分），这条路径对它就是把 data-from/to 重写成 0..len。
+ *
+ * 它写的是「这一眼看上去的 DOM」的坐标，只在下次重排之前有效；重排之后由
+ * applyFragmentRanges 按分页结果重写一遍 —— 那时分页结果才是权威。
  */
 function retagFragments(blockId: string): void {
   const rootEl = root.value
@@ -550,11 +569,49 @@ function retagFragments(blockId: string): void {
   )
   let cursor = 0
   for (const frag of frags) {
-    const prefix = prefixLengthOf(frag)
+    // 直接用 textContent 的长度：自动编号（.wtp-num）就在这一片里，已经算进去了。
+    // 早先这里另外又加了一次前缀长度，于是编号段落跨页时坐标整体偏大（表现为丢字）。
     const text = (frag.textContent ?? '').length
     frag.dataset.from = String(cursor)
-    frag.dataset.to = String(cursor + prefix + text)
-    cursor += prefix + text
+    frag.dataset.to = String(cursor + text)
+    cursor += text
+  }
+}
+
+/**
+ * 按分页结果重写各片段的 data-from / data-to —— **分页结果是这些属性的唯一权威**。
+ *
+ * 为什么重排之后必须补这一下：`retagFragments` 在每次编辑后命令式改写属性（它按 DOM 现算，
+ * 值是「编辑后、重排前」的），而 Vue 打补丁时拿新 vnode 与**上一个 vnode** 比、相等就跳过
+ * 属性写入 —— 它不知道 DOM 已经被 retag 改过。两边一旦不一致（典型是「上一页末行让出一个
+ * 字位、下一页首字顶上来」，分页给的 from/to 原地不动），DOM 文字与坐标就差一个字符，
+ * 之后每次读回都把多出的字符复制进模型，越删越多。见 issues/20260915.md。
+ *
+ * 只写段落片段：格子的坐标是「格内文字」的 0..len，与分页无关（表格片段外层根本没有
+ * data-block-id，格子由 renderTableFragment 每次整段重渲染）。
+ */
+function applyFragmentRanges(): void {
+  const rootEl = root.value
+  if (!rootEl) return
+  const want = new Map<string, Array<{ from: number; to: number }>>()
+  for (const page of pages.value) {
+    for (const frag of page.fragments) {
+      if (frag.rowFrom !== undefined) continue
+      const list = want.get(frag.blockId) ?? []
+      list.push({ from: frag.from, to: frag.to })
+      want.set(frag.blockId, list)
+    }
+  }
+  // pages 里的片段与 DOM 里的元素都是文档顺序，逐块对位即可
+  for (const [blockId, list] of want) {
+    const els = rootEl.querySelectorAll<HTMLElement>(`[data-block-id="${CSS.escape(blockId)}"]`)
+    for (let i = 0; i < els.length && i < list.length; i += 1) {
+      const el = els[i]
+      const frag = list[i]
+      if (!el || !frag) continue
+      el.dataset.from = String(frag.from)
+      el.dataset.to = String(frag.to)
+    }
   }
 }
 
@@ -844,6 +901,118 @@ function onInput(event: Event): void {
   runSync(pageEl)
 }
 
+/** 选区碰到的片段元素（文档顺序）。判断「这次删除会不会把多个片段并到一起」用它 */
+function fragmentsInRange(rootEl: HTMLElement, range: Range): HTMLElement[] {
+  return Array.from(rootEl.querySelectorAll<HTMLElement>('[data-block-id]')).filter((el) =>
+    range.intersectsNode(el),
+  )
+}
+
+/**
+ * 选区端点的显示坐标。端点落在片段之外时（整页全选时端点就是 `.wtp-content` 本身）
+ * 退到最外侧被碰到的片段那一端，这样「全选本页再删」也能算出一个完整区间。
+ */
+function endpointOf(
+  rootEl: HTMLElement,
+  touched: readonly HTMLElement[],
+  node: Node,
+  offset: number,
+  side: 'start' | 'end',
+): DisplayPoint | null {
+  const direct = displayPointOf(rootEl, node, offset)
+  if (direct) return direct
+  const frag = side === 'start' ? touched[0] : touched[touched.length - 1]
+  const blockId = frag?.dataset.blockId ?? ''
+  if (!frag || blockId === '') return null
+  const start = Number(frag.dataset.from ?? '0')
+  return {
+    blockId,
+    offset: side === 'start' ? start : start + (frag.textContent ?? '').length,
+  }
+}
+
+/**
+ * 插入符所在片段在显示坐标里的两端（判断是否顶到片段的左／右边缘用）。
+ *
+ * 片段按**插入符所在的 DOM 节点**找（fragmentOf 往上取），不能用按数值区间找的
+ * `fragmentAt`：相邻两片共用一个边界（前片的 to == 后片的 from）时，数值法会命中前一片，
+ * 于是「顶在下一页首字之前」被误判成「在上一页末尾之中」，跨页那一退就接不了管。
+ */
+function fragmentEdges(): { from: number; to: number } | null {
+  const rootEl = root.value
+  if (!rootEl) return null
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0) return null
+  const frag = fragmentOf(sel.getRangeAt(0).startContainer)
+  if (!frag) return null
+  const from = Number(frag.dataset.from ?? '0')
+  return { from, to: from + (frag.textContent ?? '').length }
+}
+
+/**
+ * 这次选区删除要不要由模型层接管。
+ *
+ * 单独拆出来是为了让调用方**先问再改**：`deleteSelection` 一进去就动模型，而撤销快照
+ * 必须在动模型之前记 —— 先问清楚，才不会给「交给浏览器做」的情况白记一步撤销。
+ */
+function selectionNeedsTakeover(range: Range, always = false): boolean {
+  const rootEl = root.value
+  if (!rootEl || range.collapsed) return false
+  const touched = fragmentsInRange(rootEl, range).length
+  return always ? touched > 0 : touched > 1
+}
+
+/**
+ * 删掉选中的文字，返回删完后的落点（显示坐标）。
+ *
+ * **选区碰到两个以上片段时必须由模型层做，不能放给浏览器**：原生删除会把相邻的片段元素
+ * 并成一个、把其余的直接删掉，而 Vue 手里还留着那些节点的 vnode，页面就再也补不回来
+ * （issues/20260915.md 的「全选删除本页，下一页文字没有前移」）。
+ *
+ * 段落之间按 Word 语义接起来（deleteSpan：段落标记被删掉，两头并成一段）；端点落在表格
+ * 格子里时退回「各容器各自删掉选中的文字」—— 格子的单段落模型表达不了并格。
+ *
+ * 只碰到一个片段时默认不接管（片内删除交给浏览器，原生手感最好，读回也只有那一片），
+ * 返回 null；`always` 为真时连片内选区也自己做 —— 粘贴要替换选区，而粘贴是调用方
+ * 自己 preventDefault 的，浏览器那条路已经没了。
+ * **调用方要在它之前 `pushHistory`**（见 selectionNeedsTakeover 的说明）。
+ */
+function deleteSelection(range: Range, always = false): DisplayPoint | null {
+  const rootEl = root.value
+  if (!rootEl || range.collapsed) return null
+  const touched = fragmentsInRange(rootEl, range)
+  if (touched.length === 0) return null
+  if (touched.length < 2 && !always) return null
+  const start = endpointOf(rootEl, touched, range.startContainer, range.startOffset, 'start')
+  const end = endpointOf(rootEl, touched, range.endContainer, range.endOffset, 'end')
+  if (!start || !end) return null
+  // 落点先落到**模型坐标**上：删除会把段落并掉、连带改了自动编号前缀，
+  // 显示坐标要按删除后的前缀重算一次
+  const caret: BlockPoint = {
+    blockId: start.blockId,
+    offset: Math.max(0, start.offset - prefixLength(start.blockId)),
+  }
+  const rev = props.trackChanges ? mark('del') : undefined
+  const head = findBlock(doc.value, start.blockId)
+  const tail = findBlock(doc.value, end.blockId)
+
+  if (head && tail) {
+    deleteSpan(
+      doc.value,
+      caret,
+      { blockId: end.blockId, offset: Math.max(0, end.offset - prefixLength(end.blockId)) },
+      rev,
+    )
+  } else {
+    for (const r of selectedRanges(rootEl)) {
+      const p = prefixLength(r.blockId)
+      deleteRange(doc.value, r.blockId, Math.max(0, r.from - p), Math.max(0, r.to - p), rev)
+    }
+  }
+
+  return { blockId: caret.blockId, offset: prefixLength(caret.blockId) + caret.offset }
+}
+
 function onBeforeInput(event: InputEvent): void {
   if (!props.editable) return
   const rootEl = root.value
@@ -851,6 +1020,35 @@ function onBeforeInput(event: InputEvent): void {
   const sel = document.getSelection()
   if (!sel || sel.rangeCount === 0) return
   const range = sel.getRangeAt(0)
+
+  if (!range.collapsed) {
+    if (!selectionNeedsTakeover(range)) {
+      // 片内选区：交给浏览器（原生手感、原生的撤销分组都在它那边）
+      preEditCaret = displayPointOf(rootEl, range.startContainer, range.startOffset)
+      return
+    }
+    event.preventDefault()
+    const before = startPointOf(range) ?? lastCaret
+    pushHistory(before)
+    const caret = deleteSelection(range) ?? before
+    // 端点算不出来时（极少见）这次删除不做；上面那步撤销是白记的，无害
+    if (!caret) return
+    /*
+     * 这次的输入类型本身就是「插入」（打字、输入法、粘贴）时，选区删完还得把内容补上
+     * —— 数据只有 `event.data` 里有，拿不到就先只删（这几条极少见，也不该把 DOM 并坏）。
+     */
+    const data = event.data ?? ''
+    let anchor = caret
+    if (event.inputType === 'insertText' && data !== '') {
+      const offset = Math.max(0, caret.offset - prefixLength(caret.blockId))
+      insertText(doc.value, caret.blockId, offset, data, props.trackChanges ? mark('ins') : undefined)
+      anchor = { blockId: caret.blockId, offset: caret.offset + data.length }
+    }
+    refreshLayout({ anchor, force: true })
+    void nextTick(emitSelection)
+    return
+  }
+
   if (!fragmentOf(range.startContainer)) {
     // 落点在正文下方空白处：拉回最后一段末尾，免得敲进来的字没有归宿
     const frags = Array.from(rootEl.querySelectorAll<HTMLElement>('[data-block-id]'))
@@ -867,8 +1065,29 @@ function onBeforeInput(event: InputEvent): void {
   preEditCaret = displayPointOf(rootEl, range.startContainer, range.startOffset)
 }
 
+/** 本次输入之前的落点（编辑器已经在选区里，pushHistory 的「改之前」要用它） */
+function startPointOf(range: Range): DisplayPoint | null {
+  const rootEl = root.value
+  if (!rootEl) return null
+  return displayPointOf(rootEl, range.startContainer, range.startOffset)
+}
+
 function onCompositionStart(): void {
   composing = true
+  /*
+   * 打字/输入法落在跨片段选区上：先按模型把选区删掉再让输入法写字。
+   * 不接管的话原生会把片段元素并掉（见 deleteSelection 的说明）。
+   */
+  if (!props.editable) return
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0) return
+  const range = sel.getRangeAt(0)
+  if (!selectionNeedsTakeover(range)) return
+  const before = startPointOf(range) ?? lastCaret
+  pushHistory(before)
+  const caret = deleteSelection(range) ?? before
+  if (caret) refreshLayout({ anchor: caret, force: true })
+  void nextTick(emitSelection)
 }
 
 function onCompositionEnd(): void {
@@ -977,11 +1196,39 @@ function onKeydown(event: KeyboardEvent): void {
       if (point.offset <= prefixLength(point.blockId)) event.preventDefault()
       return
     }
-    if (point.offset > prefixLength(point.blockId)) return
+    /*
+     * 段中间交给浏览器在片内正常退格。但**顶在片段左缘**时不能放给它：段落被分页切到
+     * 下一页的那一片，左缘并不是段首，而浏览器跨不过 contenteditable 的边界
+     * （每页一个宿主），这一退在浏览器手里会变成什么都不做（issues/20260915.md）。
+     * 这时按模型往前删一个字 —— 上一个字可能在上一页的片段里，模型坐标不管分页。
+     */
+    if (point.offset > prefixLength(point.blockId)) {
+      const edges = fragmentEdges()
+      if (!edges || point.offset > edges.from) return
+      const offset = point.offset - prefixLength(point.blockId)
+      event.preventDefault()
+      pushHistory(point)
+      deleteRange(
+        doc.value,
+        point.blockId,
+        offset - 1,
+        offset,
+        props.trackChanges ? mark('del') : undefined,
+      )
+      refreshLayout({ anchor: { blockId: point.blockId, offset: point.offset - 1 }, force: true })
+      void nextTick(emitSelection)
+      return
+    }
+    /*
+     * 没得并（首块、或前一块是表格／换页标记）时也要拦：放给浏览器的话，
+     * 原生会把相邻的片段元素并起来，Vue 手里的 vnode 却还在，DOM 就补不回来了。
+     */
+    event.preventDefault()
+    if (!canMergeIntoPrevious(doc.value, point.blockId)) return
+    // 撤销快照必须记在改模型之前（并完再记就退回不去了）
+    pushHistory(point)
     const merged = mergeIntoPrevious(doc.value, point.blockId)
     if (!merged) return
-    event.preventDefault()
-    pushHistory(point)
     refreshLayout({
       anchor: {
         blockId: merged.blockId,
@@ -995,16 +1242,54 @@ function onKeydown(event: KeyboardEvent): void {
     const sel = document.getSelection()
     if (!sel || !sel.isCollapsed) return
     const point = caretPoint()
-    if (!point || !isTableCell(point.blockId)) return
-    /*
-     * 格尾的 Delete 同样是结构性的：不拦的话原生会跟下一格合并。
-     * 只在「格内偏移已到格文字长度」时接管，格内其它位置留给浏览器。
-     */
-    const container = findContainer(doc.value, point.blockId)
-    if (!container) return
-    if (point.offset >= prefixLength(point.blockId) + containerLength(container)) {
-      event.preventDefault()
+    if (!point) return
+    if (isTableCell(point.blockId)) {
+      /*
+       * 格尾的 Delete 同样是结构性的：不拦的话原生会跟下一格合并。
+       * 只在「格内偏移已到格文字长度」时接管，格内其它位置留给浏览器。
+       */
+      const cellContainer = findContainer(doc.value, point.blockId)
+      if (!cellContainer) return
+      if (point.offset >= prefixLength(point.blockId) + containerLength(cellContainer)) {
+        event.preventDefault()
+      }
+      return
     }
+    const container = findContainer(doc.value, point.blockId)
+    const edges = fragmentEdges()
+    if (!container || !edges || point.offset < edges.to) return
+    const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+    event.preventDefault()
+    if (offset < containerLength(container)) {
+      // 片段右缘，但这一段后面还有字（跨页时它在下一页那一片里）：按模型删掉那一个字
+      pushHistory(point)
+      deleteRange(
+        doc.value,
+        point.blockId,
+        offset,
+        offset + 1,
+        props.trackChanges ? mark('del') : undefined,
+      )
+      refreshLayout({ anchor: point, force: true })
+      void nextTick(emitSelection)
+      return
+    }
+    /*
+     * 段尾：删的是「段落标记」，也就是把下一段接上来（Word 语义）。
+     * 修订模式下不做（模型里没有段落标记可留痕），但默认行为一律拦住 ——
+     * 原生并片段 DOM 会把结构弄坏。下一块是表格／换页标记时不改模型、也不放行。
+     */
+    if (props.trackChanges) return
+    if (!canJoinWithNext(doc.value, point.blockId)) return
+    // 撤销快照必须记在改模型之前（并完再记就退回不去了）
+    pushHistory(point)
+    const joined = joinWithNext(doc.value, point.blockId)
+    if (!joined) return
+    refreshLayout({
+      anchor: { blockId: joined.blockId, offset: prefixLength(joined.blockId) + joined.offset },
+      force: true,
+    })
+    void nextTick(emitSelection)
     return
   }
   /*
@@ -1187,9 +1472,20 @@ function onPaste(event: ClipboardEvent): void {
   event.preventDefault()
   const text = event.clipboardData?.getData('text/plain') ?? ''
   if (text === '') return
-  const point = caretPoint()
+  const rootEl = root.value
+  const sel = document.getSelection()
+  const range = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null
+  let point = caretPoint()
   if (!point) return
   pushHistory(point)
+
+  /*
+   * 粘贴要**替换**选中的文字（Word 语义）。粘贴是我们自己 preventDefault 的，
+   * 浏览器那条路已经没了，所以这里必须自己删 —— 跨片段时更不能放给原生（见 deleteSelection）。
+   */
+  if (rootEl && range && !range.collapsed) {
+    point = deleteSelection(range, true) ?? point
+  }
 
   // 纯文本粘贴：换行还原成新段落（公文里段落就是行）
   const lines = text.replace(/\r\n?/g, '\n').split('\n')

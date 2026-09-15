@@ -141,15 +141,21 @@ for (const template of DOC_TEMPLATES) {
   }
 }
 
-// 两套模板的页数必须不同 —— 一样就说明切换模板没有真的重量（页边距变了版心就变了）
+// 切模板必须整篇重量：页数可以巧合地相同（demo 样本就是 5 ↔ 5），所以判据取**版心几何**；
+// 「真的重量了」由上面逐套模板的「预览页数 = Word 页数」证 —— 不重量那一条不可能吻合。
 if (DOC_TEMPLATES.length > 1) {
-  const counts = DOC_TEMPLATES.map((t) => reports[t.key]?.pageCount ?? -1)
-  const expected = DOC_TEMPLATES.map((t) => `${t.label}=${reports[t.key]?.pageCount}`).join('，')
-  if (new Set(counts).size <= 1) {
-    failures.push(`两套模板的预览页数相同（${expected}）—— 切换模板没有整篇重量`)
-  } else {
-    console.log(`\n  ok   两套模板的预览页数不同：${expected}`)
+  const geom = (key) => {
+    const r = reports[key]
+    return r ? `${r.contentWidth}×${r.contentHeight}` : '(缺)'
   }
+  const shown = DOC_TEMPLATES.map((t) => `${t.label}=${geom(t.key)}`).join('，')
+  if (new Set(DOC_TEMPLATES.map((t) => geom(t.key))).size <= 1) {
+    failures.push(`两套模板的版心几何相同（${shown}）—— 切换模板没有换整套版心`)
+  } else {
+    console.log(`\n  ok   两套模板的版心几何不同：${shown}`)
+  }
+  const counts = DOC_TEMPLATES.map((t) => reports[t.key]?.pageCount ?? -1)
+  console.log(`       两套模板的预览页数：${DOC_TEMPLATES.map((t) => `${t.label}=${counts[DOC_TEMPLATES.indexOf(t)]}`).join('，')}`)
 }
 
 /*
@@ -182,4 +188,4 @@ if (failures.length > 0) {
   process.exit(1)
 }
 console.log('[PASS] 每套模板的预览分页与 Word 的分页结果一致（页数、节数、页码重排次数均吻合），')
-console.log('       且两套模板的页数确实不同（切模板整篇重量的证据）。')
+console.log('       且两套模板的版心几何不同（切模板换的是整套版心的证据）。')

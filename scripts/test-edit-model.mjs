@@ -22,12 +22,15 @@ import {
   bodyInsertIndex,
   bodyRowIndexes,
   buildOutline,
+  canJoinWithNext,
+  canMergeIntoPrevious,
   cellId,
   cloneDoc,
   commentScopes,
   containerLength,
   contentBoxPx,
   deleteRange,
+  deleteSpan,
   findBlock,
   findCell,
   findContainer,
@@ -39,6 +42,7 @@ import {
   insertColumn,
   insertSectionBreakAfter,
   insertText,
+  joinWithNext,
   mergeIntoPrevious,
   normalizeBlocks,
   normalizeTable,
@@ -1657,6 +1661,98 @@ console.log('\n=== 21. 节编辑：模型操作 / 不变式 / md 往返（W5）=
   const notFirst = parseMd('甲\n\n::section numbers=off')
   eq('正文里的 ::section 不当指令', toMd(notFirst), '甲\n::section numbers=off')
   eq('也不产生 sections', notFirst.sections, undefined)
+}
+
+console.log('\n=== 25. 跨段删除：deleteSpan / joinWithNext（issues/20260915）===')
+{
+  // 同一段里删一段
+  const one = docFrom('abcdef')
+  eq('段内删除返回落点', JSON.stringify(deleteSpan(one, { blockId: 't0', offset: 2 }, { blockId: 't0', offset: 4 })), '{"blockId":"t0","offset":2}')
+  eq('段内删除结果', textOf(one).join('|'), 'abef')
+
+  // 跨段：段落标记被删掉，两头并成一段，中间整段消失
+  const join = docFrom('abc', 'def', 'ghi')
+  eq('跨段删除返回落点', JSON.stringify(deleteSpan(join, { blockId: 't0', offset: 1 }, { blockId: 't2', offset: 2 })), '{"blockId":"t0","offset":1}')
+  eq('首尾接起来、中间段没了', textOf(join).join('|'), 'ai')
+  eq('块数只剩 1', join.blocks.length, 1)
+
+  // 反向选区（从后往前选）
+  const back = docFrom('abc', 'def', 'ghi')
+  eq('反向选区也认', JSON.stringify(deleteSpan(back, { blockId: 't2', offset: 2 }, { blockId: 't0', offset: 1 })), '{"blockId":"t0","offset":1}')
+  eq('反向选区结果一致', textOf(back).join('|'), 'ai')
+
+  // 端点越界先夹住
+  const clamp = docFrom('abc', 'def')
+  deleteSpan(clamp, { blockId: 't0', offset: 99 }, { blockId: 't1', offset: 99 })
+  eq('端点越界夹到段尾', textOf(clamp).join('|'), 'abc')
+
+  // 中间夹着分页符 / 分节符；分节符被删要连带 sections 一起走
+  const withBreak = docFrom('甲', '乙')
+  withBreak.blocks.splice(1, 0, { t: 'pageBreak', id: 'pg1' })
+  withBreak.blocks.push({ t: 'sectionBreak', id: 's1' }, { t: 'textBlock', id: 't2', kind: 'body', inlines: [{ t: 'text', text: '丙' }] })
+  withBreak.sections = [{ orientation: 'landscape' }, {}]
+  eq('删前节数对得上', sectionCountOf(withBreak), 2)
+  deleteSpan(withBreak, { blockId: 't0', offset: 0 }, { blockId: 't2', offset: 0 })
+  eq('换页标记与分节符一并删掉', withBreak.blocks.length, 1)
+  eq('sections 跟着分节符一起摘（长度 = 分节符数 + 1）', withBreak.sections?.length, 1)
+  eq('留住的是首节的设置', withBreak.sections?.[0]?.orientation, 'landscape')
+
+  // 修订模式：不并段，只有文字被标成 del
+  const tracked = docFrom('abc', 'def', 'ghi')
+  deleteSpan(tracked, { blockId: 't0', offset: 1 }, { blockId: 't2', offset: 2 }, { kind: 'del', id: 1, author: '甲', date: '' })
+  eq('修订模式不并段', tracked.blocks.length, 3)
+  eq('被覆盖的文字都留着', textOf(tracked).join('|'), 'abc|def|ghi')
+  const marked = (model) =>
+    model.blocks
+      .filter((b) => b.t === 'textBlock')
+      .flatMap((b) => b.inlines)
+      .filter((i) => i.t === 'text' && i.rev)
+      .map((i) => `${i.text}:${i.rev.kind}`)
+      .join(',')
+  eq('覆盖到的文字都标成 del', marked(tracked), 'bc:del,def:del,gh:del')
+
+  // 端点不是段落（表格格子）时不认
+  const table = parseMd('甲\n\n:::table\n| a | b |\n| c | d |\n:::')
+  eq('端点落在格子里 → 不并段', deleteSpan(table, { blockId: 't0', offset: 0 }, { blockId: cellId(table.blocks[1].id, 1, 1), offset: 0 }), null)
+
+  // 中间覆盖到整张表时表格一并删掉（Word 也是这么做的）
+  const withTable = parseMd('甲\n\n:::table\n| a | b |\n| c | d |\n:::\n\n乙')
+  deleteSpan(withTable, { blockId: withTable.blocks[0].id, offset: 0 }, { blockId: withTable.blocks[2].id, offset: 1 })
+  eq('整段覆盖到的表格一起删', withTable.blocks.length, 1)
+  eq('两头接起来', plainText(withTable.blocks[0]), '乙'.slice(1))
+
+  // joinWithNext：Delete 落在段尾 = 删掉段落标记
+  const next = docFrom('ab', 'cd')
+  eq('并下一段的落点', JSON.stringify(joinWithNext(next, 't0')), '{"blockId":"t0","offset":2}')
+  eq('并下一段的结果', textOf(next).join('|'), 'abcd')
+
+  // 下一块不是段落（表格 / 换页标记 / 文末）时不接管
+  const last = docFrom('ab')
+  eq('文末没有下一段', joinWithNext(last, 't0'), null)
+  const withPg = docFrom('ab', 'cd')
+  withPg.blocks.splice(1, 0, { t: 'pageBreak', id: 'pg2' })
+  eq('下一块是换页标记', joinWithNext(withPg, 't0'), null)
+  const withTable2 = parseMd('甲\n\n:::table\n| a | b |\n| c | d |\n:::')
+  eq('下一块是表格', joinWithNext(withTable2, withTable2.blocks[0].id), null)
+
+  /*
+   * 两个谓词：调用方必须在**改模型之前**问它们 —— 撤销快照要记在改模型之前，
+   * 而 mergeIntoPrevious / joinWithNext 一进去就动模型（问都不问就记，撤销会变成空操作）。
+   */
+  const can = docFrom('ab', 'cd')
+  eq('前一块是段落 → 可以并', canMergeIntoPrevious(can, 't1'), true)
+  eq('首块没有前一块 → 不能并', canMergeIntoPrevious(can, 't0'), false)
+  eq('段尾有下一段 → 可以并', canJoinWithNext(can, 't0'), true)
+  eq('末块没有下一段 → 不能并', canJoinWithNext(can, 't1'), false)
+  const canBreak = docFrom('ab', 'cd')
+  canBreak.blocks.splice(1, 0, { t: 'pageBreak', id: 'pgx' })
+  eq('前一块是换页标记 → 不能并', canMergeIntoPrevious(canBreak, 't1'), false)
+  eq('下一块是换页标记 → 不能并', canJoinWithNext(canBreak, 't0'), false)
+  const canTable = parseMd('甲\n\n:::table\n| a | b |\n| c | d |\n:::\n\n乙')
+  const tableAt = canTable.blocks.findIndex((b) => b.t === 'table')
+  eq('下一块是表格 → 不能并', canJoinWithNext(canTable, canTable.blocks[0].id), false)
+  eq('前一块是表格 → 不能并', canMergeIntoPrevious(canTable, canTable.blocks[tableAt + 1].id), false)
+  eq('不存在的块 → 两个谓词都说不', `${canMergeIntoPrevious(canTable, 'nope')}/${canJoinWithNext(canTable, 'nope')}`, 'false/false')
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
