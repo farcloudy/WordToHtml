@@ -96,11 +96,14 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    * 单元格左右内边距**必须**与 docx 侧一致：导出侧写死 108 缇 = 5.4pt（docx/export.ts 的
    * CELL_MARGIN_TWIPS），两侧不同，格内文字相对 Word 就会偏 —— 这不是巧合，是一个共用的数。
    *
-   * 行高最小值**不能**靠 <tr> 的 min-height（表格行不吃这个属性），所以给格内那层 div 设
-   * min-height。格内文字可以换成别的样式（`TableCellModel.kind`），所以这里按 STYLE_KEYS
-   * 逐条样式生成 —— 一行里各格取自己样式的那条，实际行高天然是各格的最大值
+   * 「最小一行 / 最小两行」的行高下限写在 **`<td>` 的 height 上**（表格格的 height 就是
+   * 最小高度：内容更高时照样撑开，与 docx 侧 w:trHeight ATLEAST 同义）。**不能**写在格内
+   * 那层 div 的 min-height 上 —— 那样 div 自己就被撑成两行高，而字仍待在 div 顶部，
+   * 于是 `<td>` 上的 vertical-align 挪的是「已经填满格子的 div」，一点视觉效果都没有
+   * （2026-09-15 用户实测：最小两行 + 单行文字时垂直对齐失效，设成居中/底端都不动）。
+   * 格内文字可以换成别的样式（`TableCellModel.kind`），所以这里按 STYLE_KEYS 逐条样式生成
+   * —— 一行里各格取自己样式的那条，实际行高天然是各格的最大值
    * （docx 侧的 w:trHeight 用同一条规则算，两侧同源）。
-   * ⚠️ 本机无法用浏览器验证这一点（Edge 的程序化启动坏了、不跑 playwright），留给人工核对。
    *
    * 另有一处已知偏差（PLAN 6.8）：列表段落样式的 CSS line-height 是固定值 12pt，
    * 而 Word 的 atLeast 12pt 是「不小于」。单行格两者相同（minLines=2 → 24pt），
@@ -115,8 +118,8 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
   )
   for (const kind of STYLE_KEYS) {
     out.push(
-      `.${ns}-table .${ns}-${kind} { min-height: ${spec.styles[kind].linePt}pt; }`,
-      `.${ns}-table-min2 .${ns}-${kind} { min-height: ${spec.styles[kind].linePt * 2}pt; }`,
+      `.${ns}-table td.${ns}-td-${kind} { height: ${spec.styles[kind].linePt}pt; }`,
+      `.${ns}-table-min2 td.${ns}-td-${kind} { height: ${spec.styles[kind].linePt * 2}pt; }`,
     )
   }
   out.push(

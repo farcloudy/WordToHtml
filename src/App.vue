@@ -80,24 +80,35 @@ const KIND_LABEL: Record<BlockKind, string> = {
   listItem: '列表段落',
 }
 
-const COLORS: { label: string; value: string }[] = [
-  { label: '红', value: 'FF0000' },
-  { label: '黑', value: '000000' },
-  { label: '蓝', value: '0000FF' },
-  { label: '绿', value: '008000' },
-  { label: '紫', value: '800080' },
-  { label: '橙', value: 'FF8C00' },
-  { label: '灰', value: '808080' },
-]
+/**
+ * 唯一保留的着色 —— 红。公文体里「红色」是用来标出待核/提醒处的，其余六种颜色（黑蓝绿紫橙灰）
+ * 与这套排版没有关系，按钮排一长串反而把常用的两枚淹了，所以只留「标红」与「取消颜色」。
+ */
+const RED = 'FF0000'
 
 /**
  * 可插入的特殊空格。三个码点的宽度是排版意义上的（全宽/半宽/四分之一），
  * 与字体无关；普通空格会被 HTML 折叠，这三个不会。
+ *
+ * 三枚并排按钮而不是一个下拉：插入是「点一下插一个」的动作，下拉白多一步；
+ * 而且下拉选完必须复位回占位项才认第二次 change，想连插两个同宽空格都做不到。
  */
 const SPACES = [
-  { kind: 'em', label: '全宽空格（U+2003）' },
-  { kind: 'en', label: '半宽空格（U+2002）' },
-  { kind: 'quarterEm', label: '四分之一宽空格（U+2005）' },
+  { kind: 'em', label: '全宽空格', title: '在插入符处插入全宽空格（U+2003）' },
+  { kind: 'en', label: '半宽空格', title: '在插入符处插入半宽空格（U+2002）' },
+  { kind: 'quarterEm', label: '1/4 宽空格', title: '在插入符处插入四分之一宽空格（U+2005）' },
+] as const
+
+/**
+ * 功能区的四个标签页。四页**常驻**（表格页不在格子里时按钮置灰），
+ * 不照 Word 那样「光标进表格才弹出表格页」—— 那会让标签条与页内容在切进/切出时
+ * 变宽变窄（乃至换行），下方版面跟着跳，正是这次拆分要解决的问题。
+ */
+const RIBBON_TABS = [
+  { key: 'start', label: '开始', title: '格式、样式与修订' },
+  { key: 'insert', label: '插入', title: '特殊空格、表格、分节符、分页符、批注' },
+  { key: 'layout', label: '布局', title: '节：纸张方向、页码、关联前节' },
+  { key: 'table', label: '表格', title: '表格的上下文操作（光标要在格子里）' },
 ] as const
 
 /**
@@ -123,6 +134,8 @@ const PAGE_ORIENTATIONS = [
 
 /** edit = 直接在 A4 版面上写（面向用户）；source = 类 md 源码（给开发/排错用） */
 const mode = ref<'edit' | 'source'>('edit')
+/** 功能区当前那一页。默认「开始」—— 最常用的一组（加粗/下划线/颜色/样式）要在第一屏 */
+const tab = ref<'start' | 'insert' | 'layout' | 'table'>('start')
 const source = ref(SAMPLE)
 const author = ref('张三')
 /** 当前文件模板（样式 + 页边距是一体的，所以只有一个下拉）。默认第一套，与既有行为一致 */
@@ -221,6 +234,9 @@ const sectionRestartDisabled = computed(
   () => (sectionCtx.value?.isFirst ?? false) || (sectionCtx.value?.linkPrevious ?? false),
 )
 
+/** 选区（或插入符所在的那一串）里有没有修订 —— 「接受/拒绝修订」按钮据此亮/灰 */
+const hasRevisions = computed(() => selection.value?.revisions ?? false)
+
 /** 上下文工具条上的落点提示：正文行显示行列（下标 +1），表头/附注行没有列的概念 */
 const tablePosLabel = computed(() => {
   const t = tableCtx.value
@@ -268,16 +284,9 @@ function showToast(message: string): void {
   }, 2000)
 }
 
-/**
- * 下拉选完就复位回占位项：不复位的话「再选同一项」不会再触发 change，
- * 想连插两个同宽空格就做不到。
- */
-function onInsertSpace(event: Event): void {
-  const select = event.target as HTMLSelectElement
-  const entry = SPACES.find((s) => s.kind === select.value)
-  select.value = ''
-  if (!entry) return
-  if (!paper.value?.insertSpecialSpace(entry.kind)) showToast('请先把插入符放到版面上')
+/** 在插入符处插一个特殊空格；插入符不在版面上时给一句提示 */
+function insertSpace(kind: 'em' | 'en' | 'quarterEm'): void {
+  if (!paper.value?.insertSpecialSpace(kind)) showToast('请先把插入符放到版面上')
 }
 
 /** 修订模式由 App 持有（顶栏那个复选框也绑着它），快捷键只是换个入口 */
@@ -528,55 +537,92 @@ onBeforeUnmount(() => {
     </header>
 
     <!--
-      样式库。照 Word 的样子水平排成一排大按钮，按钮文字用各条样式自己的字体字号
-      渲染 —— 一眼能对上是哪条样式，也不用先在下拉框里找。
+      功能区（照 Word 的 ribbon）：上面一排标签页、下面一页内容。
+      标签页与页内控件一律 @mousedown.prevent —— 焦点不离开正文，落点与 native 选区才保得住。
+      四页都常驻（「表格」页在光标不在格子里时按钮置灰），不随光标出现/消失 ——
+      「切进/切出表格时工具栏宽度会变」正是这次拆分要解决的问题。
     -->
-    <div v-if="mode === 'edit'" class="styles">
-      <span class="styles-label">样式</span>
+    <div v-if="mode === 'edit'" class="ribbon-tabs" role="tablist">
       <button
-        v-for="k in BLOCK_KINDS"
-        :key="k"
+        v-for="t in RIBBON_TABS"
+        :key="t.key"
         type="button"
-        class="style-chip"
-        :class="{ 'is-on': k === kind }"
-        :style="chipStyle(k)"
-        :title="KIND_LABEL[k]"
+        role="tab"
+        class="ribbon-tab"
+        :class="{ 'is-on': tab === t.key }"
+        :aria-selected="tab === t.key"
+        :title="t.title"
         @mousedown.prevent
-        @click="paper?.setBlockKind(k)"
+        @click="tab = t.key"
       >
-        {{ KIND_LABEL[k] }}
+        {{ t.label }}
       </button>
     </div>
 
-    <div v-if="mode === 'edit'" class="toolbar">
-      <button
-        type="button"
-        class="tool"
-        :class="{ 'is-on': selection?.bold }"
-        title="加粗（Ctrl+B）"
-        @mousedown.prevent
-        @click="paper?.toggleBold()"
-      >
-        <b>B</b>
-      </button>
+    <!--
+      开始：撤销/重做、加粗/下划线/颜色、修订的收尾动作（接受/拒绝），以及样式库。
+      样式库照 Word 的样子用各条样式自己的字体字号渲染按钮文字 —— 一眼能对上的是哪条样式。
+    -->
+    <div v-if="mode === 'edit' && tab === 'start'" class="toolbar panel panel-start">
+      <span class="tk-group">
+        <button
+          type="button"
+          class="tool"
+          title="撤销（Ctrl+Z）"
+          @mousedown.prevent
+          @click="paper?.undo()"
+        >
+          ↺
+        </button>
+        <button
+          type="button"
+          class="tool"
+          title="重做（Ctrl+Y）"
+          @mousedown.prevent
+          @click="paper?.redo()"
+        >
+          ↻
+        </button>
+      </span>
 
-      <span class="field">
-        颜色
+      <span class="sep" />
+
+      <span class="tk-group">
+        <button
+          type="button"
+          class="tool"
+          :class="{ 'is-on': selection?.bold }"
+          title="加粗（Ctrl+B）"
+          @mousedown.prevent
+          @click="paper?.toggleBold()"
+        >
+          <b>B</b>
+        </button>
+        <button
+          type="button"
+          class="tool"
+          :class="{ 'is-on': selection?.underline }"
+          title="下划线（Ctrl+U）"
+          @mousedown.prevent
+          @click="paper?.toggleUnderline()"
+        >
+          <u>U</u>
+        </button>
+        <span class="tk-label">颜色</span>
         <span class="swatches">
           <button
-            v-for="c in COLORS"
-            :key="c.value"
             type="button"
             class="swatch"
-            :style="{ background: `#${c.value}` }"
-            :title="c.label"
+            :class="{ 'is-on': selection?.color === RED }"
+            :style="{ background: `#${RED}` }"
+            title="标红"
             @mousedown.prevent
-            @click="paper?.setColor(c.value)"
+            @click="paper?.setColor(RED)"
           />
           <button
             type="button"
             class="swatch clear"
-            title="默认颜色"
+            title="取消颜色"
             @mousedown.prevent
             @click="paper?.setColor(null)"
           >
@@ -587,68 +633,110 @@ onBeforeUnmount(() => {
 
       <span class="sep" />
 
-      <button
-        type="button"
-        class="tool"
-        title="撤销（Ctrl+Z）"
-        @mousedown.prevent
-        @click="paper?.undo()"
-      >
-        ↺
-      </button>
-      <button
-        type="button"
-        class="tool"
-        title="重做（Ctrl+Y）"
-        @mousedown.prevent
-        @click="paper?.redo()"
-      >
-        ↻
-      </button>
-
-      <span class="sep" />
-
-      <button
-        type="button"
-        class="tool"
-        title="在光标所在段落后插入分页符（只换页，页码连续）"
-        @mousedown.prevent
-        @click="paper?.insertPageBreak()"
-      >
-        分页符
-      </button>
-      <button
-        type="button"
-        class="tool"
-        title="在光标所在段落后插入分节符（新起一页；页码默认关联前一节、不重排）"
-        @mousedown.prevent
-        @click="paper?.insertSectionBreak()"
-      >
-        分节符
-      </button>
-      <button
-        type="button"
-        class="tool"
-        title="在光标所在段落后插入一张空表格（行数、列数可选）"
-        @mousedown.prevent
-        @click="openTablePanel"
-      >
-        插入表格
-      </button>
-
-      <span class="sep" />
-
-      <span class="field">
-        插入
-        <select title="在插入符处插入一个特殊空格" @change="onInsertSpace">
-          <option value="">空格…</option>
-          <option v-for="s in SPACES" :key="s.kind" :value="s.kind">{{ s.label }}</option>
-        </select>
+      <!--
+        修订的收尾动作。常驻置灰，不随「有没有选中修订」出现/消失 —— 按钮忽隐忽现会改变
+        这一行的宽度与是否换行，与这次拆分要解决的问题同源。
+      -->
+      <span class="tk-group">
+        <button
+          type="button"
+          class="tool"
+          :disabled="!hasRevisions"
+          title="接受选中的修订（插入的文字留下、删除的文字真的删掉）"
+          @mousedown.prevent
+          @click="paper?.resolveRevisions('accept')"
+        >
+          接受修订
+        </button>
+        <button
+          type="button"
+          class="tool"
+          :disabled="!hasRevisions"
+          title="拒绝选中的修订（插入的文字删掉、删除的文字留下）"
+          @mousedown.prevent
+          @click="paper?.resolveRevisions('reject')"
+        >
+          拒绝修订
+        </button>
       </span>
 
       <span class="sep" />
 
-      <span class="field comment-field">
+      <span class="tk-group">
+        <span class="tk-label">样式</span>
+        <span class="styles">
+          <button
+            v-for="k in BLOCK_KINDS"
+            :key="k"
+            type="button"
+            class="style-chip"
+            :class="{ 'is-on': k === kind }"
+            :style="chipStyle(k)"
+            :title="KIND_LABEL[k]"
+            @mousedown.prevent
+            @click="paper?.setBlockKind(k)"
+          >
+            {{ KIND_LABEL[k] }}
+          </button>
+        </span>
+      </span>
+    </div>
+
+    <!--
+      插入：三枚特殊空格并排（照样式库的做法做成并排按钮，不再是下拉 —— 下拉选完还得复位
+      回占位项才认第二次 change，想连插两个同宽空格都做不到），加上表格、分节符、分页符与批注。
+    -->
+    <div v-if="mode === 'edit' && tab === 'insert'" class="toolbar panel panel-insert">
+      <span class="tk-group">
+        <span class="tk-label">特殊空格</span>
+        <button
+          v-for="s in SPACES"
+          :key="s.kind"
+          type="button"
+          class="tool"
+          :title="s.title"
+          @mousedown.prevent
+          @click="insertSpace(s.kind)"
+        >
+          {{ s.label }}
+        </button>
+      </span>
+
+      <span class="sep" />
+
+      <span class="tk-group">
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在段落后插入一张空表格（行数、列数可选）"
+          @mousedown.prevent
+          @click="openTablePanel"
+        >
+          表格
+        </button>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在段落后插入分节符（新起一页；页码默认关联前一节、不重排）"
+          @mousedown.prevent
+          @click="paper?.insertSectionBreak()"
+        >
+          分节符
+        </button>
+        <button
+          type="button"
+          class="tool"
+          title="在光标所在段落后插入分页符（只换页，页码连续）"
+          @mousedown.prevent
+          @click="paper?.insertPageBreak()"
+        >
+          分页符
+        </button>
+      </span>
+
+      <span class="sep" />
+
+      <span class="tk-group comment-field">
         批注
         <input
           v-model="commentDraft"
@@ -662,126 +750,140 @@ onBeforeUnmount(() => {
     </div>
 
     <!--
-      节的上下文工具条：编辑模式常驻（光标永远落在某一节里），交互与表格工具条同一套 ——
-      按钮与 radio 一律 @mousedown.prevent，焦点不离开正文，落点与 native 选区才保得住。
+      布局（= 节编辑）：标签页常驻，页内容跟着落点走 —— 刚打开页面（光标还没进正文）时只显示一句
+      提示。这是 HEAD 上就有的既有行为（PLAN 第 11 节 C.7），本次只把**外壳**做成常驻。
+      交互与表格页同一套：按钮与 radio 一律 @mousedown.prevent，焦点不离开正文，落点与 native 选区才保得住。
       置灰规则：首节没有前节（关联前节恒置灰）；「关联前节 = 是」时另两项被前一节接管；
       「从 1 开始」在首节也无意义（恒从 1 开始），一并置灰。
     -->
-    <div v-if="mode === 'edit' && sectionCtx" class="toolbar sub-toolbar section-toolbar">
-      <span class="tk-hint">第 {{ sectionCtx.index + 1 }} 节 / 共 {{ sectionCtx.total }} 节</span>
+    <div
+      v-if="mode === 'edit' && tab === 'layout'"
+      class="toolbar sub-toolbar section-toolbar panel panel-layout"
+    >
+      <template v-if="sectionCtx">
+        <span class="tk-hint">第 {{ sectionCtx.index + 1 }} 节 / 共 {{ sectionCtx.total }} 节</span>
 
-      <span class="tk-group">
-        <span class="tk-label">方向</span>
-        <label v-for="o in PAGE_ORIENTATIONS" :key="o.value" class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-orientation"
-            :title="o.title"
-            :checked="sectionCtx.orientation === o.value"
-            @click="paper?.setSectionOrientation(o.value)"
-          />
-          {{ o.label }}
-        </label>
-      </span>
+        <span class="tk-group">
+          <span class="tk-label">方向</span>
+          <label v-for="o in PAGE_ORIENTATIONS" :key="o.value" class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-orientation"
+              :title="o.title"
+              :checked="sectionCtx.orientation === o.value"
+              @click="paper?.setSectionOrientation(o.value)"
+            />
+            {{ o.label }}
+          </label>
+        </span>
 
-      <span class="tk-group">
-        <span class="tk-label">页码</span>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-numbers"
-            title="本节显示页码（关联前节时由前一节决定）"
-            :disabled="sectionCtx.linkPrevious"
-            :checked="sectionCtx.pageNumbers"
-            @click="paper?.setSectionPageNumbers(true)"
-          />
-          开
-        </label>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-numbers"
-            title="本节不显示页码"
-            :disabled="sectionCtx.linkPrevious"
-            :checked="!sectionCtx.pageNumbers"
-            @click="paper?.setSectionPageNumbers(false)"
-          />
-          关
-        </label>
-      </span>
+        <span class="tk-group">
+          <span class="tk-label">页码</span>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-numbers"
+              title="本节显示页码（关联前节时由前一节决定）"
+              :disabled="sectionCtx.linkPrevious"
+              :checked="sectionCtx.pageNumbers"
+              @click="paper?.setSectionPageNumbers(true)"
+            />
+            开
+          </label>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-numbers"
+              title="本节不显示页码"
+              :disabled="sectionCtx.linkPrevious"
+              :checked="!sectionCtx.pageNumbers"
+              @click="paper?.setSectionPageNumbers(false)"
+            />
+            关
+          </label>
+        </span>
 
-      <span class="tk-group">
-        <span class="tk-label">关联前节</span>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-link"
-            title="页脚与页码沿用前一节（本节不单独设页脚）"
-            :disabled="sectionCtx.isFirst"
-            :checked="sectionCtx.linkPrevious"
-            @click="paper?.setSectionLinkPrevious(true)"
-          />
-          是
-        </label>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-link"
-            title="本节用自己的页脚与页码（首节没有前节，恒为否）"
-            :disabled="sectionCtx.isFirst"
-            :checked="!sectionCtx.linkPrevious"
-            @click="paper?.setSectionLinkPrevious(false)"
-          />
-          否
-        </label>
-      </span>
+        <span class="tk-group">
+          <span class="tk-label">关联前节</span>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-link"
+              title="页脚与页码沿用前一节（本节不单独设页脚）"
+              :disabled="sectionCtx.isFirst"
+              :checked="sectionCtx.linkPrevious"
+              @click="paper?.setSectionLinkPrevious(true)"
+            />
+            是
+          </label>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-link"
+              title="本节用自己的页脚与页码（首节没有前节，恒为否）"
+              :disabled="sectionCtx.isFirst"
+              :checked="!sectionCtx.linkPrevious"
+              @click="paper?.setSectionLinkPrevious(false)"
+            />
+            否
+          </label>
+        </span>
 
-      <span class="tk-group">
-        <span class="tk-label">从 1 开始</span>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-restart"
-            title="本节页码从 1 重新起算"
-            :disabled="sectionRestartDisabled"
-            :checked="sectionCtx.restartAtOne"
-            @click="paper?.setSectionRestartAtOne(true)"
-          />
-          是
-        </label>
-        <label class="tk-radio" @mousedown.prevent>
-          <input
-            @mousedown.prevent
-            type="radio"
-            name="sec-restart"
-            title="本节页码接着前面往下数"
-            :disabled="sectionRestartDisabled"
-            :checked="!sectionCtx.restartAtOne"
-            @click="paper?.setSectionRestartAtOne(false)"
-          />
-          否
-        </label>
-      </span>
+        <span class="tk-group">
+          <span class="tk-label">从 1 开始</span>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-restart"
+              title="本节页码从 1 重新起算"
+              :disabled="sectionRestartDisabled"
+              :checked="sectionCtx.restartAtOne"
+              @click="paper?.setSectionRestartAtOne(true)"
+            />
+            是
+          </label>
+          <label class="tk-radio" @mousedown.prevent>
+            <input
+              @mousedown.prevent
+              type="radio"
+              name="sec-restart"
+              title="本节页码接着前面往下数"
+              :disabled="sectionRestartDisabled"
+              :checked="!sectionCtx.restartAtOne"
+              @click="paper?.setSectionRestartAtOne(false)"
+            />
+            否
+          </label>
+        </span>
+      </template>
+      <span v-else class="tk-empty">把光标放进正文里后可用</span>
     </div>
 
     <!--
-      表格的上下文工具条：只在光标落在格子里时出现（跟着 selection-change 的 table 上下文走）。
+      表格页：**常驻**，不随光标进出表格出现/消失 —— 拆标签页要解决的正是「切进/切出表格时
+      工具栏宽度会变」。光标不在格子里时给一句提示、控件全部置灰；`:disabled` 逐个写在控件上
+      而不用 <fieldset disabled>（那要靠 display 参与布局，与这里的 flex 分组打架）。
       所有按钮与 radio 都 @mousedown.prevent —— 焦点不离开正文，落点与 native 选区才保得住。
     -->
-    <div v-if="mode === 'edit' && tableCtx" class="toolbar sub-toolbar">
-      <span class="tk-hint">表格 · {{ tablePosLabel }}</span>
+    <div
+      v-if="mode === 'edit' && tab === 'table'"
+      class="toolbar sub-toolbar table-toolbar panel panel-table"
+    >
+      <span class="tk-hint">{{ tableCtx ? `表格 · ${tablePosLabel}` : '表格' }}</span>
+      <span v-if="!tableCtx" class="tk-empty">把光标放进表格的格子里后可用</span>
 
       <span class="tk-group">
         <span class="tk-label">行</span>
         <button
           type="button"
           class="tool"
+          :disabled="!tableCtx"
           title="在光标所在行的上方插入一行"
           @mousedown.prevent
           @click="paper?.insertTableRow('above')"
@@ -791,6 +893,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool"
+          :disabled="!tableCtx"
           title="在光标所在行的下方插入一行"
           @mousedown.prevent
           @click="paper?.insertTableRow('below')"
@@ -800,7 +903,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool"
-          :disabled="tableCtx.role !== 'body' || tableCtx.bodyRows <= 1"
+          :disabled="!tableCtx || tableCtx.role !== 'body' || tableCtx.bodyRows <= 1"
           title="删除光标所在行（只剩一个正文行、或光标在表头行／附注行时不可用）"
           @mousedown.prevent
           @click="paper?.removeTableRow()"
@@ -814,6 +917,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool"
+          :disabled="!tableCtx"
           title="在光标所在列的左侧插入一列"
           @mousedown.prevent
           @click="paper?.insertTableColumn('left')"
@@ -823,6 +927,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool"
+          :disabled="!tableCtx"
           title="在光标所在列的右侧插入一列"
           @mousedown.prevent
           @click="paper?.insertTableColumn('right')"
@@ -832,7 +937,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool"
-          :disabled="tableCtx.columns <= 1"
+          :disabled="!tableCtx || tableCtx.columns <= 1"
           title="删除光标所在列（只剩一列时不可用）"
           @mousedown.prevent
           @click="paper?.removeTableColumn()"
@@ -848,7 +953,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-minlines"
-            :checked="tableCtx.minLines === 1"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.minLines === 1"
             @click="paper?.setTableMinLines(1)"
           />
           最小一行
@@ -858,7 +964,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-minlines"
-            :checked="tableCtx.minLines === 2"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.minLines === 2"
             @click="paper?.setTableMinLines(2)"
           />
           最小两行
@@ -872,7 +979,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-unit"
-            :checked="tableCtx.hasUnit"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.hasUnit === true"
             @click="paper?.setTableRoleRow('unit', true)"
           />
           有
@@ -882,7 +990,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-unit"
-            :checked="!tableCtx.hasUnit"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.hasUnit === false"
             @click="paper?.setTableRoleRow('unit', false)"
           />
           无
@@ -896,7 +1005,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-note"
-            :checked="tableCtx.hasNote"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.hasNote === true"
             @click="paper?.setTableRoleRow('note', true)"
           />
           有
@@ -906,7 +1016,8 @@ onBeforeUnmount(() => {
             @mousedown.prevent
             type="radio"
             name="tk-note"
-            :checked="!tableCtx.hasNote"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.hasNote === false"
             @click="paper?.setTableRoleRow('note', false)"
           />
           无
@@ -920,7 +1031,8 @@ onBeforeUnmount(() => {
           :key="a.value"
           type="button"
           class="tool"
-          :class="{ 'is-on': tableCtx.alignH === a.value }"
+          :disabled="!tableCtx"
+          :class="{ 'is-on': tableCtx?.alignH === a.value }"
           :title="a.title"
           @mousedown.prevent
           @click="paper?.setTableCellAlignH(a.value)"
@@ -936,7 +1048,8 @@ onBeforeUnmount(() => {
           :key="a.value"
           type="button"
           class="tool"
-          :class="{ 'is-on': tableCtx.alignV === a.value }"
+          :disabled="!tableCtx"
+          :class="{ 'is-on': tableCtx?.alignV === a.value }"
           :title="a.title"
           @mousedown.prevent
           @click="paper?.setTableCellAlignV(a.value)"
@@ -949,6 +1062,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="tool tk-danger"
+          :disabled="!tableCtx"
           title="删除整张表格（不二次确认，可 Ctrl+Z 撤销）"
           @mousedown.prevent
           @click="paper?.removeTable()"
@@ -1263,20 +1377,51 @@ button.primary:disabled {
   cursor: default;
 }
 
-.styles {
+/*
+ * 功能区的标签条。四枚标签永远都在（表格页在光标不在格子里时只是内容置灰）——
+ * 标签条宽度因此不随光标位置变，下方版面也就不会跳。
+ */
+.ribbon-tabs {
   display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 1px solid #d8dade;
+  background: #eef0f3;
+}
+
+.ribbon-tab {
+  padding: 6px 16px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #4a4f56;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ribbon-tab:hover {
+  background: #e4e7eb;
+}
+
+.ribbon-tab.is-on {
+  background: #fff;
+  border-bottom-color: #1f6feb;
+  color: #1f6feb;
+  font-weight: 600;
+}
+
+/* 光标不在表格里时表格页的那句提示 */
+.tk-empty {
+  color: #8a9099;
+}
+
+/* 样式库：现在是「开始」页里的一个分组，只留横向排列，不再是一条独立的横栏 */
+.styles {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  padding: 8px 16px;
-  border-bottom: 1px solid #e4e6ea;
-  background: #f6f7f9;
-}
-
-.styles-label {
-  margin-right: 2px;
-  color: #8a9099;
-  font-size: 12px;
 }
 
 /* 按钮文字由 inline style 按各条样式自己的字体字号渲染（见 chipStyle） */
@@ -1392,6 +1537,12 @@ button.primary:disabled {
   color: #1f6feb;
 }
 
+/* 置灰的按钮（「接受/拒绝修订」没有修订时、表格页光标不在格子里时） */
+.tool:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .swatches {
   display: inline-flex;
   gap: 4px;
@@ -1412,8 +1563,18 @@ button.primary:disabled {
   line-height: 1;
 }
 
+/* 选中的文字已经是这个颜色时，色块自己带一圈蓝边（与 .tool.is-on 同一套观感） */
+.swatch.is-on {
+  border-color: #1f6feb;
+  box-shadow: inset 0 0 0 1px #1f6feb;
+}
+
 .comment-field input {
   width: 200px;
+  padding: 3px 6px;
+  border: 1px solid #c8ccd2;
+  border-radius: 4px;
+  font: inherit;
 }
 
 .comment-field button {
@@ -1716,6 +1877,7 @@ textarea {
  */
 @media print {
   .bar,
+  .ribbon-tabs,
   .styles,
   .toolbar,
   .sub-toolbar,

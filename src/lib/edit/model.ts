@@ -23,6 +23,7 @@ import type {
   RevMark,
   TableRowRole,
   TextBlock,
+  TextInline,
 } from '../types'
 import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
 import { findCell, setCellKind } from './table'
@@ -71,8 +72,15 @@ export interface EditorSelection {
   collapsed: boolean
   /** 选区内文字是否全加粗 */
   bold: boolean
+  /** 选区内文字是否全带下划线 */
+  underline: boolean
   /** 选区内文字是否同色；混色或无色时为 undefined */
   color?: string
+  /**
+   * 选区（或插入符所在的那一串）里有没有修订 —— 「接受/拒绝修订」按钮据此启用/置灰。
+   * 常驻按钮而不随修订出现/消失，否则工具栏会换行、下方版面跟着跳。
+   */
+  revisions: boolean
   /** 落点在表格格子里时给出表格上下文；不在格子里则没有这个字段 */
   table?: TableSelectionContext
   /** 光标所在节的上下文；供「节」上下文工具条回显与置灰 */
@@ -549,6 +557,119 @@ export function applyFormat(
       return next
     }),
   )
+}
+
+/**
+ * 一串连续的、同一类的修订文字在容器里的字符区间（`ins` = 插入修订，`del` = 删除修订）。
+ *
+ * 按「串」而不是按 inline 归并，是因为**修订标记是逐个 inline 存的、而打字是一笔一笔落的**：
+ * 开着修订连敲三个字，模型里是三个各带一枚新 id 的 ins —— 用户眼里的「这一处是新增的」
+ * 不该被拆成三次点击。相邻（字符坐标上首尾相接）且同类的那些 inline 算一串。
+ */
+export interface RevisionSpan {
+  from: number
+  to: number
+  kind: 'ins' | 'del'
+}
+
+/** 容器里全部的修订串，按位置排列（内部用；对外只暴露「某个偏移落在哪一串」） */
+function revisionRuns(container: InlineContainer): RevisionSpan[] {
+  const runs: RevisionSpan[] = []
+  let cursor = 0
+  for (const inline of container.inlines) {
+    if (inline.t !== 'text') continue
+    const start = cursor
+    cursor += inline.text.length
+    if (cursor <= start || !inline.rev) continue
+    const last = runs[runs.length - 1]
+    if (last && last.to === start && last.kind === inline.rev.kind) last.to = cursor
+    else runs.push({ from: start, to: cursor, kind: inline.rev.kind })
+  }
+  return runs
+}
+
+/**
+ * 插入符所在的那一串修订；插入符不在修订里时返回 null。
+ *
+ * 插入符正好贴在某一串的末尾（offset === to）时也认这一串：用户点到修订文字的右半边、
+ * 或刚刚接受完一处修订、光标停在原地，按钮都不该突然变灰。此时若紧挨着还有另一串
+ * 修订从该偏移开始，则算后一串（先按「落在串内」找，找不到才回退到「贴着串尾」）。
+ */
+export function revisionSpanAt(container: InlineContainer, offset: number): RevisionSpan | null {
+  const runs = revisionRuns(container)
+  const inside = runs.find((r) => offset >= r.from && offset < r.to)
+  if (inside) return inside
+  return runs.find((r) => offset === r.to) ?? null
+}
+
+/**
+ * [from,to) 里有没有修订 —— 「接受/拒绝修订」按钮据此决定亮不亮。
+ *
+ * from === to（只有插入符）时按插入符所在的那一串算，于是「点一下修订文字就能接受」
+ * 与「选中修订文字才能接受」两种用法都成立。
+ */
+export function hasRevisions(container: InlineContainer, from: number, to: number): boolean {
+  if (from === to) return revisionSpanAt(container, from) !== null
+  let cursor = 0
+  for (const inline of container.inlines) {
+    if (inline.t !== 'text') continue
+    const start = cursor
+    cursor += inline.text.length
+    if (inline.rev && start < to && cursor > from) return true
+  }
+  return false
+}
+
+/**
+ * 接受 / 拒绝 [from,to) 里的修订。
+ *
+ * 接受：插入修订去掉标记、文字留下；删除修订连文字一起删掉。
+ * 拒绝：反过来 —— 插入修订连文字删掉，删除修订去掉标记、文字留下。
+ * 落在区间里的批注锚点、软换行、以及区间外的修订都由 replaceRange 的既有规则照看，
+ * 这里只负责把区间内那些 text inline 重算一遍。
+ *
+ * from === to 时整串处理（见 revisionSpanAt）；选区只覆盖某一串的一半时只处理这一半，
+ * 与 Word 里「选到哪儿就动到哪儿」一致。
+ *
+ * 与同文件里其它「改模型」的入口一样吃 doc + 容器 id（段落与表格格子走同一条路）；
+ * 查询用的 hasRevisions / revisionSpanAt 则吃容器本身，与 rangeIsBold / rangeColor 一致。
+ *
+ * 返回**是否真的动了模型** —— 调用方据此决定要不要记这一步撤销（没修订就不许记空快照）。
+ */
+export function resolveRevisions(
+  doc: DocModel,
+  containerId: string,
+  from: number,
+  to: number,
+  action: 'accept' | 'reject',
+): boolean {
+  const container = findContainer(doc, containerId)
+  if (!container) return false
+
+  const span = from === to ? revisionSpanAt(container, from) : null
+  const a = span ? span.from : Math.max(0, Math.min(from, to))
+  const b = span ? span.to : Math.max(from, to)
+  if (b <= a) return false
+
+  let changed = false
+  const kept: Inline[] = []
+  for (const inline of sliceStrict(container.inlines, a, b)) {
+    if (inline.t !== 'text' || !inline.rev) {
+      kept.push(inline)
+      continue
+    }
+    changed = true
+    // ins 接受就留、del 拒绝就留；另一个分支是「连文字一起删掉」
+    const keep = inline.rev.kind === 'ins' ? action === 'accept' : action === 'reject'
+    if (!keep) continue
+    const rest: TextInline = { ...inline }
+    delete rest.rev
+    kept.push(rest)
+  }
+  if (!changed) return false
+
+  replaceRange(container, a, b, kept)
+  return true
 }
 
 /** 给 [from,to) 加一条批注；返回新批注 id */

@@ -49,6 +49,7 @@ import {
   deleteSpan,
   findBlock,
   findContainer,
+  hasRevisions,
   insertBreakAfter,
   insertText,
   joinWithNext,
@@ -60,6 +61,7 @@ import {
   removeComment as removeCommentOp,
   replyComment as replyCommentOp,
   replaceRange,
+  resolveRevisions,
   setContainerKind as setContainerKindOp,
   sliceStrict,
   splitBlock,
@@ -806,7 +808,10 @@ function emitSelection(): void {
     to,
     collapsed: to === from,
     bold: to > from ? rangeIsBold(container, from, to) : false,
+    underline: to > from ? rangeIsUnderline(container, from, to) : false,
     color: to > from ? rangeColor(container, from, to) : undefined,
+    // 插入符（没选中文字）也要报：点一下修订文字就能整串接受/拒绝
+    revisions: hasRevisions(container, from, to),
     ...(cell && table ? { table: tableContextOf(table, cell.row, cell.col) } : {}),
     section: sectionContextOf(range.start.blockId),
   })
@@ -1613,6 +1618,65 @@ function setColor(hex: string | null): void {
       color: hex ? hex.replace(/^#/, '').toUpperCase() : null,
     }),
   )
+}
+
+/**
+ * 接受 / 拒绝当前选区里的修订（没选中文字时按插入符所在的那一串算，见 revisionSpanAt）。
+ *
+ * 先问再改：一个修订都没覆盖到就一步都不动 —— 按钮虽然置灰，键盘路径与「点按钮到执行
+ * 之间选区被改」这类竞态仍可能走到这里，记下一份什么都没变的撤销快照是最难查的那种错。
+ *
+ * 锚点按改之前的选区还回去：接受/拒绝插入修订时坐标不动，处理删除修订时后面会左移，
+ * placeCaret 自己会找最近的落点。
+ */
+function resolveRevisionsOf(action: 'accept' | 'reject'): void {
+  if (!props.editable) return
+  const rootEl = root.value
+  if (!rootEl) return
+
+  /*
+   * 要处理哪儿：**实时**选区优先 —— 有真选区就跨块全给上；只有插入符（折叠）时，
+   * 按插入符所在的那一串修订算（Word 里点一下修订文字就能整段接受）。
+   *
+   * 这里**不能**像插入空格 / 加批注那样回退到 stickyRanges（「最近一次真选区」）：
+   * 那两个入口的焦点会离开正文（下拉框、输入框），实时选区确实没了；而这两个按钮是
+   * `@mousedown.prevent`，焦点一直在正文里，插入符就是最新的落点。回退过去反而会拿
+   * 一份过期的选区当目标 —— 2026-09-15 实测踩到：选中「苏州」拒绝掉它之后，再点接受，
+   * 用的还是那份旧选区（那儿已经没有修订了），于是这一下静默无效。
+   */
+  const targets: { blockId: string; from: number; to: number }[] = []
+  const push = (blockId: string, from: number, to: number): void => {
+    const p = prefixLength(blockId)
+    const a = Math.max(0, from - p)
+    targets.push({ blockId, from: a, to: Math.max(a, to - p) })
+  }
+  const live = selectedRanges(rootEl)
+  if (live.length > 0) {
+    for (const range of live) push(range.blockId, range.from, range.to)
+  } else {
+    const caret = selectionRange()?.start ?? lastCaret
+    if (caret) push(caret.blockId, caret.offset, caret.offset)
+  }
+
+  // 先问再改：一处修订都没覆盖到就一步都不动（见上面的说明）
+  const hits = targets.filter((target) => {
+    const container = findContainer(doc.value, target.blockId)
+    return container ? hasRevisions(container, target.from, target.to) : false
+  })
+  if (hits.length === 0) return
+
+  const before = selectionRange()
+  pushHistory()
+  for (const target of hits) {
+    resolveRevisions(doc.value, target.blockId, target.from, target.to, action)
+  }
+  refreshLayout({
+    anchor: before?.start ?? lastCaret,
+    anchorEnd: before?.end ?? null,
+    force: true,
+  })
+  // 修订没了，按钮得跟着变灰 —— 焦点没离开正文，不会自己来一次 selectionchange
+  void nextTick(emitSelection)
 }
 
 /**
@@ -2522,6 +2586,8 @@ defineExpose({
   toggleBold,
   toggleUnderline,
   setColor,
+  // 接受 / 拒绝修订
+  resolveRevisions: resolveRevisionsOf,
   formatSelectionAsAmount,
   insertSpecialSpace,
   addCommentOnSelection,

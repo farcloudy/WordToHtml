@@ -631,8 +631,13 @@ try {
       return frag.dataset.blockId ?? null
     }, needle)
 
+  // 节控件在功能区的「布局」页里（页内容按 tab 用 v-if 渲染，默认停在「开始」页）。
+  // 标签按钮是 @mousedown.prevent，切页不会把插入符/选区弄丢。
+  await page.locator('.ribbon-tab', { hasText: '布局' }).first().click()
+  await page.waitForTimeout(120)
+
   const secBar = page.locator('.section-toolbar')
-  ok('编辑模式下「节」工具条常驻', (await secBar.count()) === 1)
+  ok('编辑模式下「节」工具条常驻（布局页里）', (await secBar.count()) === 1)
   const screenView = await paperView()
   // 只有横排节挂命名页：纵排挂 wtp-portrait 会让渲染器在最后一页之后从命名页切回默认页，
   // 那个切换强制断页 —— 每份纵排文档打印出来都会多一张空白纸（2026-09-15 修）。

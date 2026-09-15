@@ -7,7 +7,7 @@
  *   · 切分 / 合并的边界（开头、结尾、加粗/下划线等内联格式的边界）；
  *   · 加粗、下划线、颜色的判断与增删；
  *   · 金额格式化（千分位 + 两位小数）的取舍；
- *   · 修订模式下删除不真删，而是标成 del；
+ *   · 修订模式下删除不真删，而是标成 del；接受 / 拒绝修订（ins 与 del 的四种组合）；
  *   · 特殊空格（U+2003/2002/2005）能原样写进 docx 的 document.xml。
  *
  * 用法：node scripts/test-edit-model.mjs   （需先 npm run build:lib）
@@ -37,6 +37,7 @@ import {
   findMatches,
   findTable,
   formatAmount,
+  hasRevisions,
   insertBodyRow,
   insertBreakAfter,
   insertColumn,
@@ -63,9 +64,11 @@ import {
   replyComment,
   replaceMatches,
   replaceRange,
+  resolveRevisions,
   resolveSectionSettings,
   resolveSections,
   resolveSpec,
+  revisionSpanAt,
   sectionCountOf,
   sectionIndexOf,
   setBlockKind,
@@ -393,6 +396,91 @@ console.log('\n=== 7. 修订模式的插入与删除 ===')
   const hard = docFrom('abcdef')
   deleteRange(hard, 't0', 1, 3)
   eq('没有修订标记时是真删', plainText(findBlock(hard, 't0')), 'adef')
+}
+
+console.log('\n=== 7b. 接受 / 拒绝修订（resolveRevisions / hasRevisions / revisionSpanAt）===')
+{
+  const rev = (kind, id) => ({ kind, id, author: '张三', date: '2026-09-13T10:00:00.000Z' })
+  /** 'ab' + 插入的 'XY' + 'cdef'，再把 'a' 标成删除 —— 普通/插入/删除三段都在同一段里 */
+  const tracked = () => {
+    const model = docFrom('abcdef')
+    insertText(model, 't0', 2, 'XY', rev('ins', 1))
+    deleteRange(model, 't0', 0, 1, rev('del', 2))
+    return model
+  }
+  /** 本段（容器）。查询类函数吃容器，改模型的那一个吃 doc + 容器 id */
+  const seg = (model) => findBlock(model, 't0')
+  /** 一段里的 inline 形态，带修订的写成 `文字:kind`（看「标记去掉没有」最直观） */
+  const kindsOf = (model) =>
+    findBlock(model, 't0')
+      .inlines.map((i) => (i.rev ? `${i.text}:${i.rev.kind}` : i.text))
+      .join('|')
+
+  eq('夹具：删除、原文、插入三段挨着', kindsOf(tracked()), 'a:del|b|XY:ins|cdef')
+
+  eq(
+    '插入符落在删除修订里 → 给出整串',
+    JSON.stringify(revisionSpanAt(seg(tracked()), 0)),
+    '{"from":0,"to":1,"kind":"del"}',
+  )
+  eq(
+    '插入符落在插入修订里 → 给出整串',
+    JSON.stringify(revisionSpanAt(seg(tracked()), 3)),
+    '{"from":2,"to":4,"kind":"ins"}',
+  )
+  eq('插入符落在普通文字里 → 没有', revisionSpanAt(seg(tracked()), 5), null)
+  eq(
+    '插入符贴在插入修订末尾（点到字右半边）也算落在里面',
+    JSON.stringify(revisionSpanAt(seg(tracked()), 4)),
+    '{"from":2,"to":4,"kind":"ins"}',
+  )
+
+  // 连敲几个字 = 几个 inline（每笔一枚新 id），但它们是**同一处**修订，要归成一串
+  const typed = docFrom('ab')
+  insertText(typed, 't0', 2, 'X', rev('ins', 1))
+  insertText(typed, 't0', 3, 'Y', rev('ins', 2))
+  insertText(typed, 't0', 4, 'Z', rev('ins', 3))
+  eq('连敲三个字是三个 inline（各带一枚 id）', kindsOf(typed), 'ab|X:ins|Y:ins|Z:ins')
+  eq(
+    '但它们算同一串（点一下就能整段处理）',
+    JSON.stringify(revisionSpanAt(seg(typed), 3)),
+    '{"from":2,"to":5,"kind":"ins"}',
+  )
+
+  // hasRevisions：「接受/拒绝修订」按钮亮不亮就看它
+  const m1 = tracked()
+  eq('选区里有删除修订 → true', hasRevisions(seg(m1), 0, 1), true)
+  eq('选区只覆盖普通字 → false', hasRevisions(seg(m1), 4, 5), false)
+  eq('选区没盖到修订 → false', hasRevisions(seg(m1), 1, 2), false)
+  eq('插入符落在修订里 → true', hasRevisions(seg(m1), 3, 3), true)
+  eq('插入符不在修订里 → false', hasRevisions(seg(m1), 5, 5), false)
+
+  // 接受：删除修订连文字删掉、插入修订去掉标记留下文字
+  const acc = tracked()
+  eq('接受返回 true', resolveRevisions(acc, 't0', 0, 4, 'accept'), true)
+  eq('接受后：被删的字没了、插入的字留下且不再带标记', kindsOf(acc), 'b|XY|cdef')
+  eq('接受后再接受一次返回 false（已经没有修订了）', resolveRevisions(acc, 't0', 0, 5, 'accept'), false)
+
+  // 拒绝：插入修订连文字删掉、删除修订去掉标记留下文字 —— 正好回到原文
+  const rej = tracked()
+  eq('拒绝返回 true', resolveRevisions(rej, 't0', 0, 4, 'reject'), true)
+  eq('拒绝后：被删的字回来、插入的字没了', kindsOf(rej), 'a|b|cdef')
+  eq('拒绝后的文字就是原文', plainText(findBlock(rej, 't0')), 'abcdef')
+
+  // 只有插入符（没选中）时整串处理
+  eq('插入符在修订里时整串接受', resolveRevisions(typed, 't0', 3, 3, 'accept'), true)
+  eq('整串接受后文字一个不少、标记全消', kindsOf(typed), 'ab|X|Y|Z')
+
+  // 只选中修订的一半：只处理这一半，另一半仍是修订
+  const half = tracked()
+  eq('只选插入修订的一半也能处理', resolveRevisions(half, 't0', 2, 3, 'accept'), true)
+  eq('处理过的半个不再带标记、剩下一半还在', kindsOf(half), 'a:del|b|X|Y:ins|cdef')
+
+  // 批注锚点跨过修订：处理之后锚点必须仍成对（否则渲染会把余下文字吞进高亮里）
+  const withComment = tracked()
+  addComment(withComment, 't0', 0, 4, '这一段', '张三', '2026-09-13T10:00:00.000Z')
+  resolveRevisions(withComment, 't0', 2, 4, 'accept')
+  eq('接受修订后批注锚点仍成对', commentScopes(withComment).size, 1)
 }
 
 console.log('\n=== 8. setBlockKind / cloneDoc / 往返 ===')

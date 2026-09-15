@@ -210,7 +210,13 @@ await server.listen()
 const url = server.resolvedUrls?.local?.[0] ?? `http://localhost:${PORT}/`
 console.log(`dev server: ${url}`)
 
-async function openApp() {
+/**
+ * 打开应用。
+ *
+ * `tabLabel` 给了就顺手切到那一页：功能区的页内容是按 tab 用 v-if 渲染的，
+ * 重新载入后默认停在「开始」页 —— 要验别的页里的控件，就得先切过去。
+ */
+async function openApp(tabLabel) {
   await page.goto(url, { waitUntil: 'load' })
   await page.waitForSelector('.wtp-page', { timeout: 30000 })
   await page.evaluate(async () => {
@@ -221,6 +227,7 @@ async function openApp() {
     normal: SEARCH_HIGHLIGHT,
     current: SEARCH_CURRENT_HIGHLIGHT,
   })
+  if (tabLabel) await openTab(tabLabel)
 }
 
 const getModel = () => page.evaluate(() => window.__wtpPaper.getModel())
@@ -230,6 +237,19 @@ const textOfBlock = (block) =>
     .filter((i) => i.t === 'text')
     .map((i) => i.text)
     .join('')
+
+/**
+ * 切功能区的标签页（开始 / 插入 / 布局 / 表格）。
+ *
+ * 四页常驻在标签条上，但页内容是按 tab 的 v-if 出现的 —— 要验某一页里的控件，
+ * 必须先切过去。标签按钮是 @mousedown.prevent（焦点不离开正文），所以切页不会丢选区。
+ */
+async function openTab(label) {
+  const tabButton = page.locator('.ribbon-tab', { hasText: label })
+  if ((await tabButton.count()) === 0) throw new Error(`功能区里没有「${label}」这一页`)
+  await tabButton.first().click()
+  await page.waitForTimeout(80)
+}
 
 /**
  * 按模型的「可搜索文字」数一处查询出现几次 —— 期望值从模型推导，不从界面反推。
@@ -503,7 +523,7 @@ try {
 
   await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
   await page.waitForTimeout(60)
-  await page.click('.swatch[title="红"]')
+  await page.click('.swatch[title="标红"]')
   await page.waitForTimeout(150)
   const colored = await getModel()
   const colorBlock = heroBlocks(colored).find((b) => textOfBlock(b).startsWith('我方'))
@@ -555,9 +575,77 @@ try {
   )
   ok('版面上那两个字带了删除线', delDom.some((t) => (t ?? '').includes('苏州')), JSON.stringify(delDom))
 
+  // 接受 / 拒绝修订：按钮常驻在「开始」页，选区里没有修订就置灰。
+  // 目标认「（修订新增）」那一块 —— 样本自己还带一处 ins 一处 del，所以不能按全篇数。
+  const revBlock = (model) => heroBlocks(model).find((b) => textOfBlock(b).includes('（修订新增）'))
+  const countRev = (model, kind) =>
+    (revBlock(model)?.inlines ?? []).filter((i) => i.t === 'text' && i.rev?.kind === kind).length
+  /**
+   * 目标块**之外**那些修订（样本自带的 ins / del）的条数 —— 「别处一个都没动」要按这个比：
+   * 拒绝/接受本来就该把目标块里的那一条去掉，拿全篇总数比是错的。
+   */
+  const otherRevCounts = (model) => {
+    const inlines = heroBlocks(model)
+      .filter((b) => b !== revBlock(model))
+      .flatMap((b) => b.inlines)
+    return {
+      ins: inlines.filter((i) => i.t === 'text' && i.rev?.kind === 'ins').length,
+      del: inlines.filter((i) => i.t === 'text' && i.rev?.kind === 'del').length,
+    }
+  }
+  const acceptBtn = page.locator('.panel-start button.tool[title^="接受"]')
+  const rejectBtn = page.locator('.panel-start button.tool[title^="拒绝"]')
+  const revTextBefore = textOfBlock(revBlock(deleted) ?? { inlines: [] })
+  eq(
+    '目标块里删除修订一处、插入修订一处',
+    `${countRev(deleted, 'del')}/${countRev(deleted, 'ins')}`,
+    '1/1',
+  )
+
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(150)
+  eq('光标不在修订上时「接受修订」置灰', await acceptBtn.isDisabled(), true)
+  eq('光标不在修订上时「拒绝修订」置灰', await rejectBtn.isDisabled(), true)
+
+  // 光标停在修订串末尾也算「落在修订上」：点到修订字的右半边不该看到按钮变灰
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(150)
+  eq('光标贴在插入修订末尾时按钮可用', await rejectBtn.isDisabled(), false)
+
+  // 拒绝删除修订：被删的字回来（标记去掉、文字留下）；别处的修订一个都不许动
+  await page.evaluate(() => window.__wtpTest.selectIn('苏州市公安局', 0, 2))
+  await page.waitForTimeout(120)
+  const revsBeforeReject = otherRevCounts(await getModel())
+  await rejectBtn.click()
+  await page.waitForTimeout(250)
+  const rejected = await getModel()
+  eq('拒绝删除修订后那一处不再带 del 标记', countRev(rejected, 'del'), 0)
+  eq('拒绝后插入修订没被动到（同一块里另一处仍在）', countRev(rejected, 'ins'), 1)
+  eq('拒绝删除修订后文字原样留在原处', textOfBlock(revBlock(rejected) ?? { inlines: [] }), revTextBefore)
+  eq(
+    '别处的修订一个都没动',
+    JSON.stringify(otherRevCounts(rejected)),
+    JSON.stringify(revsBeforeReject),
+  )
+
+  // 接受插入修订：新增的文字留下、标记去掉；处理完按钮自己变灰
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(120)
+  await acceptBtn.click()
+  await page.waitForTimeout(250)
+  const accepted = await getModel()
+  eq('接受插入修订后 ins 标记没了', countRev(accepted, 'ins'), 0)
+  eq('接受插入修订后文字一个不少', textOfBlock(revBlock(accepted) ?? { inlines: [] }), revTextBefore)
+  eq('处理完之后（光标处已无修订）「接受修订」又置灰', await acceptBtn.isDisabled(), true)
+
+  // 撤销要能还原这一步（记的是「改之前」的模型）
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  eq('Ctrl+Z 把接受掉的修订还原回来', countRev(await getModel(), 'ins'), 1)
+
   /* ------------------------------------------------------------------ */
   console.log('\n=== H. 批注：选中 → 写内容 → 侧栏出现 ===')
-  await openApp()
+  await openApp('插入')
   const commentsBefore = (await getModel()).comments.length
   const sidebarBefore = await page.evaluate(
     () => document.querySelectorAll('.wtp-comments li .wtp-comment-item').length,
@@ -613,7 +701,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== H2. 点批注框时选中的底色还在（Custom Highlight 续命）===')
-  await openApp()
+  await openApp('插入')
   await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
   await page.waitForTimeout(80)
   await page.click('.comment-field input')
@@ -641,7 +729,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== H3. 批注能改、能删 ===')
-  await openApp()
+  await openApp('插入')
   await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
   await page.waitForTimeout(80)
   await page.click('.comment-field input')
@@ -678,7 +766,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== H4. 分页符 / 分节符：按钮插入，页间看得见 ===')
-  await openApp()
+  await openApp('插入')
   const breaksBefore = await page.evaluate(() => ({
     pages: document.querySelectorAll('.wtp-page').length,
     marks: document.querySelectorAll('.wtp-break').length,
@@ -744,7 +832,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== H5. 分页符 + 分节符连在一起：两枚标记都要看得见 ===')
-  await openApp()
+  await openApp('插入')
   const beforeBoth = await page.evaluate(
     () => document.querySelectorAll('.wtp-page').length,
   )
@@ -798,7 +886,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== H6. 文末插分节符：Word 会多留一张空白页 ===')
-  await openApp()
+  await openApp('插入')
   const beforeTail = await page.evaluate(() => {
     const pages = Array.from(document.querySelectorAll('.wtp-page'))
     const last = pages[pages.length - 1]
@@ -1020,25 +1108,30 @@ try {
   await checkNoOverflow('L 金额格式化后')
 
   /* ------------------------------------------------------------------ */
-  console.log('\n=== M. 工具栏：插入三种特殊空格（模型里是确切码点） ===')
-  await openApp()
-  /** 走真实的下拉 change（焦点会离开正文，靠选区/落点记录回退） */
+  console.log('\n=== M. 工具栏：插入三种特殊空格（并排按钮，模型里是确切码点） ===')
+  // 三枚空格按钮在「插入」页里
+  await openApp('插入')
+  const SPACE_TITLE = {
+    em: '在插入符处插入全宽空格',
+    en: '在插入符处插入半宽空格',
+    quarterEm: '在插入符处插入四分之一宽空格',
+  }
+  const spaceButton = (kind) =>
+    page.locator(`.panel-insert button.tool[title^="${SPACE_TITLE[kind]}"]`)
+  /** 点按钮插入。按钮是 @mousedown.prevent：焦点不离开正文，走实时选区那条路 */
   async function pickSpace(kind) {
-    await page.selectOption('.toolbar select', kind)
+    await spaceButton(kind).click()
     await page.waitForTimeout(250)
   }
-  /** 直接在正文里改下拉值触发 change（焦点不动，走实时选区那条路） */
-  async function fireSpaceChange(kind) {
-    await page.evaluate((k) => {
-      const sel = document.querySelector('.toolbar select')
-      sel.value = k
-      sel.dispatchEvent(new Event('change', { bubbles: true }))
-    }, kind)
+  /** 先把焦点移出正文再点按钮（真人先点了别处的典型路径）：考选区/落点记录的兜底 */
+  async function pickSpaceBlurred(kind) {
+    await page.evaluate(() => document.activeElement?.blur?.())
+    await spaceButton(kind).click()
     await page.waitForTimeout(250)
   }
 
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
-  await fireSpaceChange('em')
+  await pickSpace('em')
   const emModel = await getModel()
   const emBlock = heroBlocks(emModel).find((b) => textOfBlock(b).includes('\u2003'))
   ok('模型里插入了 U+2003（全宽空格）', emBlock !== undefined, JSON.stringify(heroBlocks(emModel).map(textOfBlock)))
@@ -1060,11 +1153,11 @@ try {
   })
   ok('版面上也读得到这个码点', domHasEm !== null && domHasEm.includes('\u2003'), JSON.stringify(domHasEm))
 
-  // 另外两个：半宽与四分之一宽。这次走真实下拉（焦点被拿走，考的是选区/落点记录的兜底）
+  // 另外两个：半宽与四分之一宽。这次先把焦点移出正文（考选区/落点记录的兜底）
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
-  await pickSpace('en')
+  await pickSpaceBlurred('en')
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
-  await pickSpace('quarterEm')
+  await pickSpaceBlurred('quarterEm')
   const spacesModel = await getModel()
   const spacesBlock = heroBlocks(spacesModel).find((b) => textOfBlock(b).includes('\u2002'))
   const points = spacesBlock ? Array.from(textOfBlock(spacesBlock)).map((c) => c.codePointAt(0)) : []
@@ -1075,13 +1168,22 @@ try {
     : false, JSON.stringify(textOfBlock(spacesBlock)))
   ok('普通空格没有混进来', !points.includes(0x20), JSON.stringify(points))
 
-  // 下拉必须复位回占位项，否则再选同一项不会再触发 change
-  eq('下拉复位回占位项', await page.evaluate(() => document.querySelector('.toolbar select').value), '')
+  // 连点同一枚按钮两次必须插两个 —— 三枚并排按钮换掉那个下拉就是为了这个：
+  // 下拉选完要复位回占位项才认第二次 change，否则「再选同一项」是静默的
+  await pickSpace('em')
+  await pickSpace('em')
+  const twiceModel = await getModel()
+  const twiceBlock = heroBlocks(twiceModel).find((b) => textOfBlock(b).includes('\u2003'))
+  ok(
+    '连点两次同一枚空格按钮，插入两个',
+    twiceBlock ? textOfBlock(twiceBlock).endsWith('\u2003\u2002\u2005\u2003\u2003') : false,
+    JSON.stringify(twiceBlock ? textOfBlock(twiceBlock) : null),
+  )
 
   // 有选区时替换选区（与 insertText / replaceRange 的既有语义一致）
   await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
   await page.waitForTimeout(60)
-  await fireSpaceChange('en')
+  await pickSpace('en')
   const replaced = await getModel()
   const replacedBlock = heroBlocks(replaced).find((b) => textOfBlock(b).includes('于2026年9月1日'))
   ok(
@@ -1094,7 +1196,7 @@ try {
   await checkNoOverflow('M 插特殊空格后')
 
   // 还没在版面上放过插入符：既不该改模型，也该给一句提示
-  await openApp()
+  await openApp('插入')
   const beforeNoCaret = JSON.stringify(await getModel())
   await pickSpace('em')
   eq('没有插入符时不改模型', JSON.stringify(await getModel()), beforeNoCaret)
@@ -1196,13 +1298,15 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== O. 打印：只出 A4 纸，且不多不少 ===')
-  await openApp()
+  // 「插入表格」按钮在「插入」页里
+  await openApp('插入')
   // 打开查找面板：打印时它和导航窗格都必须一起消失。
-  // 落点放进表格格子里 —— 上下文工具条（.sub-toolbar）只在格内出现，打印时它也必须一起消失。
+  // 落点放进表格格子里 —— 表格页里的控件要光标在格内才启用，打印时它们也必须一起消失。
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.keyboard.press('Control+f')
   await page.waitForSelector('.search-panel', { timeout: 3000 })
-  // 插入表格面板也要一起验：它和查找面板一样是浮层，打印时同样不该出现
+  // 插入表格面板也要一起验：它和查找面板一样是浮层（挂在预览窗格上，切页不会把它关掉），
+  // 打印时同样不该出现
   await page.locator('button.tool[title^="在光标所在段落后插入一张空表格"]').click()
   await page.waitForSelector('.table-panel', { timeout: 3000 })
 
@@ -1211,6 +1315,7 @@ try {
     page.evaluate(() => {
       const sels = [
         '.bar',
+        '.ribbon-tabs',
         '.styles',
         '.toolbar',
         '.sub-toolbar',
@@ -1238,6 +1343,13 @@ try {
       out.boxShadow = first ? getComputedStyle(first).boxShadow : 'missing'
       return out
     })
+
+  /** 当前媒体下某个选择器的 display（不存在给 'missing'，别把「没有」当成「隐藏了」） */
+  const displayOf = (sel) =>
+    page.evaluate((s) => {
+      const el = document.querySelector(s)
+      return el ? getComputedStyle(el).display : 'missing'
+    }, sel)
 
   // @page：尺寸来自规格表，边距归 0（白边由纸张自己的 padding 提供，不能留两份）
   const pageRules = () =>
@@ -1267,10 +1379,7 @@ try {
   // 那时元素不存在，给的是 'missing' 而不是 'none'，下面那个源码视图的循环因此不带它
   for (const sel of [
     '.bar',
-    '.styles',
-    '.toolbar',
-    '.sub-toolbar',
-    '.section-toolbar',
+    '.ribbon-tabs',
     '.wtp-comments',
     '.wtp-measure-root',
     '.wtp-break',
@@ -1279,6 +1388,23 @@ try {
     '.table-panel',
   ]) {
     eq(`打印时隐藏 ${sel}`, printEdit[sel], 'none')
+  }
+  /*
+   * 功能区的四页外壳：页内容是按 tab 用 v-if 渲染的，同时只有一页在 DOM 里，
+   * 所以得逐页切过去、逐页验（只看某一个 .toolbar 会把另外三页漏掉）。
+   * 切页前先切回 screen —— 打印媒体下标签条自己就是 display:none，点不动。
+   */
+  for (const [label, panel] of [
+    ['开始', '.panel-start'],
+    ['插入', '.panel-insert'],
+    ['布局', '.panel-layout'],
+    ['表格', '.panel-table'],
+  ]) {
+    await page.emulateMedia({ media: 'screen' })
+    await openTab(label)
+    await page.emulateMedia({ media: 'print' })
+    eq(`打印时隐藏「${label}」页`, await displayOf(panel), 'none')
+    if (label === '开始') eq('打印时隐藏样式库', await displayOf('.styles'), 'none')
   }
   eq('第一张纸前面不再断页', printEdit.firstBreak, 'auto')
   eq('后续每张纸都在新的一页开始', printEdit.secondBreak, 'page')
@@ -1687,7 +1813,8 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== U. 插入表格面板：选规格后按规格插入，Esc 只关面板 ===')
-  await openApp()
+  // 「插入表格」按钮在「插入」页里（功能区四页各管各的）
+  await openApp('插入')
   const tableIds = async () =>
     (await getModel()).blocks.filter((b) => b.t === 'table').map((b) => b.id)
   const beforeU = await tableIds()
@@ -1792,19 +1919,26 @@ try {
       min2: document.querySelectorAll('.wtp-table.wtp-table-min2').length,
       min1: document.querySelectorAll('.wtp-table.wtp-table-min1').length,
     }))
-  // W5 起编辑模式常驻一条「节」工具条，它也在 .sub-toolbar 上（共用外观）；
-  // 表格那一条靠 :not(.section-toolbar) 排掉，否则下面的 count()===0 会永远不成立
-  const subToolbar = page.locator('.sub-toolbar:not(.section-toolbar)')
+  // 表格页常驻（不随光标进出表格出现/消失），按 .table-toolbar 定位；
+  // 光标不在格子里时它给一句提示并置灰全部按钮
+  const subToolbar = page.locator('.table-toolbar')
+  const subHint = page.locator('.table-toolbar .tk-empty')
   const subButton = (name) => subToolbar.getByRole('button', { name, exact: true })
-  /** 上下文工具条里某个 radio 组里的一个选项（组按左边的标签文字定位，避免「有/无」重名） */
+  /** 表格页里某个 radio 组里的一个选项（组按左边的标签文字定位，避免「有/无」重名） */
   const subRadio = (group, name) =>
     subToolbar.locator('.tk-group', { hasText: group }).getByRole('radio', { name, exact: true })
 
-  // ---- V1. 工具条的出现/消失 + 下方插入行 ----
-  await openApp()
+  // ---- V1. 工具条常驻、按钮随光标进出表格启用/置灰 + 下方插入行 ----
+  await openApp('表格')
+  // 光标还没进格子：工具条就在（宽度不跳），按钮全灰 + 一句提示
+  eq('光标不在表格里时工具条仍在（常驻）', await subToolbar.count(), 1)
+  eq('光标不在表格里时给一句提示', await subHint.count(), 1)
+  ok('光标不在表格里时按钮置灰', await subButton('下方插入行').isDisabled())
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.waitForTimeout(200)
-  eq('光标进表格后上下文工具条出现', await subToolbar.count(), 1)
+  eq('光标进表格后工具条仍在（常驻，不随光标出现/消失）', await subToolbar.count(), 1)
+  eq('光标进表格后提示收起', await subHint.count(), 0)
+  ok('光标进表格后按钮可用', (await subButton('下方插入行').isDisabled()) === false)
   ok(
     '工具条显示落点（行/列都是下标，显示时 +1）',
     (await subToolbar.innerText()).includes('第 3 行第 1 列'),
@@ -1812,7 +1946,9 @@ try {
   )
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
   await page.waitForTimeout(200)
-  eq('光标离开表格后工具条消失', await subToolbar.count(), 0)
+  eq('光标离开表格后工具条不消失（常驻）', await subToolbar.count(), 1)
+  eq('光标离开表格后提示回来', await subHint.count(), 1)
+  ok('光标离开表格后按钮又置灰', await subButton('下方插入行').isDisabled())
 
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.waitForTimeout(200)
@@ -1833,7 +1969,7 @@ try {
   await checkNoOverflow('V1 下方插入行后')
 
   // ---- V2. 删除列到最后一列 → 按钮禁用 ----
-  await openApp()
+  await openApp('表格')
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.waitForTimeout(200)
   const deleteCol = subButton('删除列')
@@ -1851,7 +1987,7 @@ try {
   await checkNoOverflow('V2 删除列后')
 
   // ---- V3. 两个 radio：行高 2↔1、表头行有/无 ----
-  await openApp()
+  await openApp('表格')
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
   await page.waitForTimeout(200)
   const domMinBefore = await tableDom()
@@ -1907,7 +2043,7 @@ try {
   await checkNoOverflow('V3 radio 切换后')
 
   // ---- V4. 格内 Shift+Enter：插入符落在换行之后 ----
-  await openApp()
+  await openApp('表格')
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('检测仪器'))
   await page.waitForTimeout(200)
   await page.keyboard.press('Shift+Enter')
@@ -1932,7 +2068,7 @@ try {
   await checkNoOverflow('V4 Shift+Enter 后')
 
   // ---- V5. 边界护栏：格首 Backspace、格尾 Delete 都不许动模型/DOM ----
-  await openApp()
+  await openApp('表格')
   const guardDom = await tableDom()
   const guardTable = await modelTable()
   await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 0))
@@ -1976,7 +2112,7 @@ try {
     }, group)
 
   // ---- W1. Tab / Shift+Tab 行优先跨格；最后一格 Tab 无响应 ----
-  await openApp()
+  await openApp('表格')
   const wTable = await modelTable()
   const wId = wTable?.id ?? ''
   ok('样本表 id 可用', wId !== '', wId)
@@ -2016,7 +2152,7 @@ try {
   await checkNoOverflow('W1 Tab 跨格后')
 
   // ---- W2. ← / → 在格首 / 格尾跨格；格内中间不接管 ----
-  await openApp()
+  await openApp('表格')
   await page.evaluate(() => window.__wtpTest.setCaret('数控加工中心', 0))
   await page.waitForTimeout(200)
   await page.keyboard.press('ArrowLeft')
@@ -2043,7 +2179,7 @@ try {
   await checkNoOverflow('W2 方向键后')
 
   // ---- W3. 删除整张表（不二次确认）----
-  await openApp()
+  await openApp('表格')
   const delBefore = await getModel()
   const delIndex = delBefore.blocks.findIndex((b) => b.t === 'table')
   const prevBlock = delBefore.blocks[delIndex - 1]
@@ -2060,14 +2196,16 @@ try {
     delBefore.blocks.filter((b) => b.t === 'table').length - 1,
   )
   eq('DOM 里不再有 .wtp-tableFrag', await page.evaluate(() => document.querySelectorAll('.wtp-tableFrag').length), 0)
-  eq('工具条随光标离开表格而收起', await subToolbar.count(), 0)
+  eq('表格页仍常驻（按钮置灰）', await subToolbar.count(), 1)
+  eq('光标离开表格后提示回来（删表后）', await subHint.count(), 1)
   const delCaret = await page.evaluate(() => window.__wtpTest.caretInfo())
   eq('插入符落在上一块（块 id）', delCaret?.blockId, prevBlock.id)
   eq('插入符落在上一块末尾（偏移 = 该块文字长度）', delCaret?.offset, prevText.length)
   await checkNoOverflow('W3 删除表格后')
 
   // ---- W4. 光标在格内点样式 chip → 只有该格换样式 ----
-  await openApp()
+  // 样式库在「开始」页里，所以这一小节要的是开始页（不是表格页）
+  await openApp('开始')
   const chipBefore = await modelTable()
   const kindsBefore = chipBefore.rows.map((r) => r.cells.map((c) => c.kind ?? null))
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
@@ -2110,7 +2248,7 @@ try {
   await checkNoOverflow('W4 格内换样式后')
 
   // ---- W5. 两组对齐：active 态、写进 DOM 的行内样式、只作用于该格 ----
-  await openApp()
+  await openApp('表格')
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('单位：元'))
   await page.waitForTimeout(200)
   eq('unit 行默认右对齐 → 水平组高亮「右」', (await activeLabels('水平')).join(','), '右')
@@ -2172,7 +2310,7 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log('\n=== S. 「节」工具条（W5）：回显 / 置灰 / 改方向与页码 ===')
-  await openApp()
+  await openApp('布局')
   // 编辑模式常驻：节工具条与表格工具条同在一层，但节这条永远在
   const secToolbar = page.locator('.section-toolbar')
   const secRadio = (group, name) =>
@@ -2605,6 +2743,176 @@ try {
     heroBlocks(xBeforePaste).length - 1,
   )
   await checkDomMatchesModel('X7 粘贴替换跨段选区后：版面文字 = 模型文字')
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== Y. 功能区标签页：四页常驻、各页各管一摊、切页不丢选区 ===')
+  await openApp()
+  /** 当前在 DOM 里的页（页内容是 v-if，同一时刻只有一页） */
+  const panelPresence = () =>
+    page.evaluate(() =>
+      ['.panel-start', '.panel-insert', '.panel-layout', '.panel-table'].filter(
+        (s) => document.querySelector(s) !== null,
+      ),
+    )
+  /** 预览区上边缘的 y —— 功能区一换高，它就会跳 */
+  const canvasTop = () =>
+    page.evaluate(() =>
+      Math.round(document.querySelector('.canvas').getBoundingClientRect().top),
+    )
+
+  eq('功能区有四枚标签', await page.locator('.ribbon-tab').count(), 4)
+  eq(
+    '标签就是「开始 / 插入 / 布局 / 表格」',
+    (await page.locator('.ribbon-tab').allInnerTexts()).join('|'),
+    '开始|插入|布局|表格',
+  )
+  eq('默认停在「开始」页', (await page.locator('.ribbon-tab.is-on').innerText()).trim(), '开始')
+  eq('只有「开始」页在 DOM 里', (await panelPresence()).join(','), '.panel-start')
+
+  // 「开始」页该有什么：撤销/重做、加粗/下划线、红与取消颜色、接受/拒绝修订、样式库
+  eq(
+    '开始页有加粗与下划线',
+    await page.locator('.panel-start button.tool[title^="加粗"], .panel-start button.tool[title^="下划线"]').count(),
+    2,
+  )
+  eq(
+    '开始页有撤销与重做',
+    await page.locator('.panel-start button.tool[title^="撤销"], .panel-start button.tool[title^="重做"]').count(),
+    2,
+  )
+  eq('颜色只剩「红」与「取消颜色」两枚', await page.locator('.panel-start .swatch').count(), 2)
+  eq(
+    '红色色块就是 FF0000',
+    await page.locator('.panel-start .swatch[title="标红"]').evaluate((el) => el.style.background),
+    'rgb(255, 0, 0)',
+  )
+  eq(
+    '开始页有接受/拒绝修订',
+    await page.locator('.panel-start button.tool[title^="接受"], .panel-start button.tool[title^="拒绝"]').count(),
+    2,
+  )
+  ok('样式库在「开始」页里', (await page.locator('.panel-start .styles .style-chip').count()) >= 5)
+
+  // 「插入」页：三枚特殊空格并排 + 表格/分节符/分页符 + 批注；加粗这类留在开始页
+  await openTab('插入')
+  eq('切到「插入」页后只剩插入页在 DOM 里', (await panelPresence()).join(','), '.panel-insert')
+  eq(
+    '插入页三枚特殊空格并排（不再是下拉）',
+    await page.locator('.panel-insert button.tool[title^="在插入符处插入"]').count(),
+    3,
+  )
+  eq('插入页里没有下拉框', await page.locator('.panel-insert select').count(), 0)
+  eq(
+    '插入页有表格 / 分节符 / 分页符',
+    await page.locator('.panel-insert button.tool[title^="在光标所在段落后插入"]').count(),
+    3,
+  )
+  eq(
+    '插入页有批注输入框与「添加」',
+    `${await page.locator('.panel-insert .comment-field input').count()}/${await page.locator('.panel-insert .comment-field button').count()}`,
+    '1/1',
+  )
+  eq('插入页里没有加粗（各页各管一摊，不是全堆在一条栏上）', await page.locator('.panel-insert button.tool[title^="加粗"]').count(), 0)
+
+  await openTab('布局')
+  eq('切到「布局」页后只剩布局页在 DOM 里', (await panelPresence()).join(','), '.panel-layout')
+  // 节控件的回显跟着落点走：先把插入符放进正文（「节工具条只在光标落进正文之后才出内容」
+  // 是 HEAD 上就红着的既有问题，见 PLAN 第 11 节 ⑤，不在本次改动范围里）
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(200)
+  eq('布局页就是节编辑（有节号提示）', await page.locator('.panel-layout .tk-hint').count(), 1)
+  eq('布局页里有四组节控件', await page.locator('.panel-layout .tk-group').count(), 4)
+
+  await openTab('表格')
+  eq('切到「表格」页后只剩表格页在 DOM 里', (await panelPresence()).join(','), '.panel-table')
+  eq('光标不在格子里时表格页也在（常驻）', await page.locator('.panel-table').count(), 1)
+  eq('光标不在格子里时给一句提示', await page.locator('.panel-table .tk-empty').count(), 1)
+  ok(
+    '光标不在格子里时表格页按钮全灰',
+    await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('.panel-table button'))
+      return btns.length > 0 && btns.every((b) => b.disabled)
+    }),
+  )
+
+  // 这就是拆标签页要解决的问题：光标进出表格时，下面那摞纸不许跳
+  const topOutsideTable = await canvasTop()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(250)
+  eq('光标进表格后版面不上移也不下移', await canvasTop(), topOutsideTable)
+  eq('光标进表格后提示收起', await page.locator('.panel-table .tk-empty').count(), 0)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(250)
+  eq('光标离开表格后版面照样不动', await canvasTop(), topOutsideTable)
+
+  /* ------------------------------------------------------------------ */
+  console.log('\n=== Z. 格内垂直对齐：最小两行 + 单行文字时也要真的生效 ===')
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(250)
+  /**
+   * 目标格的几何：格高（=最小行数×行高）、格内那层 div 的高度（一行文字的自然高）、
+   * 以及文字顶端相对格子顶端的偏移 —— 垂直对齐到底有没有生效，就只看最后这个数。
+   */
+  const cellMetrics = () =>
+    page.evaluate(() => {
+      const cell = Array.from(
+        document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'),
+      ).find((el) => (el.textContent ?? '').includes('数控加工中心'))
+      const td = cell?.closest('td')
+      if (!cell || !td) return null
+      const tdBox = td.getBoundingClientRect()
+      const range = document.createRange()
+      range.selectNodeContents(cell)
+      const text = range.getClientRects()[0]
+      return {
+        tdHeight: Math.round(tdBox.height),
+        cellHeight: Math.round(cell.getBoundingClientRect().height),
+        textOffset: text ? Math.round(text.top - tdBox.top) : -1,
+      }
+    })
+  const vAlignButton = (name) =>
+    page.locator('.panel-table .tk-group', { hasText: '垂直' }).getByRole('button', {
+      name,
+      exact: true,
+    })
+
+  const atTop = await cellMetrics()
+  ok('目标格是两行高（最小两行），格内文字只有一行', atTop !== null && atTop.tdHeight > atTop.cellHeight + 8, JSON.stringify(atTop))
+  ok('默认顶端对齐时文字贴着格子上沿', atTop.textOffset >= 0 && atTop.textOffset <= 2, JSON.stringify(atTop))
+
+  await vAlignButton('居中').click()
+  await page.waitForTimeout(300)
+  const atMiddle = await cellMetrics()
+  ok(
+    '改成居中对齐后文字真的下移了（旧写法在这里一动不动）',
+    atMiddle.textOffset > atTop.textOffset + 4,
+    `${JSON.stringify(atTop)} → ${JSON.stringify(atMiddle)}`,
+  )
+  ok(
+    '居中的偏移约等于（格高 − 文字高）/ 2',
+    Math.abs(atMiddle.textOffset - (atMiddle.tdHeight - atMiddle.cellHeight) / 2) <= 2,
+    JSON.stringify(atMiddle),
+  )
+
+  await vAlignButton('底端').click()
+  await page.waitForTimeout(300)
+  const atBottom = await cellMetrics()
+  ok(
+    '改成底端对齐后文字比居中时更低',
+    atBottom.textOffset > atMiddle.textOffset + 4,
+    `${JSON.stringify(atMiddle)} → ${JSON.stringify(atBottom)}`,
+  )
+  ok(
+    '底端的偏移约等于 格高 − 文字高',
+    Math.abs(atBottom.textOffset - (atBottom.tdHeight - atBottom.cellHeight)) <= 2,
+    JSON.stringify(atBottom),
+  )
+  // 行高没变（下限写在 td 的 height 上，不是靠格内 div 撑高）—— 分页因此不受影响
+  eq('三档对齐都不改格高', `${atTop.tdHeight}/${atMiddle.tdHeight}/${atBottom.tdHeight}`, `${atTop.tdHeight}/${atTop.tdHeight}/${atTop.tdHeight}`)
+  await vAlignButton('顶端').click()
+  await page.waitForTimeout(250)
+  eq('点回顶端后偏移回到 0 附近', (await cellMetrics()).textOffset <= 2, true)
 } finally {
   await browser?.close()
   await server.close()
@@ -2620,9 +2928,12 @@ console.log(
   '[PASS] 编辑层实测：输入不重排不丢插入符、回车/退格、加粗/下划线/改色、修订、批注、撤销、' +
     '金额格式、特殊空格、切文件模板、打印（含新增对齐/删表按钮的隐藏、两档命名 @page）、查找替换（面板/高亮/范围/替换一处与全部）、' +
     '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）、' +
-    '表格编辑交互（上下文工具条与落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
+    '表格编辑交互（表格页常驻与置灰规则、落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
     '格首 Backspace 与格尾 Delete 护栏）、表格收尾（Tab/Shift+Tab 与 ←/→ 跨格、最后一格 Tab 无响应、' +
     '删除整表后插入符落上一块末尾、格内点样式 chip 只改那一格、两组对齐的 active 态与行内样式、对齐不改页数）、' +
     '节工具条（常驻、节号回显、首节与「关联前节=是」的置灰、改方向后逐页几何横竖互换且页数不变、' +
-    '关页码后该节不再有页码元素而别的节不受影响、默认值不落模型字段）均落到模型。',
+    '关页码后该节不再有页码元素而别的节不受影响、默认值不落模型字段）、' +
+    '接受/拒绝修订（无修订时置灰、拒绝删除修订、接受插入修订、撤销能还原）、' +
+    '功能区标签页（四页常驻、各页各管一摊、光标进出表格时版面不跳）、' +
+    '格内垂直对齐（最小两行 + 单行文字时三档真的生效，且不改格高）均落到模型。',
 )
