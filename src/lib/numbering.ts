@@ -41,6 +41,9 @@ export function numberingPrefix(style: NumberingStyle, n: number): string {
       return `（${chineseNum(n)}）`
     case 'arabicDot':
       return `${n}、`
+    // GB/T 9704 三级标题的写法：半角句点 + 一个空格（「1. 」，句点后的空格是编号的一部分）
+    case 'arabicPeriodSpace':
+      return `${n}. `
     case 'none':
       return ''
   }
@@ -82,7 +85,8 @@ export function computeNumbering(
 
 const H1_NUM_RE = /^\s*(?:[一二三四五六七八九十百零]+、)\s*/
 const H2_NUM_RE = /^\s*（[一二三四五六七八九十百零]+）\s*/
-const H3_NUM_RE = /^\s*\d+、\s*/
+// h3 的编号有两种写法：管理人文件的「1、」与简易公文格式的「1. 」，两种都要剥
+const H3_NUM_RE = /^\s*\d+[、.]\s*/
 
 /**
  * 导入 docx 时剥掉段首已有的编号，避免重新编号后出现「一、一、」。

@@ -1366,7 +1366,7 @@ function onKeydown(event: KeyboardEvent): void {
         setBlockKind('h1')
         break
       case 'styleH2':
-        setBlockKind('h1')
+        setBlockKind('h2')
         break
       case 'styleH3':
         setBlockKind('h3')

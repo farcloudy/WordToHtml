@@ -138,7 +138,7 @@ const editor = ref<InstanceType<typeof WtpEditor> | null>(null)
 /**
  * 演示「props → 组件 → emits」这条回路的落地：把组件回传的值攒到一个浏览器脚本读得到的
  * 地方（验收脚本靠它验受控回写与 `save_*`）。真实使用方直接把自己的状态绑上去即可，
- * 不必这么写 —— 见 README「组件用法」。
+ * 不必这么写 —— 见 PLAN.md 的「组件接口」。
  */
 const probe = {
   fileName: fileName.value,

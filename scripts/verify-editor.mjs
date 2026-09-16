@@ -1019,7 +1019,7 @@ try {
   await page.waitForTimeout(150)
   eq('再按一次关掉', await page.isChecked(trackSel), false)
   // 换个没有任何修订标记的段落敲字：在刚被标成 ins 的字后面接着敲，
-  // 读回时新字会并进那个 ins 区间（DOM 上下文继承，见 README 的已知取舍）
+  // 读回时新字会并进那个 ins 区间（DOM 上下文继承，见 PLAN.md 第 8 节第 18 条）
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
   await page.keyboard.insertText('（关闭后新增）')
   await page.waitForTimeout(250)

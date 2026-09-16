@@ -119,9 +119,11 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    * 那条规则提供（1 行高）。两行的高度是「整张表的装饰」而不是内容，
    * 跟着行高设置一起变高只会白白把表格撑长（导出侧同一条规则，见 docx/export.ts 的 rowHeight）。
    *
-   * 另有一处已知偏差（PLAN 6.8）：列表段落样式的 CSS line-height 是固定值 12pt，
-   * 而 Word 的 atLeast 12pt 是「不小于」。单行格两者相同（minLines=2 → 24pt），
-   * 多行格（内容撑高）可能差零点几磅。
+   * atLeast 行距在预览里也写成固定值（CSS 的 line-height 只有固定值与 normal 两种），
+   * 而 Word 的「最小值」是「不小于」：实际行高取 max(linePt, 字体自然行高)。两套模板的列表系列
+   * 取值刻意取成「该字号的自然行高」（10.5pt → 12pt、14pt → 16pt；仿宋/黑体/楷体的自然行高
+   * 倍数都是 1.1406 = 292/256），所以两边最多差 0.03pt。换字号或改这两个值时要把这层对上
+   * （见 PLAN 第 5 节）。
    */
   out.push(
     `.${ns}-table { width: 100%; table-layout: fixed; border-collapse: collapse; }`,

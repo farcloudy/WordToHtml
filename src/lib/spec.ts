@@ -54,7 +54,12 @@ export type LineRule = 'exact' | 'atLeast' | 'auto'
 export type Align = 'left' | 'center' | 'right' | 'both'
 
 /** 自动编号样式；'none' 表示该级不编号 */
-export type NumberingStyle = 'chineseDot' | 'parenChinese' | 'arabicDot' | 'none'
+export type NumberingStyle =
+  | 'chineseDot'
+  | 'parenChinese'
+  | 'arabicDot'
+  | 'arabicPeriodSpace'
+  | 'none'
 
 export interface TextStyleSpec {
   /**
@@ -164,14 +169,212 @@ const GOV_MARGIN: MarginSpec = {
 }
 
 /**
+ * 「简易公文格式」的行网格高，pt。它同时也是这一套的 `page.gridLinePt`
+ * —— Word 的「段后 1 行」以文档网格行高为基准，设成它，标题的「空一行」才是正好一行。
+ *
+ * 每页 22 行的算术：上 37 / 下 35 的版心高 = 637.795pt，÷ 22 = 28.99pt；**取 28.95pt
+ * （= 579 缇）才装得下 22 行**（22 × 28.95 = 636.90pt，余 0.90pt），取 29pt 就只剩 21 行。
+ *
+ * 各条样式一律写「固定值 28.95pt」而不是「单倍行距」：Word 里「单倍行距 + 文档网格每页
+ * 22 行」靠的是把每一行**吸附到行网格**，浏览器的排版引擎没有这个能力（`line-height`
+ * 只有固定值能表达）。写成固定值，两边的行高与每页行数才一致 —— `verify:pages` 拿预览
+ * 页数与 Word 页数逐套模板对账，这条等价关系就是它验的。
+ */
+const GOV_LINE_PT = 28.95
+
+/**
+ * 「简易公文格式」（`DOC_TEMPLATES` 第二套）的样式覆盖。
+ *
+ * 体例：正文与各级标题都是三号 = 16pt，文本标题二号 = 22pt，列表与页脚四号 = 14pt；
+ * 正文与各级标题的行高一律压成网格行高，且都不留段前段后。字号取值见 issues/20260916.md。
+ *
+ * **每行 27 字、不是 GB/T 9704 写的 28 字，这是已知偏差而不是笔误**：版心宽 156mm =
+ * 442.20pt，三号字每字 16pt，28 字要 448.00pt。Word 靠文档网格**压缩字符间距**把 28 字
+ * 挤进 156mm，浏览器的排版引擎没有这个能力，实测 442.20pt 只放得下 27 字。左右边距各
+ * 让 2mm（各 25mm）就能精确容下 28 字，但那样版心就不是公文标准的 156×225mm 了 ——
+ * 2026-09-16 用户选择保标准版心。
+ *
+ * name / id 一概不覆盖：两套模板共用同一批 Word 样式名，导出与反向解析（P4）都按名字
+ * 锚定，这里改了会让同一份文档在两套模板下写出两套 styles.xml。
+ */
+const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
+  /**
+   * 文本标题：二号方正小标宋简体，居中、不加粗。行高**强行**取网格行高 —— 公文里标题
+   * 也占一行网格，整篇的行基线才对得齐（22pt 字的单倍行高是 25.27pt，装得进 28.95pt
+   * 的固定行盒，不会被裁）。段后空一行。
+   */
+  title: {
+    eastAsia: '方正小标宋简体',
+    ascii: 'Times New Roman',
+    sizePt: 22,
+    bold: false,
+    align: 'center',
+    firstLineChars: 0,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 1,
+    numbering: 'none',
+  },
+  /** 一级标题：黑体三号，不加粗、两端对齐、缩进 2 字、不留段前段后，编号「一、」 */
+  h1: {
+    eastAsia: '黑体',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'both',
+    firstLineChars: 2,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'chineseDot',
+  },
+  /** 二级标题：楷体三号，其余同一级标题，编号「（一）」 */
+  h2: {
+    eastAsia: '楷体',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'both',
+    firstLineChars: 2,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'parenChinese',
+  },
+  /** 三级标题：**与正文同款**（仿宋三号），只多一个自动编号「1. 」 */
+  h3: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'both',
+    firstLineChars: 2,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'arabicPeriodSpace',
+  },
+  /** 正文：三号仿宋、两端对齐、缩进 2 字、行高 = 网格行高、无段前段后 */
+  body: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'both',
+    firstLineChars: 2,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+  /** 抬头：随正文（三号仿宋），只取消首行缩进、改左对齐 */
+  salutation: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'left',
+    firstLineChars: 0,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+  /** 落款：随正文，只取消首行缩进、改右对齐 */
+  signature: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 16,
+    bold: false,
+    align: 'right',
+    firstLineChars: 0,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+  /**
+   * 附件：随正文的字号与行高，只按「附件」标识的体例改字体（黑体）、取消首行缩进、
+   * 段前归零、段后留 1 行 —— 与「管理人文件」的逻辑一致，西文槽位同样用黑体。
+   */
+  attachment: {
+    eastAsia: '黑体',
+    ascii: '黑体',
+    sizePt: 16,
+    bold: false,
+    align: 'both',
+    firstLineChars: 0,
+    lineRule: 'exact',
+    linePt: GOV_LINE_PT,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 1,
+    numbering: 'none',
+  },
+  /** 列表标题：四号（14pt）加粗居中，其余同「管理人文件」 */
+  listTitle: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 14,
+    bold: true,
+    align: 'center',
+    firstLineChars: 0,
+    lineRule: 'atLeast',
+    linePt: 16,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+  /**
+   * 列表段落：四号（14pt），其余逻辑同「管理人文件」—— 行距取「最小值」，值就是该字号
+   * 的单倍自然行高（14pt × 1.1406 = 15.97 ≈ 16pt，与管理人文件那条 10.5pt → 12pt 同源；
+   * 仿宋/黑体/楷体的字面行距倍数都是 1.1406 = 292/256，实测字体 hhea 指标）。表格默认
+   * 用它，所以「最小一行」的高度 = 16pt，「最小两行」= 32pt。
+   */
+  listItem: {
+    eastAsia: '仿宋',
+    ascii: 'Times New Roman',
+    sizePt: 14,
+    bold: false,
+    align: 'both',
+    firstLineChars: 0,
+    lineRule: 'atLeast',
+    linePt: 16,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+  /** 页脚：四号（14pt）宋体居中，单倍行距（正文的固定行距会把页高撑坏） */
+  footer: {
+    eastAsia: '宋体',
+    ascii: 'Times New Roman',
+    sizePt: 14,
+    bold: false,
+    align: 'center',
+    firstLineChars: 0,
+    lineRule: 'auto',
+    linePt: 12,
+    spaceBeforeLines: 0,
+    spaceAfterLines: 0,
+    numbering: 'none',
+  },
+}
+
+/**
  * 文件模板：**样式覆盖与页边距绑成一体**。
  *
  * 为什么不让人分别选「样式」和「页边距」：公文体例里页边距本身就是格式的一部分，
  * 让两者可以自由组合只会拼出既不是甲模板也不是乙模板的东西。
  *
- * 现在两套模板的样式值完全相同（只差页边距），但覆盖写成整份 spec 的 DeepPartial
- * 而不是只有 page.margin：将来真要给第二套不同的字体字号，往 spec.styles 里加即可，
- * 不用改结构、也不用改调用方（预览 CSS 与 docx 样式都从 resolveSpec 派生）。
+ * 覆盖写成整份 spec 的 DeepPartial 而不是只有 page.margin，正是为了第二套的整套字体字号：
+ * 「简易公文格式」的样式覆盖见 GOV_STYLES，调用方（预览 CSS 与 docx 样式都从 resolveSpec
+ * 派生）一行都不用改。
  */
 export interface DocTemplate {
   key: string
@@ -189,7 +392,10 @@ export const DOC_TEMPLATES: readonly [DocTemplate, ...DocTemplate[]] = [
   {
     key: 'govDoc',
     label: '简易公文格式',
-    spec: { page: { margin: GOV_MARGIN } },
+    spec: {
+      page: { margin: GOV_MARGIN, gridLinePt: GOV_LINE_PT },
+      styles: GOV_STYLES,
+    },
   },
 ]
 
