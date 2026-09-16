@@ -79,6 +79,7 @@ import {
   removeComment,
   removeSectionBreak,
   removeTable,
+  renderInlinesHtml,
   renderTableFragment,
   replyComment,
   replaceMatches,
@@ -1037,6 +1038,42 @@ console.log('\n=== 18. 软换行 {br}：零宽、往返、转义 ===')
   const literal = parseMd('\\{br\\}')
   eq('转义后的 {br} 是字面量', plainText(findBlock(literal, literal.blocks[0].id)), '{br}')
   eq('字面量往返稳定', toMd(parseMd(toMd(literal))), toMd(literal))
+}
+
+console.log('\n=== 18b. 段尾软换行的渲染：占位 <br> 只在尾随那一枚之后补 ===')
+{
+  const inlinesOf = (md) => {
+    const doc = parseMd(md)
+    return findBlock(doc, doc.blocks[0].id).inlines
+  }
+  eq(
+    '段尾软换行之后再补一枚占位 <br>（行数才与 Word 一致）',
+    renderInlinesHtml(inlinesOf('甲{br}')),
+    '甲<br class="wtp-br"><br>',
+  )
+  eq(
+    '中间的软换行不补（后面还有字，本来就有行盒）',
+    renderInlinesHtml(inlinesOf('甲{br}乙')),
+    '甲<br class="wtp-br">乙',
+  )
+  eq(
+    '开头那枚不补（它后面有字）',
+    renderInlinesHtml(inlinesOf('{br}甲')),
+    '<br class="wtp-br">甲',
+  )
+  eq(
+    '两枚连着结尾时补在最后一枚之后（每枚各占一行）',
+    renderInlinesHtml(inlinesOf('甲{br}{br}')),
+    '甲<br class="wtp-br"><br class="wtp-br"><br>',
+  )
+  eq('空段落仍是单枚裸 <br>（占位，不是软换行）', renderInlinesHtml([]), '<br>')
+  eq(
+    '格子里的尾随软换行走同一条路',
+    renderTableFragment(parseMd(':::table\n| 甲{br} |\n:::').blocks[0], 0, 1).includes(
+      '甲<br class="wtp-br"><br>',
+    ),
+    true,
+  )
 }
 
 console.log('\n=== 19. 软换行的切片：不读到 undefined.length，边界不重复不丢失 ===')

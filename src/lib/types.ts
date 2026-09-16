@@ -38,11 +38,14 @@ export interface CommentEndInline {
 }
 
 /**
- * 软换行，对应 Word 的 `<w:br/>`（单元格里 Shift+Enter 的产物）。
+ * 软换行，对应 Word 的 `<w:br/>`（Shift+Enter 的产物：正文段落与表格格子同一条路）。
  *
  * **零宽**：它不占字符位 —— plainText、块长度、分页的字符偏移坐标系、
  * sliceInlines/sliceStrict 的区间全都按「它不存在」来算，所以量测与分页算术
  * 一行都不用改。它只影响渲染（多一个行盒）与导出（一个 <w:br/>）。
+ *
+ * 尾随的那一枚（段落/格子以换行结尾）在渲染时会再补一个占位 `<br>`：
+ * 浏览器不给尾随 `<br>` 单独开行盒，不补就与 Word 差一行，且敲进来的字会跑回上一行。
  */
 export interface BreakInline {
   t: 'break'

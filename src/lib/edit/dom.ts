@@ -331,7 +331,7 @@ function breakAt(frag: HTMLElement, offset: number): HTMLBRElement | null {
 }
 
 /**
- * 把插入符放到某枚软换行**之后**（单元格里 Shift+Enter 专用）。
+ * 把插入符放到某枚软换行**之后**（Shift+Enter 之后的那一落，正文段落与格内同一条路）。
  *
  * 软换行是零宽的，offsetToPoint 会把同一个偏移还原到「换行之前」（上一行末尾），
  * 照原样 placeCaret 就会让回车之后敲的字打回上一行。这里定位到那枚 `<br>`，

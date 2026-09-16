@@ -83,6 +83,44 @@ console.log('\n=== 3. 长段落跨页按行切开 ===')
   eq('片段总数', pages.reduce((n, p) => n + p.fragments.length, 0), 3)
 }
 
+console.log('\n=== 3b. 片段尾标志 tail：只有覆盖到本块最后一行的那一片才带 ===')
+{
+  // 10 行、100 字符；版心 100px 只能放 4 行 → 三片 [0,40) / [40,80) / [80,100)
+  const items = [block('long', { rows: 10, length: 100 })]
+  const pages = paginate(items, { contentHeight: 100 })
+  ok('第1片不到块尾（没有 tail）', pages[0].fragments[0].tail !== true)
+  ok('第2片也不到块尾', pages[1].fragments[0].tail !== true)
+  ok('末片带 tail', pages[2].fragments[0].tail === true)
+
+  // 两段共用一页：tail 是「本块到没到块尾」，不是「这一页到没到末尾」
+  const two = paginate(
+    [block('a', { rows: 1, length: 10 }), block('b', { rows: 1, length: 10 })],
+    { contentHeight: 100 },
+  )
+  ok('单页里的每一片都各自带 tail', two[0].fragments.every((f) => f.tail === true))
+}
+
+console.log('\n=== 3c. 尾随软换行的段落：两行、末片带 tail ===')
+{
+  // 「abc{br}」量出来是 2 行（第二行是空的），两行的字符起点是 0 与 3
+  const item = {
+    t: 'block',
+    blockId: 'br',
+    kind: 'body',
+    displayLength: 3,
+    rows: 2,
+    lineHeight: 25,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    rowStarts: [0, 3],
+  }
+  const pages = paginate([item], { contentHeight: 100 })
+  eq('页数', pages.length, 1)
+  eq('一片覆盖整段', pages[0].fragments.length, 1)
+  eq('片段区间仍是 0/3（软换行零宽）', `${pages[0].fragments[0].from}/${pages[0].fragments[0].to}`, '0/3')
+  ok('带 tail —— 渲染时才会补占位 <br>（否则只渲 1 行、与量测差一行）', pages[0].fragments[0].tail === true)
+}
+
 console.log('\n=== 4. 孤行控制：少于 4 行的段落不拆 ===')
 {
   // 第 1 段 3 行占满 75px，第 2 段 3 行只剩 25px（只够 1 行）→ 整段挪到下一页

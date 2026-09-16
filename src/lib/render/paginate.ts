@@ -75,6 +75,15 @@ export interface PageFragment {
   to: number
   /** true 表示这是上一页同一段落后半截（页顶续排，不缩进、不叠段前距） */
   continuation: boolean
+  /**
+   * true = 这一片覆盖了本块的**最后一行**（到块尾了）。
+   *
+   * 渲染侧靠它区分「整段」与「块被切成两页时的前半截」：尾随软换行是零宽的，
+   * 两种片段的字符区间完全一样（都是 `[0, 文字长度)`），只有分页结果知道谁到块尾。
+   * 尾随软换行之后要补占位 `<br>`（见 render/html.ts），补错的片会凭空多出一行、
+   * 把分页算术打破。段落片段才有意义，表格片段不看它。
+   */
+  tail?: true
   /** 表格片段：本片覆盖的表格行区间 [rowFrom, rowTo)（半开）。段落片段没有这两个字段 */
   rowFrom?: number
   rowTo?: number
@@ -173,6 +182,7 @@ export function paginate(
       from: item.rowStarts[rowFrom] ?? 0,
       to: item.rowStarts[rowTo] ?? item.displayLength,
       continuation: rowFrom > 0,
+      ...(rowTo >= item.rows ? { tail: true as const } : {}),
     })
   }
 

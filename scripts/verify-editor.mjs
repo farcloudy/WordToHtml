@@ -2077,6 +2077,67 @@ try {
   eq('插入符仍在同一格', v4Caret?.blockId, `${typedV4?.id ?? ''}.r${shiftRow}c0`)
   await checkNoOverflow('V4 Shift+Enter 后')
 
+  // ---- V4b. 正文段落里的 Shift+Enter（issues/20260916-1 第 1 条）----
+  await openApp()
+  const softBefore = textOfBlock(
+    heroBlocks(await getModel()).find((b) => textOfBlock(b).includes('我方于2026年9月1日')),
+  )
+  const softBlocksBefore = (await getModel()).blocks.length
+  /** 某一块在版面上的行盒数（与量测同一口径：行盒顶端去重后计数） */
+  const rowBoxes = (needle) =>
+    page.evaluate((text) => {
+      const frag = Array.from(document.querySelectorAll('[data-block-id]')).find((el) =>
+        (el.textContent ?? '').includes(text),
+      )
+      if (!frag) return null
+      const range = document.createRange()
+      range.selectNodeContents(frag)
+      const tops = []
+      for (const r of Array.from(range.getClientRects()).filter((x) => x.height > 0)) {
+        if (tops.length === 0 || r.top - tops[tops.length - 1] > 1) tops.push(r.top)
+      }
+      return tops.length
+    }, needle)
+  const softRowsBefore = await rowBoxes('我方于2026年9月1日')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Shift+Enter')
+  await page.waitForTimeout(300)
+  const softModel = await getModel()
+  const softBlock = heroBlocks(softModel).find((b) => textOfBlock(b).includes('我方于2026年9月1日'))
+  eq('正文里 Shift+Enter 不切段（块数不变）', softModel.blocks.length, softBlocksBefore)
+  eq(
+    '正文段落末尾多了一枚软换行',
+    softBlock?.inlines[softBlock.inlines.length - 1]?.t,
+    'break',
+  )
+  eq('软换行零宽：段落的文字没变', textOfBlock(softBlock), softBefore)
+  /*
+   * 段尾软换行必须真的多占一个行盒 —— 与量测同一口径（数行盒顶端的去重个数）。
+   * 浏览器不给尾随 <br> 单独开行盒，渲染时不补那枚占位 <br>，这里就会与改之前一样多，
+   * 而量测那边多了一行 —— 两边差的就是一整行。期望值从「这一块自己几个行盒」现推。
+   */
+  eq('段尾软换行在版面上多占一个行盒（量测同口径）', await rowBoxes('我方于2026年9月1日'), softRowsBefore + 1)
+  // 换行之后打字：必须落在新的一行（模型里排在 break 之后），且不许多出第二枚软换行
+  await page.keyboard.insertText('X')
+  await page.waitForTimeout(300)
+  const typedSoft = await getModel()
+  const typedSoftBlock = heroBlocks(typedSoft).find((b) =>
+    textOfBlock(b).includes('我方于2026年9月1日'),
+  )
+  const softBreakIdx = typedSoftBlock.inlines.findIndex((i) => i.t === 'break')
+  const softXIdx = typedSoftBlock.inlines.findIndex(
+    (i) => i.t === 'text' && i.text.includes('X'),
+  )
+  ok('换行之后敲的字落在换行之后（不是打回上一行）', softBreakIdx >= 0 && softXIdx > softBreakIdx)
+  eq(
+    '换行之后敲的字没把软换行复制成两枚',
+    typedSoftBlock.inlines.filter((i) => i.t === 'break').length,
+    1,
+  )
+  eq('只多了那一个字', textOfBlock(typedSoftBlock), `${softBefore}X`)
+  await checkNoOverflow('V4b 正文软换行后')
+
   // ---- V5. 边界护栏：格首 Backspace、格尾 Delete 都不许动模型/DOM ----
   await openApp('表格')
   const guardDom = await tableDom()

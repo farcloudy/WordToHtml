@@ -351,6 +351,16 @@ function fragmentHtml(frag: PageFragment): string {
   const p = prefix.length
   const active = activeCommentId.value
 
+  /*
+   * 这一片覆盖整块时不切片：切片的右端点会把段尾那枚零宽软换行丢掉（`sliceInlines` 的规则
+   * 是给真跨页用的 —— 页边界已经断了一行，片首/片尾那枚不该再算一个行盒）。而零宽让「整段」
+   * 与「第一页那半截」的字符区间一模一样，只能靠分页结果给的 tail 区分。
+   * 丢错的后果实打实：量测按 2 行记账、预览只渲 1 行（尾随软换行的占位 <br> 也一起没了）。
+   */
+  if (frag.tail === true && frag.from === 0) {
+    return renderInlinesHtml(block.inlines, prefix, active)
+  }
+
   if (frag.from < p) {
     return renderInlinesHtml(
       sliceInlines(block.inlines, 0, Math.max(0, frag.to - p)),
@@ -492,6 +502,9 @@ function sameLayout(
         fa.to !== fb.to ||
         fa.kind !== fb.kind ||
         fa.continuation !== fb.continuation ||
+        // 「这一片到块尾」也要比：它决定尾随软换行之后补不补占位 <br>（见 render/html.ts），
+        // 漏比会在「块尾那一行从第 1 页挪到第 2 页」时留下错的片段 DOM
+        fa.tail !== fb.tail ||
         // 表格片段的行区间也要比：漏比会导致「分页变了却不重建 DOM」，
         // 页面上的表还是上一轮的若干行
         fa.rowFrom !== fb.rowFrom ||
@@ -512,7 +525,7 @@ interface RefreshOptions {
   /** 即使分页没变也重建 DOM（格式化、批注这类不改行数但要改外观的操作） */
   force?: boolean
   /**
-   * 锚点落在软换行处时，落到换行**之后**（只有单元格里的 Shift+Enter 用）。
+   * 锚点落在软换行处时，落到换行**之后**（只有 Shift+Enter 这一条路用得上）。
    * 软换行零宽，默认的 placeCaret 会还原到换行之前 —— 那会让回车后敲的字打回上一行。
    */
   afterBreak?: boolean
@@ -710,7 +723,16 @@ function syncPlain(pageEl: HTMLElement): void {
     const container = findContainer(doc.value, blockId)
     if (!container) continue
     const { from, to } = fragmentRange(frag, blockId)
-    replaceRange(container, from, to, readInlines(frag))
+    const read = readInlines(frag)
+    /*
+     * 这一片覆盖整个容器时**整段换成 DOM 的内容**：没有边界，就不会有边界规则帮倒忙。
+     * 边界规则（`replaceRange` 的「右端点上的零宽 inline 留下」）在段尾/格尾那枚软换行上
+     * 恰好是错的 —— 它与读回区间的右端点重合，会被留成第二枚，于是每敲一个字多一枚
+     * （2026-09-16 实测，见 issues/20260916-1 第 1 条）。「DOM 是手感的真相」在这里就该照抄。
+     * 只在这一片就是整段时才这么干：真跨页的片段仍要走区间替换，否则会把另一页那半截抹掉。
+     */
+    if (from === 0 && to >= containerLength(container)) container.inlines = read
+    else replaceRange(container, from, to, read)
     retagFragments(blockId)
   }
 }
@@ -735,8 +757,10 @@ function mark(kind: 'ins' | 'del'): RevMark {
  * 新增的文字标 w:ins；被删掉的字不真删，原地补回来标 w:del
  * —— 这就是 Word 开着修订时看到的样子。
  */
-function syncTracked(pageEl: HTMLElement): DisplayPoint | null {
-  let caret: DisplayPoint | null = null
+function syncTracked(
+  pageEl: HTMLElement,
+): { point: DisplayPoint; afterBreak: boolean } | null {
+  let caret: { point: DisplayPoint; afterBreak: boolean } | null = null
 
   for (const frag of Array.from(pageEl.querySelectorAll<HTMLElement>('[data-block-id]'))) {
     const blockId = frag.dataset.blockId ?? ''
@@ -776,16 +800,34 @@ function syncTracked(pageEl: HTMLElement): DisplayPoint | null {
         ...sliceStrict(before, head + removedLen, oldText.length),
       ])
       retagFragments(blockId)
-      // 落点放在改动之后：删掉的文字之后、或插入的文字之后
+      /*
+       * 落点放在改动之后：删掉的文字之后、或插入的文字之后。
+       * 改动正好落在一枚零宽软换行上时要连 afterBreak 一起带出去 —— 否则重排后插入符被
+       * 还原到换行**之前**，接着敲的字打回上一行（与 Shift+Enter 之后打字同一个坑）。
+       */
       const local = head + removedLen + addedLen
+      const display = Number(frag.dataset.from ?? '0') + prefixLengthOf(frag) + local
       caret = {
-        blockId,
-        offset: Number(frag.dataset.from ?? '0') + prefixLengthOf(frag) + local,
+        point: { blockId, offset: display },
+        afterBreak: breakAtOffset(container.inlines, display - prefixLength(blockId)),
       }
     }
   }
 
   return caret
+}
+
+/** 容器的某个模型偏移处是不是一枚零宽软换行（决定插入符还原到换行之前还是之后） */
+function breakAtOffset(inlines: readonly Inline[], offset: number): boolean {
+  let cursor = 0
+  for (const inline of inlines) {
+    if (inline.t === 'text') {
+      cursor += inline.text.length
+      continue
+    }
+    if (inline.t === 'break' && cursor === offset) return true
+  }
+  return false
 }
 
 function textOf(inlines: readonly Inline[]): string {
@@ -1000,10 +1042,14 @@ function onSelectionChange(): void {
 function runSync(pageEl: HTMLElement): void {
   pushHistory()
   let anchor: DisplayPoint | null = null
-  if (props.trackChanges) anchor = syncTracked(pageEl)
-  else syncPlain(pageEl)
+  let afterBreak = false
+  if (props.trackChanges) {
+    const tracked = syncTracked(pageEl)
+    anchor = tracked?.point ?? null
+    afterBreak = tracked?.afterBreak === true
+  } else syncPlain(pageEl)
   if (!anchor) anchor = selectionRange()?.start ?? lastCaret
-  refreshLayout({ anchor, force: props.trackChanges })
+  refreshLayout({ anchor, force: props.trackChanges, afterBreak })
 }
 
 function onInput(event: Event): void {
@@ -1454,17 +1500,20 @@ function onKeydown(event: KeyboardEvent): void {
   }
   if (event.key === 'Enter') {
     /*
-     * 格内 Enter 一律不接管（单元格是单段落，分段表达不出来）—— 但护栏现在就得有：
+     * Shift+Enter 在**任何**容器里都是软换行（Word 的 `<w:br/>`）—— 正文段落与表格格子走同一条路，
+     * 插入符落到换行之后（软换行零宽，通用还原规则会把它放回换行之前，那里的字也就打回上一行）。
+     *
+     * 不带 Shift 的 Enter 在格内一律不接管（单元格是单段落，分段表达不出来）—— 但护栏现在就得有：
      * 不拦的话回车会掉进 insertParagraphBreak，把整张表当段落切开。
      * （insertParagraphBreak 里还有一道 findBlock 兜底，两道都在，免得日后改一处漏一处。）
-     * 格内 Shift+Enter 插一枚软换行（Word 的 <w:br/>），插入符落到换行之后。
      */
     const point = caretPoint()
     event.preventDefault()
-    if (point && isTableCell(point.blockId)) {
-      if (event.shiftKey) insertSoftBreak(point)
+    if (event.shiftKey) {
+      if (point) insertSoftBreak(point)
       return
     }
+    if (point && isTableCell(point.blockId)) return
     insertParagraphBreak()
     return
   }
@@ -1717,7 +1766,10 @@ function visualLineStep(
   }
 }
 
-/** 单元格里 Shift+Enter：在插入符处插一枚软换行（零宽），插入符落到换行之后 */
+/**
+ * Shift+Enter：在插入符处插一枚软换行（零宽），插入符落到换行之后。
+ * 正文段落与表格格子是同一条路 —— 载体就是一个「持有 inlines 的容器」。
+ */
 function insertSoftBreak(point: DisplayPoint): void {
   const container = findContainer(doc.value, point.blockId)
   if (!container) return
