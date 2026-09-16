@@ -4387,24 +4387,91 @@ try {
     'true',
   )
 
-  // ---- AG5. content 留空（`?empty=1`）----
+  // ---- AG5. content 留空（`?empty=1`）与 `model` 给零块：载入时补一个空白正文段落 ----
+  /*
+   * 零块文档（`content: ''` / 手写空 md / `emptyDoc()`）以前在版面上打得进字、模型里一个字都没有
+   * —— 字只进了 `.wtp-content` 的 DOM，保存与导出拿到的是空文档，还不报错（issues/20260916-2）。
+   * 修法是「载入时规范化」，所以两条入口各走一遍：版面出得来、模型里恰好一个空白正文段落、
+   * **在版面上打的中文真的进模型**。最后这条是核心 —— 「blocks 字段存在」不算证据（空数组也有它）。
+   */
   const pageErrors = []
   const onPageError = (error) => pageErrors.push(String(error))
   page.on('pageerror', onPageError)
-  await openDemo('?empty=1')
-  const emptyState = await page.evaluate(() => ({
-    pages: document.querySelectorAll('.wtp-page').length,
-    name: document.querySelector('.bar .file-name')?.value ?? null,
-    blocks: document.querySelectorAll('.wtp-content [data-block-id]').length,
-  }))
-  page.off('pageerror', onPageError)
-  eq('content 留空时不报错（没有未捕获的页面异常）', pageErrors.length, 0)
-  ok(
-    'content 留空也出得来版面（至少一张纸、没有块）',
-    emptyState.pages >= 1 && emptyState.blocks === 0,
-    JSON.stringify(emptyState),
+
+  /** 一个零块入口的公共验收（从载入到打字；pageerror 探针跟着覆盖这一段） */
+  async function checkZeroBlockEntry(search, label) {
+    await openDemo(search)
+    const before = await page.evaluate(() => {
+      const frags = Array.from(document.querySelectorAll('.wtp-content [data-block-id]'))
+      return {
+        pages: document.querySelectorAll('.wtp-page').length,
+        blocks: frags.length,
+        blockIds: frags.map((el) => el.dataset.blockId ?? ''),
+        text: frags.map((el) => el.textContent ?? '').join(''),
+      }
+    })
+    ok(
+      `${label}：至少一张纸，且页面上恰好一个片段（零块补出来的那一段）`,
+      before.pages >= 1 && before.blocks === 1 && before.blockIds[0] !== '',
+      JSON.stringify(before),
+    )
+    const model = await getModel()
+    const first = model.blocks[0]
+    ok(
+      `${label}：模型里恰好一个块，且是空白正文段落（textBlock / body / 无文字）`,
+      model.blocks.length === 1 &&
+        first?.t === 'textBlock' &&
+        first?.kind === 'body' &&
+        textOfBlock(first ?? { inlines: [] }) === '',
+      JSON.stringify(model.blocks),
+    )
+    eq(`${label}：版面上那个段落也还没有文字`, before.text, '')
+    await page.evaluate(
+      (id) => window.__wtpTest.caretAtPageEdgeOf(id, 0, 'start'),
+      before.blockIds[0],
+    )
+    await page.waitForTimeout(120)
+    const placed = await page.evaluate(() => window.__wtpTest.caretInfo())
+    ok(
+      `${label}：（前置）插入符落进了那一段`,
+      placed?.blockId === before.blockIds[0],
+      JSON.stringify(placed),
+    )
+    await page.keyboard.insertText('这是一段测试正文')
+    await page.waitForTimeout(300)
+    const typed = await getModel()
+    ok(
+      `${label}：在版面上打的中文真的进了 toMd(getModel())（不是只进 DOM）`,
+      toMd(typed).includes('这是一段测试正文'),
+      JSON.stringify(toMd(typed).slice(0, 80)),
+    )
+    eq(`${label}：打字之后模型里仍是那一个块（没多没少）`, typed.blocks.length, 1)
+    eq(
+      `${label}：打进去的字就在那一段里（逐字对）`,
+      textOfBlock(typed.blocks[0] ?? { inlines: [] }),
+      '这是一段测试正文',
+    )
+  }
+
+  await checkZeroBlockEntry('?empty=1', 'content 留空')
+  /*
+   * 版面不报错：AG5 原有的 pageerror 探针（错误输出不受任何截断保护，也是 issue 里
+   * 「静默」的反面 —— 真有异常必须在这儿现形）。
+   */
+  eq(
+    '零块文档载入 + 打字全程不报错（没有未捕获的页面异常）',
+    pageErrors.length,
+    0,
+    pageErrors.join(' | '),
   )
-  eq('content 留空时传的确实是空字符串（demo 也没编一个标题出来）', emptyState.name, '')
+  page.off('pageerror', onPageError)
+
+  await openDemo('?empty=1')
+  eq(
+    'content 留空时传的确实是空字符串（demo 也没编一个标题出来）',
+    await fileNameBox.inputValue(),
+    '',
+  )
   await fileNameBox.fill('空文档探针')
   await page.waitForTimeout(150)
   eq('content 留空时顶栏文件名仍可编辑（回传拿到新值）', (await probe())?.fileName, '空文档探针')

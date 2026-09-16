@@ -51,6 +51,8 @@ import {
   deleteRange,
   deleteSpan,
   emptyCell,
+  emptyDoc,
+  ensureBodyBlock,
   findBlock,
   findCell,
   findCellAt,
@@ -2646,6 +2648,71 @@ console.log('\n=== 30. 默认快捷键表落在一个可直接手改的 json 上
     '默认表 29 个动作两两不冲突（都有键、标签互不相同）',
     `${defaultLabels.filter((label) => !label.startsWith('未绑定')).length} 个有键 / ${new Set(defaultLabels).size} 个不同标签`,
     '29 个有键 / 29 个不同标签',
+  )
+}
+
+console.log('\n=== 31. ensureBodyBlock：零块载入时补一个空白正文段落（issues/20260916-2）===')
+{
+  /*
+   * 零块文档（`content: ''` / 手写空 md / `emptyDoc()`）在版面上打得进字、模型里却一个字都没有：
+   * 编辑层靠页面上带 data-block-id 的片段把 DOM 读回模型，零块 ⇒ 一个片段都没有 ⇒ 循环体不跑。
+   * 载入时补一个空白段落是最小改动，所以这个纯函数得先把两件事钉住：补出来的段落形状对、
+   * 非零块输入**逐字段原样**返回（一个块都不多不少，comments / editor 都不丢）。
+   */
+  const empty = emptyDoc()
+  const filled = ensureBodyBlock(empty)
+  const para = filled.blocks[0]
+  ok(
+    '零块 → 恰好一个块，且是空白正文段落（textBlock / body / 无 inlines）',
+    filled.blocks.length === 1 &&
+      para.t === 'textBlock' &&
+      para.kind === 'body' &&
+      para.inlines.length === 0,
+    JSON.stringify(filled.blocks),
+  )
+  ok('补出来的段落有 id（不是空串）', typeof para.id === 'string' && para.id !== '', String(para.id))
+  eq('补出来的 id 与既有 id 分配同源（nextBlockId 的默认前缀）', para.id.startsWith('b'), true)
+  ok(
+    '不就地改输入：emptyDoc() 的返回值仍是一个块都没有',
+    empty.blocks.length === 0,
+    JSON.stringify(empty.blocks),
+  )
+  ok('返回的是新对象（输入未被复用成返回值）', filled !== empty)
+  /*
+   * id 不许与已用过的撞：同一进程里连补两份零块文档，两次 id 必须不同，
+   * 否则两份文档并进一份（或复制粘贴）时 retagFragments / syncPlain 会认错块。
+   */
+  const second = ensureBodyBlock(emptyDoc())
+  ok(
+    '连补两份零块文档：两次分到的 id 不同（不与已用过的 id 撞）',
+    second.blocks[0].id !== para.id,
+    `${para.id} / ${second.blocks[0].id}`,
+  )
+
+  // 非零块：逐字段原样返回（comments / sections / editor 一个都不许丢，块也不许多不少）
+  const source = parseMd('::editor trackChanges=on\n\n# 标题\n\n正文一段[[锚|批注]]', {
+    author: '张三',
+    now: () => new Date('2026-05-06T07:08:09.000Z'),
+  })
+  const before = JSON.stringify(source)
+  const same = ensureBodyBlock(source)
+  ok('非零块：原样返回（同一个对象，不是复制出来的）', same === source)
+  ok(
+    '非零块：整份模型一字不差（含块 id、comments、editor、sections 字段的有无）',
+    JSON.stringify(same) === before,
+    `${before} → ${JSON.stringify(same)}`,
+  )
+  ok(
+    '非零块：comments 与 editor 一个都不丢（逐字段抽查）',
+    same.comments.length === 1 &&
+      same.comments[0].author === '张三' &&
+      same.editor?.trackChanges === true,
+    `${JSON.stringify(same.comments)} / ${JSON.stringify(same.editor)}`,
+  )
+  ok(
+    '非零块：连 sections 也照原样（字段存在与否都不动）',
+    JSON.stringify(same.sections) === JSON.stringify(source.sections),
+    JSON.stringify(same.sections),
   )
 }
 

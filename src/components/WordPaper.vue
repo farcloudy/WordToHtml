@@ -137,6 +137,7 @@ import {
   cellParagraphId,
   commentScopes,
   defaultCellAlignH,
+  ensureBodyBlock,
   headerRowCount,
   nextBlockId,
   parseCellId,
@@ -216,8 +217,13 @@ const resolved = computed<Spec>(() => resolveSpec(props.spec))
 /**
  * 权威模型。用 shallowRef：它是「导出的真相」，但**不参与渲染** ——
  * 渲染只读 viewDoc 快照，否则每敲一个字都会重建 DOM、丢掉插入符。
+ *
+ * 载入一律过 ensureBodyBlock：零块文档（`content: ''` / `emptyDoc()` / 手写空 md）
+ * 补一个空白正文段落，否则版面上打得进字、模型里一个字都没有（issues/20260916-2）。
  */
-const doc = shallowRef<DocModel>(props.model ?? parseMd(props.source, { author: props.author }))
+const doc = shallowRef<DocModel>(
+  ensureBodyBlock(props.model ?? parseMd(props.source, { author: props.author })),
+)
 
 /** 渲染用的冻结快照，只在重排时整体换新 */
 const viewDoc = shallowRef<DocModel>(doc.value)
@@ -3456,7 +3462,7 @@ onBeforeUnmount(() => {
 })
 
 watch([() => props.source, () => props.model], () => {
-  doc.value = props.model ?? parseMd(props.source, { author: props.author })
+  doc.value = ensureBodyBlock(props.model ?? parseMd(props.source, { author: props.author }))
   clearMeasureCache(cache)
   undoStack.length = 0
   redoStack.length = 0

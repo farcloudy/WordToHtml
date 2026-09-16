@@ -38,6 +38,12 @@
 
 ## 2. 已定稿的设计决策（勿再改回）
 
+- **载入后文档至少有一个块**：零块输入（`content: ''`、手写空 md、`emptyDoc()`）由 `WordPaper` 载入时
+  过一道 `ensureBodyBlock()`（`lib/types.ts`）补一个空白正文段落（`kind: 'body'`、`inlines: []`），
+  `content` / `model` 两条入口都在那一处。**为什么**：编辑层靠页面上带 `data-block-id` 的片段把 DOM
+  读回模型，零块 ⇒ 页面上一个片段都没有 ⇒ 读回的循环体一次都不跑，而 `.wtp-content` 自己就是
+  `contenteditable`，字被插在它下面 ⇒ 字只进 DOM、永远回不到模型（看得见、保存与导出却是空的，还不报错）。
+  `emptyDoc()` 本身仍返回零块 —— 它表达的是「没有内容的文档」，不替调用方决定该不该有一个空段落。
 - **文件模板** = 样式与页边距绑成一体（`DOC_TEMPLATES`）。`manager`「管理人文件」四边 25mm、样式走
   `DEFAULT_SPEC`；`govDoc`「简易公文格式」上 37 / 下 35 / 左 28 / 右 26 mm、整套样式覆盖在
   `GOV_STYLES`（正文与各级标题三号 16pt、标题二号 22pt 方正小标宋简体、列表与页脚四号 14pt、

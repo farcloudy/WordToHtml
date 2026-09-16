@@ -286,6 +286,25 @@ export interface DocModel {
 
 export const emptyDoc = (): DocModel => ({ blocks: [], comments: [] })
 
+/**
+ * 载入时的规范化：**零块文档补一个空白正文段落**。
+ *
+ * 编辑层是靠页面上带 `data-block-id` 的片段把 DOM 读回模型的；零块 ⇒ 页面一个片段都没有
+ * ⇒ 读回的循环体一次都不跑。而 `.wtp-content` 自己就是 contenteditable，浏览器把字插在它
+ * 下面（不在任何片段里），于是字只留在 DOM 上：看得见、保存与导出却是空的，还不报错。
+ * 补一个空段落就有了落点，`getModel()` / `toMd()` 才跟得上版面上打的字。
+ *
+ * 只碰零块这一种输入：非零块一律**原样返回**（一个块都不多不少，comments / editor 等字段
+ * 一个都不丢）。不就地改输入 —— `emptyDoc()` 的返回值可能是调用方持有的引用。
+ */
+export function ensureBodyBlock(doc: DocModel): DocModel {
+  if (doc.blocks.length > 0) return doc
+  return {
+    ...doc,
+    blocks: [{ t: 'textBlock', id: nextBlockId(), kind: 'body', inlines: [] }],
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* 纯函数辅助                                                                  */
 /* -------------------------------------------------------------------------- */
