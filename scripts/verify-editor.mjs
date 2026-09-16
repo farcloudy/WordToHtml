@@ -4477,6 +4477,7 @@ try {
   await page.waitForTimeout(150)
   eq('content 留空时顶栏文件名仍可编辑（回传拿到新值）', (await probe())?.fileName, '空文档探针')
 
+  /* ------------------------------------------------------------------ */
   // ---- AG6. `model` prop：与 `content` 二选一、model 优先；md 装不下的东西只有它保得住 ----
   /*
    * demo 的 `?model=rich` 同时递了一份**非空**的 `content`（SAMPLE），所以「版面上是模型的内容」
@@ -4529,6 +4530,61 @@ try {
     '（对照）走 md 通路：批注的回复线程没了（只剩一条、没有 parentId）',
     mdModel.comments.length === 1 && mdModel.comments[0]?.parentId === undefined,
     JSON.stringify(mdModel.comments),
+  )
+
+  // ---- AG7. 换 model 时的锚点：插入符按「块 id + 字符偏移」落回来，不跳回文首 ----
+  /*
+   * 界限（写进结果的同一条）：anchor 是「块 id + 字符偏移」，只有那个块 id 在新文档里仍然存在时
+   * 才找得回插入符（换一份历史模型、只换 inlines 这类场景）；整篇换成一份全新的文档时块 id 全变了，
+   * anchor 解析不到 —— 所以这里验的正是「块 id 仍在」的那种形态，不另造「按坐标找块」的机制。
+   */
+  await openDemo('?model=rich')
+  const anchorSet = await page.evaluate(() => window.__wtpTest.setCaret('这是', 3))
+  ok('（前沿）插入符放进正文段的第 3 个字之后', anchorSet !== null, JSON.stringify(anchorSet))
+  await page.waitForTimeout(150)
+  const anchorBefore = await page.evaluate(() => window.__wtpTest.caretInfo())
+  const modelBefore = await getModel()
+  ok(
+    '（前沿）插入符在第二个块（正文段）里、不在文首',
+    anchorBefore?.blockId === modelBefore.blocks[1]?.id && anchorBefore?.offset === 3,
+    JSON.stringify(anchorBefore),
+  )
+  // 换进去的模型：块 id 全照旧，只把标题改长（版面真的会变），插入符那一段一字不动
+  const newTitle = '换模型之后的标题（更长了，版面跟着变）'
+  const swapTitleBlockId = await page.evaluate(
+    (payload) => {
+      const next = JSON.parse(JSON.stringify(payload.model))
+      next.blocks[0].inlines = [{ t: 'text', text: payload.title }]
+      window.__wtpDemo.setModel(next)
+      return next.blocks[0].id
+    },
+    { model: modelBefore, title: newTitle },
+  )
+  await page.waitForTimeout(400)
+  const shownTitle = await page.evaluate(() => {
+    const first = document.querySelector('.wtp-page [data-block-id]')
+    return first ? (first.textContent ?? '') : ''
+  })
+  ok(
+    '（前置）换进去的那份模型真的生效了（版面上的标题已经是新的）',
+    shownTitle.includes(newTitle),
+    JSON.stringify(shownTitle.slice(0, 40)),
+  )
+  const caretAfterSwap = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq(
+    '换 model 之后：插入符落回原来的块（块 id 一字不差）',
+    caretAfterSwap?.blockId,
+    anchorBefore?.blockId,
+  )
+  eq(
+    '换 model 之后：插入符落回原来的文字偏移（不是跳回文首、也不是跳到标题块）',
+    caretAfterSwap?.offset,
+    anchorBefore?.offset,
+  )
+  ok(
+    '（反证）插入符没落在刚换过的标题块里、偏移也不是 0',
+    caretAfterSwap?.blockId !== swapTitleBlockId && caretAfterSwap?.offset === 3,
+    JSON.stringify(caretAfterSwap),
   )
 
   /* ------------------------------------------------------------------ */
@@ -4778,5 +4834,9 @@ console.log(
     'preventDefault、save_docx 事件发出、content 留空不报错）；' +
     'W9：追加的 20 个 Ctrl+Alt+… 组合键（段落样式 1/8/0、标红与取消颜色、三种特殊空格的码点 ' +
     '2003/2002/2005、分节符与分页符落在插入符所在段落之后、格内两组对齐 H/J/K 与 ←/Home/→ 写进模型 ' +
-    'align 字段、光标不在格内与没有修订时都只弹提示条且一字不改模型）。',
+    'align 字段、光标不在格内与没有修订时都只弹提示条且一字不改模型）；' +
+    'W12：零块文档（content 留空与 model 给零块两条入口各一遍）载入后恰好一个空白正文段落、' +
+    '在版面上打的中文真的进 toMd(getModel())、全程不报错；model prop 优先于 content 且 md 装不下的' +
+    '修订作者/时间戳与批注回复线程只有走它才保得住（同内容走 md 会被抹平）；换 model 时插入符按' +
+    '「块 id + 字符偏移」落回原处（不跳回文首）。',
 )

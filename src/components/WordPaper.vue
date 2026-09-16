@@ -3466,7 +3466,13 @@ watch([() => props.source, () => props.model], () => {
   clearMeasureCache(cache)
   undoStack.length = 0
   redoStack.length = 0
-  refreshLayout({ force: true })
+  /*
+   * 整篇替换也要把插入符与滚动位置按「块 id + 字符偏移」还回去（与换规格表那一路同源）。
+   * 界限：anchor 认的是块 id，所以只有那个块在新文档里仍然存在时找得回插入符
+   *（换一份历史模型、只换 inlines 这类场景）；整篇换成一份全新文档时块 id 全变了，
+   * anchor 解析不到，落点只能作罢 —— 不为此另造一套「按坐标找块」的机制。
+   */
+  refreshLayout({ anchor: lastCaret, force: true })
   // 模型换了，开关跟着换（模型是权威）
   emitEditorFlags()
 })
