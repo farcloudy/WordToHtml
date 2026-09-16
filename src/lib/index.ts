@@ -49,6 +49,7 @@ export type {
 export {
   allInlineHolders,
   cellId,
+  cellParagraphId,
   collectRevisions,
   commentScopes,
   defaultCellAlignH,
@@ -59,6 +60,7 @@ export {
   plainText,
   resolveEditorFlags,
   sliceInlines,
+  sliceStrict,
 } from './types'
 export type {
   Block,
@@ -131,7 +133,6 @@ export {
   revisionSpanAt,
   setBlockKind,
   setContainerKind,
-  sliceStrict,
   splitBlock,
   updateComment,
 } from './edit/model'
@@ -148,16 +149,21 @@ export type {
 export {
   bodyInsertIndex,
   bodyRowIndexes,
+  cellParagraphCount,
+  cellParagraphs,
   cellRectBetween,
   cellRectIndexOf,
   cellsChangingAlign,
   cellsChangingKind,
   cellsInRect,
   cellsInRects,
+  emptyCell,
   findCell,
+  findCellAt,
   findTable,
   insertBodyRow,
   insertColumn,
+  mergeCellParagraph,
   nextAlignValue,
   normalizeCellCol,
   normalizeTable,
@@ -171,12 +177,13 @@ export {
   setMinLines,
   setRoleRow,
   sortCells,
+  splitCellParagraph,
   stepCell,
   storedCellAlign,
   storedCellKind,
   verticalCell,
 } from './edit/table'
-export type { CellRect, CellRef, CellStep } from './edit/table'
+export type { CellParagraphHit, CellRect, CellRef, CellStep } from './edit/table'
 
 export { formatAmount } from './edit/amount'
 

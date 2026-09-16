@@ -37,6 +37,7 @@
  *   :::
  * 行首 `>` 是 unit 行、`<` 是 note 行（整行一格），`|` 是 body 行（按未转义的竖线切格）；
  * 其它行首忽略。kwarg 只写非默认值：minLines 默认 1、cantSplit 默认 true。
+ * 格内可用 `{p}` 分段（Word 的单元格里放多个 `w:p`）：`| 甲{p}乙 |` 是一格两段。
  *
  * 行内标记：
  *   **文字**          加粗
@@ -46,6 +47,7 @@
  *   {-文字}           删除修订
  *   [[文字|批注内容]]  批注，锚定在「文字」上
  *   {br}              软换行（Word 的 <w:br/>），零宽、不占字符位
+ *   {p}               格内段落标记（**只在表格格里认**；正文里它不是语法）
  *   反斜杠 \ 转义上述所有标记字符
  *
  * 行内标记可以互相嵌套，例如 {红|**重点**}、{+**新增且加粗**}。
@@ -68,6 +70,7 @@ import type {
   TableRowModel,
 } from '../types'
 import { nextBlockId, resolveEditorFlags } from '../types'
+import { emptyCell } from '../edit/table'
 import { normalizeSectionSettings } from '../edit/section'
 
 export interface ParseOptions {
@@ -499,27 +502,69 @@ function splitTableCells(line: string): string[] {
 const CELL_H_ALIGNS: readonly string[] = ['left', 'center', 'right']
 const CELL_V_ALIGNS: readonly string[] = ['top', 'middle', 'bottom']
 
+/** 格内段落标记 */
+const CELL_PARA_MARK = '{p}'
+
 /**
- * 单元格开头的可选指令：`{@<token>[,<token>]…|<格内正文>}`（本波唯一的新语法）。
+ * 按**顶层**的 `{p}` 把一格的内容切成若干段。
  *
- * 只在表格解析里认 —— **不并进通用的 parseDirective**，否则普通段落里也会长出这套语义。
- * 三类 token 互不冲突：BlockKind 名 → 该格样式；left/center/right → 水平对齐；
- * top/middle/bottom → 垂直对齐。不认识的 token 一律忽略、不报错；
- * 显式写出默认样式 `listItem` 同样不落字段（见函数末尾的注释）。
+ * 「顶层」= 没落在 `{}` 指令、`[[]]` 批注、反斜杠转义里面 —— 与 splitTableCells 同一套
+ * depth / comment 扫描。`{p}` 只在表格格里认（**不并进通用的 parseDirective**，否则正文里
+ * 也会长出这套语义）：`| 甲{p}乙 |` 是一格两段，`{br}` 仍是段内的软换行。
  *
- * 转义可逆：正文里真写 `{@x|y}` 会被 serialize.ts 的 escapeText 转成 `\{@x|y\}`，
- * 解析时反斜杠吃掉 `{`，就还原成字面量。
- * `{@` 之后找不到闭合的 `}`（或没有分隔 token 与正文的 `|`）时**当普通内容处理**，
- * 绝不吞掉后面的内容。
+ * 首段为空（`| {p}乙 |`）与尾随空段（`| 甲{p} |`）都**保留成真实的一段**：它们是模型里
+ * 合法的 `[[], [文字]]` / `[[文字], []]`，往返必须双向可逆、字节稳定。
  */
-function parseCellAttrs(text: string, ctx: InlineContext): TableCellModel {
-  if (!text.startsWith('{@')) return { inlines: parseInline(text, ctx) }
+function splitCellParagraphs(text: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let depth = 0
+  let comment = false
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] ?? ''
+    if (comment) {
+      cur += ch
+      if (ch === ']' && text[i + 1] === ']' && !isEscapedAt(text, i)) {
+        cur += ']'
+        i += 1
+        comment = false
+      }
+      continue
+    }
+    if (ch === '[' && text[i + 1] === '[' && !isEscapedAt(text, i)) {
+      cur += '[['
+      i += 1
+      comment = true
+      continue
+    }
+    if (ch === '{' && !isEscapedAt(text, i)) {
+      // 只有「顶层且正好是完整的 {p}」才算段落标记；`\{p\}` 里的那个被反斜杠吃掉，不算
+      if (depth === 0 && text.startsWith(CELL_PARA_MARK, i)) {
+        out.push(cur)
+        cur = ''
+        i += CELL_PARA_MARK.length - 1
+        continue
+      }
+      depth += 1
+    } else if (ch === '}' && depth > 0 && !isEscapedAt(text, i)) {
+      depth -= 1
+    }
+    cur += ch
+  }
+  out.push(cur)
+  return out
+}
+
+/** 一格的内容切成 kind / align 前缀与正文（正文里可能还带 `{p}`，由调用方再切段） */
+function splitCellAttrPrefix(text: string): { kind?: BlockKind; align?: TableCellAlign; body: string } {
+  if (!text.startsWith('{@')) return { body: text }
 
   const close = findMatchingBrace(text, 0)
-  if (close < 0) return { inlines: parseInline(text, ctx) }
+  if (close < 0) return { body: text }
   const inner = text.slice(2, close)
   const bar = findTopLevelBar(inner)
-  if (bar < 0) return { inlines: parseInline(text, ctx) }
+  if (bar < 0) return { body: text }
 
   let kind: BlockKind | undefined
   let align: TableCellAlign | undefined
@@ -535,11 +580,31 @@ function parseCellAttrs(text: string, ctx: InlineContext): TableCellModel {
   }
 
   // 闭合 `}` 之后若还有内容，一并当正文（正常写法不会有，但不许静默丢掉）
-  const inlines = [
-    ...parseInline(inner.slice(bar + 1), ctx),
-    ...parseInline(text.slice(close + 1), ctx),
-  ]
-  const cell: TableCellModel = { inlines }
+  return {
+    ...(kind !== undefined ? { kind } : {}),
+    ...(align !== undefined ? { align } : {}),
+    body: inner.slice(bar + 1) + text.slice(close + 1),
+  }
+}
+
+/**
+ * 单元格内容 → 模型。开头可选指令 `{@<token>[,<token>]…|<格内正文>}`（本波之前就有的语法），
+ * 格内正文再按顶层 `{p}` 切成**多段**（每段一段 inline）。
+ *
+ * 三类 token 互不冲突：BlockKind 名 → 该格样式；left/center/right → 水平对齐；
+ * top/middle/bottom → 垂直对齐。不认识的 token 一律忽略、不报错；
+ * 显式写出默认样式 `listItem` 同样不落字段（见函数末尾的注释）。
+ *
+ * 转义可逆：正文里真写 `{@x|y}` 会被 serialize.ts 的 escapeText 转成 `\{@x|y\}`，
+ * 解析时反斜杠吃掉 `{`，就还原成字面量。
+ * `{@` 之后找不到闭合的 `}`（或没有分隔 token 与正文的 `|`）时**当普通内容处理**，
+ * 绝不吞掉后面的内容。
+ */
+function parseCell(text: string, ctx: InlineContext): TableCellModel {
+  const { kind, align, body } = splitCellAttrPrefix(text)
+  const cell: TableCellModel = {
+    paragraphs: splitCellParagraphs(body).map((part) => ({ inlines: parseInline(part, ctx) })),
+  }
   // 'listItem' 就是默认样式：认出它也不落字段。setCellKind 在设回默认时会删字段、序列化也会省略它，
   // 这里跟这两处对齐（模型里不留冗余值）—— 围栏的 minLines=1 / cantSplit 早就是这个约定。
   if (kind !== undefined && kind !== 'listItem') cell.kind = kind
@@ -576,14 +641,14 @@ function parseTableBlock(
       // 整行一格：文字就是标记之后的内容（再剥一个空格，与序列化写的 "> xxx" 互逆）。
       // 这一支**不能 trimEnd** —— 行尾空格属于内容；body 行不同，它的内容后面还有
       // 一枚外框 `|`，所以对 body 行 trimEnd 只会削掉框外的空白。
-      const cells: TableCellModel[] = [parseCellAttrs(stripOneSpace(line.slice(1)), ctx)]
+      const cells: TableCellModel[] = [parseCell(stripOneSpace(line.slice(1)), ctx)]
       rows.push({ role: line.startsWith('>') ? 'unit' : 'note', cells })
       continue
     }
     if (line.startsWith('|')) {
       rows.push({
         role: 'body',
-        cells: splitTableCells(line.trimEnd()).map((text) => parseCellAttrs(text, ctx)),
+        cells: splitTableCells(line.trimEnd()).map((text) => parseCell(text, ctx)),
       })
       continue
     }
@@ -591,7 +656,7 @@ function parseTableBlock(
   }
 
   if (!closed) return null
-  if (rows.length === 0) rows.push({ role: 'body', cells: [{ inlines: [] }] })
+  if (rows.length === 0) rows.push({ role: 'body', cells: [emptyCell()] })
   let columns = 1
   for (const row of rows) {
     if (row.role === 'body') columns = Math.max(columns, row.cells.length)

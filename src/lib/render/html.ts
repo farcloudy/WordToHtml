@@ -11,7 +11,8 @@
 
 import type { Align } from '../spec'
 import type { Inline, TableBlock, TableCellModel, TableRowModel } from '../types'
-import { cellId, defaultCellAlignH, inlinesText } from '../types'
+import { cellId, cellParagraphId, defaultCellAlignH, inlinesText } from '../types'
+import { cellParagraphs, emptyCell } from '../edit/table'
 
 export function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -114,18 +115,20 @@ export function renderInlinesHtml(
  *     `fragmentOf` 向上取最近的 `data-block-id`，而 `retagFragments` / `syncPlain`
  *     用 `querySelectorAll('[data-block-id]')` 找片段；外层挂了就会被当成一个片段，
  *     整张表会被当成一段文字读回模型。外层改用 `data-table-id` + `data-row-from/to`。
- *   · 格内那层 div 挂 `wtp-cell wtp-<kind>` + `data-block-id = cellId(...)` +
- *     `data-from="0"` / `data-to="<格内文字长度>"`。`wtp-cell` 是给验收脚本与 CSS 用的
- *     稳定钩子，`wtp-<kind>` 才是那条样式（缺省 `listItem`，与 W4a 起的默认一致）。
- *     这样 `edit/dom.ts` 的坐标换算一行都不用改：格内光标自然落到这一层上。
+ *   · 格内是「一层包装 + 每段一个可寻址 div」：外层 `<div class="wtp-cell">` 是给脚本
+ *     与 CSS 用的**稳定钩子**（**不挂 data-block-id** —— 挂了 `fragmentOf` 会把整格当成
+ *     一个容器，与「每段一个容器」冲突），里面每个段落一个
+ *     `<div class="wtp-cellpara wtp-<kind>" data-block-id data-from="0" data-to="<段长>">`。
+ *     段落 id 是 `cellId(...)`（第 0 段）/ `cellId(...).pN`（第 N 段）。
+ *     这样 `edit/dom.ts` 的坐标换算一行都不用改：格内光标自然落到那一段上。
  *   · `unit` / `note` 行天然整行一格（`colspan = columns`、无边框）。它们的角色默认对齐
- *     （unit 右、note 左）写在格内 div 的行内 style 上；逐格覆盖也走同一条路。
+ *     （unit 右、note 左）写在段落的行内 style 上；逐格覆盖也走同一条路。
  *     垂直对齐只能写在 `<td>` 上（格内 div 上的 vertical-align 无效）。
  *   · `<td>` 挂 `wtp-td` + `wtp-td-<kind>`（plain 行另有 `wtp-td-plain`）+ 恒定的
- *     `data-cell-id`（与格内 div 的 `data-block-id` 同一个值），
- *     行高的**最小值**由 CSS 按这个类名写在 `td` 的 `height` 上（不是格内 div 的 min-height）
- *     —— 写在内层 div 上会把 div 本身撑成两行高，`vertical-align` 就再也挪不动那一行字了
- *     （div 已经填满整个格子，对齐的是 div 而不是 div 里的字）。见 css.ts 的表格一段。
+ *     `data-cell-id`（= 第 0 段的 id），行高的**最小值**由 CSS 按这个类名写在 `td` 的
+ *     `height` 上（不是格内 div 的 min-height）—— 写在内层 div 上会把 div 本身撑成两行高，
+ *     `vertical-align` 就再也挪不动那一行字了（div 已经填满整个格子，对齐的是 div 而不是
+ *     div 里的字）。见 css.ts 的表格一段。
  *     `data-cell-id` 是给**整格复选**的高亮用的：它只由模型决定（与选中态无关），
  *     所以量测缓存签名、逐块量测对账都不受影响；选中高亮由组件在 DOM 上按它挂类名
  *     （见 css.ts 的 CELL_SELECTION_CLASS）。
@@ -149,7 +152,13 @@ function cssTextAlign(a: Align): string {
   return a === 'both' ? 'justify' : a
 }
 
-/** 格内那一层 div：`r` 是 rows 数组下标，与 cellId 同一套 */
+/**
+ * 格内那层包装 + 每段一个可寻址 div。`r` 是 rows 数组下标，与 cellId 同一套。
+ *
+ * 段距与缩进全靠每段的 `wtp-<kind>`（Word 在格内也逐段算段前段后），包装层不写任何
+ * margin / padding / min-height；空段靠 renderInlinesHtml 的占位 `<br>` 撑出高度。
+ * `divStyle` 只写给每段（水平对齐逐段生效）。
+ */
 function tableCellHtml(
   tableId: string,
   r: number,
@@ -157,13 +166,18 @@ function tableCellHtml(
   cell: TableCellModel,
   divStyle = '',
 ): string {
-  const length = inlinesText(cell.inlines).length
   const kind = cell.kind ?? 'listItem'
   const style = divStyle === '' ? '' : ` style="${divStyle}"`
-  return (
-    `<div class="wtp-cell wtp-${kind}" data-block-id="${cellId(tableId, r, c)}" ` +
-    `data-from="0" data-to="${length}"${style}>${renderInlinesHtml(cell.inlines)}</div>`
-  )
+  const paras = cellParagraphs(cell)
+    .map((para, p) => {
+      const length = inlinesText(para.inlines).length
+      return (
+        `<div class="wtp-cellpara wtp-${kind}" data-block-id="${cellParagraphId(tableId, r, c, p)}" ` +
+        `data-from="0" data-to="${length}"${style}>${renderInlinesHtml(para.inlines)}</div>`
+      )
+    })
+    .join('')
+  return `<div class="wtp-cell">${paras}</div>`
 }
 
 function tableBodyRow(
@@ -175,7 +189,7 @@ function tableBodyRow(
   const cells: string[] = []
   for (let c = 0; c < columns; c += 1) {
     // 缺格补空：Word 的表格必须是矩形；模型仍按 md 原样存（少一格的书写方式不该被解析改写）
-    const cell = row.cells[c] ?? { inlines: [] }
+    const cell = row.cells[c] ?? emptyCell()
     // 水平默认值来自 `wtp-<kind>` 那条样式（body 格跟着自己的样式），只有覆盖才写行内；
     // 垂直对齐的默认是 top（全局 CSS 已是 top），只有覆盖才写 <td> 的行内样式。
     const divStyle = cell.align?.h ? `text-align: ${cssTextAlign(cell.align.h)}` : ''
@@ -195,9 +209,9 @@ function tablePlainRow(
   r: number,
   columns: number,
 ): string {
-  const cell = row.cells[0] ?? { inlines: [] }
+  const cell = row.cells[0] ?? emptyCell()
   // unit 右对齐、note 左对齐是角色默认（不是覆盖），所以这里也照写行内 ——
-  // 格内的 `wtp-listItem` 类把它默认成 justify，不写就丢了对齐。
+  // 段落的 `wtp-listItem` 类把它默认成 justify，不写就丢了对齐。
   const h = cell.align?.h ?? defaultCellAlignH(row.role, 'both')
   const v = cell.align?.v ?? 'top'
   const divStyle = `text-align: ${cssTextAlign(h)}`

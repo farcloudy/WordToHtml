@@ -344,10 +344,14 @@ writeFileSync(outPath, buffer)
       (role === 'unit' ? 'right' : role === 'note' ? 'left' : spec.styles[cell.kind ?? 'listItem'].align)
     // OOXML 的 w:vAlign 没有 middle，垂直居中写作 center
     const vertNameOf = (cell) => (cell.align?.v === 'middle' ? 'center' : (cell.align?.v ?? 'top'))
+    // 格内是多段落的：每段的 pStyle / w:jc 各写一份，w:vAlign 是**格子级**的（一格一份）
+    const paragraphsOf = (cell) => (cell.paragraphs?.length ? cell.paragraphs : [{ inlines: [] }])
+    /** 缺格补空（导出侧同一条规则）：矩形化只发生在渲染 / 导出这一侧 */
+    const cellOf = () => ({ paragraphs: [{ inlines: [] }] })
     const renderedCells = (t, row) =>
       row.role === 'body'
-        ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? { inlines: [] })
-        : [row.cells[0] ?? { inlines: [] }]
+        ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? cellOf())
+        : [row.cells[0] ?? cellOf()]
 
     tables.forEach((t, ti) => {
       const xml = tblXmls[ti] ?? ''
@@ -413,17 +417,18 @@ writeFileSync(outPath, buffer)
       diffCounts(
         '格内样式（w:pStyle）',
         // kind === 'body' 的格不挂样式（正文就是 Word 的 Normal，styles.xml 里没有 WT-Body），
-        // 所以它们不产出 <w:pStyle>
+        // 所以它们不产出 <w:pStyle>。**逐段**计数：格内多段落时每段各一份。
         tally(
           cells
             .filter(({ cell }) => (cell.kind ?? 'listItem') !== 'body')
-            .map(({ cell }) => styleIdOf(cell)),
+            .flatMap(({ cell }) => paragraphsOf(cell).map(() => styleIdOf(cell))),
         ),
         tally([...xml.matchAll(/<w:pStyle w:val="([^"]+)"\/>/g)].map((m) => m[1])),
       )
       diffCounts(
         '水平对齐（w:jc）',
-        tally(cells.map(({ role, cell }) => alignNameOf(role, cell))),
+        // 水平对齐逐段写（格内多段落时每段一份）；垂直对齐才是格子级
+        tally(cells.flatMap(({ role, cell }) => paragraphsOf(cell).map(() => alignNameOf(role, cell)))),
         tally([...xml.matchAll(/<w:jc w:val="([^"]+)"\/>/g)].map((m) => m[1])),
       )
       diffCounts(
@@ -528,6 +533,64 @@ writeFileSync(outPath, buffer)
     }
     console.log(
       `[ok] 空页脚：独立页脚 + numbers=off 写出 footerReference（头部 ${footerParts.length} 个），PAGE 域 ${pageFields} 处`,
+    )
+
+    /*
+     * 格内多段落（md 里的 `{p}`）：Word 里就是**同一个 `w:tc` 里放 N 个 `w:p`**。
+     * 内置样本刻意保持单段落（Word COM 那套断言的口径不变），这里单独造一份最小 docx
+     * 在字节层验：段数、逐段 pStyle / w:jc、以及「w:vAlign 是格子级、一格一枚」。
+     */
+    const paraModel = parseMd(
+      [':::table minLines=2', '> 单位：元', '| {@h2,center|甲{p}乙} | 丙 |', ':::'].join('\n'),
+      { now },
+    )
+    const paraBuf = Buffer.from(await toBase64(paraModel, spec, { title: '格内多段落' }), 'base64')
+    const paraZip = await JSZip.loadAsync(paraBuf)
+    const paraXml = await paraZip.file('word/document.xml').async('string')
+    const tcXml = [...paraXml.matchAll(/<w:tc>[\s\S]*?<\/w:tc>/g)].map((m) => m[0])
+    const countIn = (xml, re) => (xml.match(re) ?? []).length
+    const h2Id = spec.styles.h2.id
+    if (tcXml.length !== 3) {
+      problems.push(`格内多段落：w:tc 数不符（期望 3，实际 ${tcXml.length}）`)
+    } else {
+      const [unitTc, multiTc, singleTc] = tcXml
+      if (countIn(unitTc, /<w:p>|<w:p [^>]*>/g) !== 1) {
+        problems.push('格内多段落：unit 行（整行合并）应只有 1 个 w:p')
+      }
+      if (countIn(multiTc, /<w:p>|<w:p [^>]*>/g) !== 2) {
+        problems.push(
+          `格内多段落：两段的格应写出 2 个 w:p（实际 ${countIn(multiTc, /<w:p>|<w:p [^>]*>/g)} 个）`,
+        )
+      }
+      if (countIn(singleTc, /<w:p>|<w:p [^>]*>/g) !== 1) {
+        problems.push('格内多段落：单段的格应只写出 1 个 w:p')
+      }
+      // 逐段 pStyle / w:jc 各一份（样式与水平对齐是格级的，但写在每段上）
+      if (countIn(multiTc, new RegExp(`<w:pStyle w:val="${h2Id}"/>`, 'g')) !== 2) {
+        problems.push(`格内多段落：两段应各带一份 w:pStyle（val=${h2Id}）`)
+      }
+      if (countIn(multiTc, /<w:jc w:val="center"\/>/g) !== 2) {
+        problems.push('格内多段落：两段应各带一份 <w:jc w:val="center"/>')
+      }
+      // 垂直对齐是格子级的：一格一枚，别跟着段数长
+      for (const [name, xml] of [
+        ['unit 格', unitTc],
+        ['两段的格', multiTc],
+        ['单段的格', singleTc],
+      ]) {
+        if (countIn(xml, /<w:vAlign\b/g) !== 1) {
+          problems.push(`格内多段落：${name}的 w:vAlign 应恰好 1 枚`)
+        }
+      }
+      // 两段的文字各自成段（`甲` / `乙`），段数对上了文字也得对上
+      const texts = [...multiTc.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)].map((m) => m[1])
+      if (texts.join('/') !== '甲/乙') {
+        problems.push(`格内多段落：两段的文字应分别是 甲 / 乙（实际 ${texts.join('/')}）`)
+      }
+    }
+    console.log(
+      `[ok] 格内多段落：一个 w:tc 里 ${countIn(tcXml[1] ?? '', /<w:p>|<w:p [^>]*>/g)} 个 w:p，` +
+        '逐段 pStyle / w:jc、每格一枚 w:vAlign',
     )
   }
 

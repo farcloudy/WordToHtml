@@ -24,6 +24,7 @@ import {
   SHORTCUT_ACTIONS,
   STYLE_KEYS,
   addComment,
+  allInlineHolders,
   applyFormat,
   blockLength,
   bodyInsertIndex,
@@ -33,6 +34,9 @@ import {
   canJoinWithNext,
   canMergeIntoPrevious,
   cellId,
+  cellParagraphCount,
+  cellParagraphId,
+  cellParagraphs,
   cellRectBetween,
   cellRectIndexOf,
   cellsChangingAlign,
@@ -46,8 +50,10 @@ import {
   contentBoxPx,
   deleteRange,
   deleteSpan,
+  emptyCell,
   findBlock,
   findCell,
+  findCellAt,
   findContainer,
   findMatches,
   findTable,
@@ -60,6 +66,7 @@ import {
   insertText,
   joinWithNext,
   matchShortcut,
+  mergeCellParagraph,
   mergeIntoPrevious,
   nextAlignValue,
   normalizeBlocks,
@@ -106,6 +113,7 @@ import {
   sliceInlines,
   sortCells,
   splitBlock,
+  splitCellParagraph,
   stepCell,
   storedCellAlign,
   storedCellKind,
@@ -147,6 +155,40 @@ function docFrom(...texts) {
 }
 
 const textOf = (model) => model.blocks.map((b) => (b.t === 'textBlock' ? plainText(b) : '---'))
+
+/**
+ * 格内第 p 段的文字（缺省第 0 段）。
+ * 格内是多段落的（`TableCellModel.paragraphs`），所以读格子文字一律按段读 ——
+ * 单段格子读 `paraText(cell)` 即旧写法里的「格内文字」。
+ */
+const paraText = (cell, p = 0) =>
+  (cellParagraphs(cell)[p]?.inlines ?? [])
+    .filter((i) => i.t === 'text')
+    .map((i) => i.text)
+    .join('')
+
+/** 格内各段文字，用 `|` 连起来（多段断言的便捷形式） */
+const parasText = (cell) => cellParagraphs(cell).map((_, p) => paraText(cell, p)).join('|')
+
+/** 造一张表（多段落形状）—— 章节里那些直接手搓表格的用例共用 */
+const makeTable = (rows, columns = 1, minLines = 1) => ({
+  t: 'table',
+  id: 'tb1',
+  rows,
+  columns,
+  minLines,
+  cantSplit: true,
+})
+
+/** 一格：一段或多段（传多个字符串就是多段；不传就是一段空段） */
+const cellOf = (...texts) => ({
+  paragraphs: (texts.length === 0 ? [''] : texts).map((text) => ({
+    inlines: text === '' ? [] : [{ t: 'text', text }],
+  })),
+})
+
+const bodyRow = (...texts) => ({ role: 'body', cells: texts.map((text) => cellOf(text)) })
+const roleRow = (role, text = '') => ({ role, cells: [cellOf(text)] })
 
 console.log('=== 1. replaceRange：增 / 删 / 改 ===')
 {
@@ -879,8 +921,7 @@ console.log('\n=== 16. buildOutline / outlineSignature ===')
 
 console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
 {
-  const cellText = (cell) =>
-    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+  const cellText = (c) => paraText(c)
 
   const src = [
     ':::table minLines=2',
@@ -905,9 +946,10 @@ console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
   eq('note 行整行一格', table.rows[4].cells.length, 1)
   eq('unit 行文字', cellText(table.rows[0].cells[0]), '单位：元')
   eq('note 行文字', cellText(table.rows[4].cells[0]), '注：以上金额不含税')
-  eq('列标题加粗', table.rows[1].cells[0].inlines[0].bold, true)
+  eq('列标题加粗', table.rows[1].cells[0].paragraphs[0].inlines[0].bold, true)
   eq('格里的竖线没被当分隔符', cellText(table.rows[3].cells[0]), '备注|说明')
   eq('格里的反斜杠原样还原', cellText(table.rows[3].cells[1]), '含\\反斜杠')
+  eq('单段格子的段数 = 1（不变式 paragraphs.length >= 1）', table.rows[1].cells[0].paragraphs.length, 1)
 
   const md2 = toMd(model)
   eq('kwarg 只写非默认值', md2.split('\n')[0], ':::table minLines=2')
@@ -927,19 +969,33 @@ console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
   eq('空表规范化成 1 行', empty.rows.length, 1)
   eq('空表规范化成 1 格', empty.rows[0].cells.length, 1)
   eq('空表规范化成 1 列', empty.columns, 1)
+  eq('空表的格子也有一段（不变式）', empty.rows[0].cells[0].paragraphs.length, 1)
 
-  eq('cellId', cellId('tb1', 2, 3), 'tb1.r2c3')
+  eq('cellId 恒指第 0 段', cellId('tb1', 2, 3), 'tb1.r2c3')
+  eq('cellParagraphId 第 0 段就是 cellId', cellParagraphId('tb1', 2, 3, 0), 'tb1.r2c3')
+  eq('cellParagraphId 第 N 段带 .pN', cellParagraphId('tb1', 2, 3, 2), 'tb1.r2c3.p2')
   eq(
-    'parseCellId 往返',
+    'parseCellId 往返（含 para 缺省 0）',
     JSON.stringify(parseCellId('tb1.r2c3')),
-    JSON.stringify({ tableId: 'tb1', row: 2, col: 3 }),
+    JSON.stringify({ tableId: 'tb1', row: 2, col: 3, para: 0 }),
+  )
+  eq(
+    'parseCellId 认 .pN 后缀',
+    JSON.stringify(parseCellId('tb1.r2c3.p5')),
+    JSON.stringify({ tableId: 'tb1', row: 2, col: 3, para: 5 }),
+  )
+  eq(
+    'parseCellId 认显式 .p0',
+    JSON.stringify(parseCellId('tb1.r0c0.p0')),
+    JSON.stringify({ tableId: 'tb1', row: 0, col: 0, para: 0 }),
   )
   eq('parseCellId 拒绝非单元格 id', parseCellId('b1'), null)
+  eq('parseCellId 拒绝残缺的段号', parseCellId('tb1.r2c3.pX'), null)
 
   // cloneDoc 必须逐层新建：撤销栈与渲染快照都靠它，共享引用会被后续编辑改到
   const copy = cloneDoc(model)
-  copy.blocks[0].rows[1].cells[0].inlines[0].text = '改过了'
-  copy.blocks[0].rows.push({ role: 'body', cells: [{ inlines: [] }] })
+  copy.blocks[0].rows[1].cells[0].paragraphs[0].inlines[0].text = '改过了'
+  copy.blocks[0].rows.push({ role: 'body', cells: [emptyCell()] })
   eq('副本的行数变了', copy.blocks[0].rows.length, 6)
   eq('原件行数没变', model.blocks[0].rows.length, 5)
   eq('原件格文字没变', cellText(model.blocks[0].rows[1].cells[0]), '项目')
@@ -947,17 +1003,215 @@ console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
   eq('不共享 cells 数组', copy.blocks[0].rows[1].cells === model.blocks[0].rows[1].cells, false)
   eq(
     '不共享 inlines 数组',
-    copy.blocks[0].rows[1].cells[0].inlines === model.blocks[0].rows[1].cells[0].inlines,
+    copy.blocks[0].rows[1].cells[0].paragraphs[0].inlines ===
+      model.blocks[0].rows[1].cells[0].paragraphs[0].inlines,
+    false,
+  )
+  eq(
+    '不共享 paragraphs 数组',
+    copy.blocks[0].rows[1].cells[0].paragraphs === model.blocks[0].rows[1].cells[0].paragraphs,
     false,
   )
 }
 
-console.log('\n=== 17b. 表格：格内行内语法 / 首尾空格 / 未闭合围栏 ===')
+console.log('\n=== 17a. 格内多段落：md `{p}` / 段落下标 / 切分与合并 ===')
+{
+  // 段间用 {p}：一个格子里两段（Word 的 w:tc 里放两个 w:p）
+  const two = parseMd(':::table\n| 甲{p}乙 | b |\n:::')
+  const twoCell = two.blocks[0].rows[0].cells[0]
+  eq('一格解析出两段', twoCell.paragraphs.length, 2)
+  eq('第一段', paraText(twoCell, 0), '甲')
+  eq('第二段', paraText(twoCell, 1), '乙')
+  eq('隔壁格不受影响（仍是一段）', two.blocks[0].rows[0].cells[1].paragraphs.length, 1)
+  eq('写回 {p}', toMd(two), ':::table\n| 甲{p}乙 | b |\n:::')
+  eq('再往返一次字节稳定', toMd(parseMd(toMd(two))), toMd(two))
+  eq(
+    '多段往返结构一致',
+    JSON.stringify(normalizeBlocks(parseMd(toMd(two)))),
+    JSON.stringify(normalizeBlocks(two)),
+  )
+
+  // 边界：尾随空段 / 首段为空 —— 都必须双向可逆、字节稳定
+  const tail = parseMd(':::table\n| 甲{p} |\n:::')
+  eq('尾随空段：两段', tail.blocks[0].rows[0].cells[0].paragraphs.length, 2)
+  eq('尾随空段：第二段是空的', paraText(tail.blocks[0].rows[0].cells[0], 1), '')
+  eq('尾随空段写回去', toMd(tail), ':::table\n| 甲{p} |\n:::')
+  eq('尾随空段往返字节稳定', toMd(parseMd(toMd(tail))), toMd(tail))
+
+  const head = parseMd(':::table\n| {p}乙 |\n:::')
+  eq('首段为空：两段', head.blocks[0].rows[0].cells[0].paragraphs.length, 2)
+  eq('首段为空：第一段是空的', paraText(head.blocks[0].rows[0].cells[0], 0), '')
+  eq('首段为空写回去', toMd(head), ':::table\n| {p}乙 |\n:::')
+  eq('首段为空往返字节稳定', toMd(parseMd(toMd(head))), toMd(head))
+
+  eq('三段的写法', parasText(parseMd(':::table\n| 甲{p}乙{p}丙 |\n:::').blocks[0].rows[0].cells[0]), '甲|乙|丙')
+  eq('段内的 {br} 仍是软换行（不切段）', parseMd(':::table\n| 甲{br}乙 |\n:::').blocks[0].rows[0].cells[0].paragraphs.length, 1)
+  eq(
+    '段内的 {br} 写回去',
+    toMd(parseMd(':::table\n| 甲{br}乙 |\n:::')),
+    ':::table\n| 甲{br}乙 |\n:::',
+  )
+
+  // 与 {@…} 同现：指令的正文部分同样要按 {p} 切
+  const withAttrs = parseMd(':::table\n| {@h2,center|甲{p}乙} |\n:::')
+  const attrsCell = withAttrs.blocks[0].rows[0].cells[0]
+  eq('{@…} 与 {p} 同现：两段', attrsCell.paragraphs.length, 2)
+  eq('{@…} 与 {p} 同现：样式落在格子上', attrsCell.kind, 'h2')
+  eq('{@…} 与 {p} 同现：对齐也落在格子上', attrsCell.align?.h, 'center')
+  eq('{@…} 与 {p} 同现：文字', parasText(attrsCell), '甲|乙')
+  eq('{@…} 与 {p} 同现写回去', toMd(withAttrs), ':::table\n| {@h2,center|甲{p}乙} |\n:::')
+  eq('{@…} 与 {p} 同现往返稳定', toMd(parseMd(toMd(withAttrs))), toMd(withAttrs))
+
+  // 转义：正文里真写 {p} 字面量要可逆，且不许被当成段落标记
+  const literal = parseMd(':::table\n| \\{p\\} |\n:::')
+  const literalCell = literal.blocks[0].rows[0].cells[0]
+  eq('转义后的 {p} 是字面量（不切段）', literalCell.paragraphs.length, 1)
+  eq('转义后的 {p} 文字', paraText(literalCell), '{p}')
+  eq('字面量写回去仍是转义形态', toMd(literal), ':::table\n| \\{p\\} |\n:::')
+  eq('字面量往返稳定', toMd(parseMd(toMd(literal))), toMd(literal))
+
+  // 段落标记只在顶层认：{} 里面、[[]] 里面的 {p} 是内容
+  eq(
+    '竖线指令里的 {p} 不算段落标记',
+    parseMd(':::table\n| {红|甲{p}乙} |\n:::').blocks[0].rows[0].cells[0].paragraphs.length,
+    1,
+  )
+
+  // splitCellParagraph / mergeCellParagraph：边界与坐标
+  const doc = parseMd(':::table\n| 甲乙丙 | d |\n| e | f |\n:::')
+  const table = doc.blocks[0]
+  const id0 = cellId(table.id, 0, 0)
+  eq('切分：返回新段落下标', splitCellParagraph(doc, id0, 1, 'listItem'), 1)
+  eq('切分：格内两段', cellParagraphCount(table.rows[0].cells[0]), 2)
+  eq('切分：前段', paraText(table.rows[0].cells[0], 0), '甲')
+  eq('切分：后段', paraText(table.rows[0].cells[0], 1), '乙丙')
+  eq('切分：后续段整体后移（第 0 段仍是甲）', paraText(table.rows[0].cells[0], 0), '甲')
+
+  // 在第 1 段里再切一刀：新段落是 .p2 形态
+  eq('再切一刀返回 2', splitCellParagraph(doc, cellParagraphId(table.id, 0, 0, 1), 1, 'listItem'), 2)
+  eq('三段', parasText(table.rows[0].cells[0]), '甲|乙|丙')
+  eq('第 0 段之前的段落标记不存在', splitCellParagraph(doc, cellId(table.id, 9, 9), 0, 'listItem'), null)
+  eq('越界段号切不动', splitCellParagraph(doc, cellParagraphId(table.id, 0, 0, 9), 0, 'listItem'), null)
+  eq('段落 id 不是格子 → null', splitCellParagraph(doc, doc.blocks[0].id, 0, 'listItem'), null)
+
+  eq('合并点 = 前段原长度', mergeCellParagraph(doc, id0, 1), 1)
+  eq('合并后两段', parasText(table.rows[0].cells[0]), '甲乙|丙')
+  eq('第 0 段之前不并（不许并到上一格）', mergeCellParagraph(doc, id0, 0), null)
+  eq('越界段号并不动', mergeCellParagraph(doc, id0, 9), null)
+  eq('段落 id → null', mergeCellParagraph(doc, doc.blocks[0].id, 1), null)
+  eq('合并到底只剩一段', (mergeCellParagraph(doc, id0, 1), parasText(table.rows[0].cells[0])), '甲乙丙')
+  eq('只剩一段时再并 → null', mergeCellParagraph(doc, id0, 1), null)
+
+  /*
+   * 坏输入护栏：手搓模型（`props.model` 直给）可能缺 `paragraphs` 或给空数组。
+   * 结构操作必须**先把模型补齐再改** —— 不许抛 TypeError，也不许只改一份临时兜底对象
+   * （那会让函数报「切好了」而模型一字未动）。
+   */
+  const broken = parseMd(':::table\n| 甲 | 乙 |\n:::')
+  const brokenCells = broken.blocks[0].rows[0].cells
+  delete brokenCells[0].paragraphs
+  brokenCells[1].paragraphs = []
+  eq(
+    '缺 paragraphs 的格子：切段不抛，返回新段落下标 1',
+    splitCellParagraph(broken, cellId(broken.blocks[0].id, 0, 0), 0, 'listItem'),
+    1,
+  )
+  eq('缺 paragraphs 的格子：切完模型里真的两段', brokenCells[0].paragraphs.length, 2)
+  eq('空数组的格子：合并先补齐再判，返回 null', mergeCellParagraph(broken, cellId(broken.blocks[0].id, 0, 1), 1), null)
+  eq('空数组的格子：补齐成一段（写回模型）', brokenCells[1].paragraphs.length, 1)
+  eq(
+    '空数组的格子：切段同样补齐再切',
+    splitCellParagraph(broken, cellId(broken.blocks[0].id, 0, 1), 1, 'listItem'),
+    1,
+  )
+  eq('空数组的格子：切完也是两段', brokenCells[1].paragraphs.length, 2)
+
+
+  // findCellAt：格子 + 那一段一起给
+  const hit = findCellAt(doc, id0)
+  eq('findCellAt 拿到格子', hit?.cell === table.rows[0].cells[0], true)
+  eq('findCellAt 拿到段落本尊', hit?.paragraph === table.rows[0].cells[0].paragraphs[0], true)
+  eq('findCellAt 的 para', hit?.para, 0)
+  eq('findCellAt 越界段 → null', findCellAt(doc, `${id0}.p9`), null)
+  eq('findCellAt 越界行 → null', findCellAt(doc, cellId(table.id, 9, 0)), null)
+  eq('findCellAt 认 .pN', findCellAt(doc, cellParagraphId(table.id, 0, 0, 0))?.para, 0)
+}
+
+console.log('\n=== 17b. 格内多段落：容器查找 / cloneDoc / allInlineHolders ===')
+{
+  const doc = parseMd(':::table\n| 甲{p}乙 | d |\n:::')
+  const table = doc.blocks[0]
+  const id = table.id
+
+  // findContainer 认 .pN，且给的是那一段本尊
+  eq('第 0 段', findContainer(doc, cellId(id, 0, 0)) === table.rows[0].cells[0].paragraphs[0], true)
+  eq(
+    '第 1 段',
+    findContainer(doc, cellParagraphId(id, 0, 0, 1)) === table.rows[0].cells[0].paragraphs[1],
+    true,
+  )
+  eq('越界段号 → undefined', findContainer(doc, cellParagraphId(id, 0, 0, 9)), undefined)
+  eq('越界行号 → undefined', findContainer(doc, cellId(id, 9, 0)), undefined)
+  eq('越界列号 → undefined', findContainer(doc, cellId(id, 0, 9)), undefined)
+  eq('表格 id 本身不是容器', findContainer(doc, id), undefined)
+
+  // 写入落在那一段上（replaceRange 写的是 container.inlines，包装对象写不回模型）
+  insertText(doc, cellParagraphId(id, 0, 0, 1), 0, 'X')
+  eq('写进第 1 段', paraText(table.rows[0].cells[0], 1), 'X乙')
+  eq('第 0 段没被连带', paraText(table.rows[0].cells[0], 0), '甲')
+
+  // cloneDoc 深拷贝：两段的 inlines 都不与原稿共享
+  const copy = cloneDoc(doc)
+  const src1 = table.rows[0].cells[0].paragraphs[1]
+  const dst1 = copy.blocks[0].rows[0].cells[0].paragraphs[1]
+  eq('第 1 段的 inlines 不共享', dst1.inlines === src1.inlines, false)
+  ok('第 1 段的内容逐字拷过来', paraText(copy.blocks[0].rows[0].cells[0], 1) === 'X乙')
+  dst1.inlines[0].text = '改过了'
+  eq('改副本不动原稿', paraText(table.rows[0].cells[0], 1), 'X乙')
+
+  // cloneDoc 对坏输入（格子缺 paragraphs）也要产出「恒 >= 1 段」，且不许抛
+  const broken = { blocks: [{ ...makeTable([{ role: 'body', cells: [{ inlines: [{ t: 'text', text: '旧' }] }] }]) }], comments: [] }
+  const fixed = cloneDoc(broken)
+  eq('坏输入被补齐成一段', fixed.blocks[0].rows[0].cells[0].paragraphs.length, 1)
+  eq('补出来的那一段是空的', paraText(fixed.blocks[0].rows[0].cells[0]), '')
+  // 旧的 inlines 字段没有兼容层（模型里已经没有它了），克隆只保证形状合法
+  eq('旧的 inlines 字段不被搬进 paragraphs', 'inlines' in fixed.blocks[0].rows[0].cells[0], false)
+
+  // allInlineHolders 要走遍格内每一段（修订 id 扫描 / 批注 scope 都靠它）
+  const holders = allInlineHolders(doc).filter((h) => h !== doc.blocks[0])
+  eq('allInlineHolders 数得到格内每一段', holders.length, 3)
+  eq(
+    '两段都在里面',
+    holders.includes(table.rows[0].cells[0].paragraphs[0]) &&
+      holders.includes(table.rows[0].cells[0].paragraphs[1]),
+    true,
+  )
+
+  // 批注 / 修订的扫描必须看到第 1 段里的锚点
+  const marked = parseMd(':::table\n| 甲{p}[[乙|核对了]] |\n:::')
+  const mt = marked.blocks[0]
+  eq('第 1 段里的批注被 commentScopes 采到', commentScopes(marked).get(marked.comments[0].id), '乙')
+  const rev = { t: 'text', text: '丙', rev: { kind: 'ins', id: 7, author: '甲', date: '' } }
+  mt.rows[0].cells[0].paragraphs[1].inlines.push(rev)
+  const found = allInlineHolders(marked)
+    .flatMap((h) => h.inlines)
+    .filter((i) => i.t === 'text' && i.rev)
+  eq('第 1 段里的修订被扫到', found.length, 1)
+  eq('修订 id 读得出来', found[0].rev.id, 7)
+
+  // normalizeTable 补齐坏格子（缺字段 / 空数组）
+  const bad = makeTable([bodyRow('a')], 1)
+  bad.rows[0].cells.push({ inlines: [] }, { paragraphs: [] })
+  normalizeTable(bad)
+  eq('缺字段的格子被补成一段', bad.rows[0].cells[1].paragraphs.length, 1)
+  eq('空数组的格子被补成一段', bad.rows[0].cells[2].paragraphs.length, 1)
+}
+
+console.log('\n=== 17c. 表格：格内行内语法 / 首尾空格 / 未闭合围栏 ===')
 {
   // 这些用例是独立验收方补的：初版 splitTableCells 只看反斜杠，不跳 {} 与 [[]]，
   // 于是格内 {红|甲}、[[甲|核对原件]] 里的竖线被当成列分隔符 —— 一格拆多格、颜色与批注静默丢失。
-  const cellText = (cell) =>
-    cell.inlines.filter((i) => i.t === 'text').map((i) => i.text).join('')
+  const cellText = (c) => paraText(c)
   const asDoc = (block) => ({ blocks: [block], comments: [] })
   const sameShape = (a, b) =>
     JSON.stringify(normalizeBlocks(a)) === JSON.stringify(normalizeBlocks(b))
@@ -966,12 +1220,12 @@ console.log('\n=== 17b. 表格：格内行内语法 / 首尾空格 / 未闭合�
   eq('彩色格只算一格', colored.blocks[0].rows[0].cells.length, 2)
   eq('彩色格列数', colored.blocks[0].columns, 2)
   eq('彩色格文字', cellText(colored.blocks[0].rows[0].cells[0]), '甲')
-  eq('彩色格颜色读出来', colored.blocks[0].rows[0].cells[0].inlines[0].color, 'FF0000')
+  eq('彩色格颜色读出来', colored.blocks[0].rows[0].cells[0].paragraphs[0].inlines[0].color, 'FF0000')
   eq('彩色格往返一致', sameShape(parseMd(toMd(colored)), colored), true)
 
   const hex = parseMd(':::table\n| {#00FF00|乙} | c |\n:::')
   eq('十六进制色号格也只算一格', hex.blocks[0].rows[0].cells.length, 2)
-  eq('十六进制色号读出来', hex.blocks[0].rows[0].cells[0].inlines[0].color, '00FF00')
+  eq('十六进制色号读出来', hex.blocks[0].rows[0].cells[0].paragraphs[0].inlines[0].color, '00FF00')
 
   const commented = parseMd(':::table\n| [[甲|核对原件]] | d |\n:::')
   eq('批注格只算一格', commented.blocks[0].rows[0].cells.length, 2)
@@ -1001,10 +1255,10 @@ console.log('\n=== 17b. 表格：格内行内语法 / 首尾空格 / 未闭合�
     unterminated.blocks.every((b) => b.t === 'textBlock'),
     true,
   )
-  eq('未闭合围栏的后文还在', cellText(unterminated.blocks[2]), '普通一段')
+  eq('未闭合围栏的后文还在', plainText(unterminated.blocks[2]), '普通一段')
 }
 
-console.log('\n=== 17c. md 往返：批注内容里的 \\ 与 | 必须还原（不是越滚越多）===')
+console.log('\n=== 17e. md 往返：批注内容里的 \\ 与 | 必须还原（不是越滚越多）===')
 {
   // 批注内容是原样存模型、原样进 docx 的，不逐字符走 inline 解析；序列化时它会被 escapeText
   // 逃逸，解析时必须还原回来 —— 否则 `\|`、`\\` 每往返一次就多一层反斜杠（不收敛）。
@@ -1134,6 +1388,11 @@ console.log('\n=== 20. 容器泛化：格子也能读、写、改格式 ===')
   eq('splitBlock 对格子是空操作', splitBlock(model, cellId(id, 0, 0), 0, 'body'), '')
   eq('mergeIntoPrevious 对格子不动模型', mergeIntoPrevious(model, cellId(id, 0, 0)), null)
   eq('setBlockKind 对格子不动模型', (setBlockKind(model, cellId(id, 0, 0), 'h1'), findContainer(model, cellId(id, 0, 0)).kind), undefined)
+  // joinWithNext / canJoinWithNext 同理（格子不是 textBlock，段落标记那条路不认它）
+  eq('joinWithNext 对格子不动模型', joinWithNext(model, cellId(id, 0, 0)), null)
+  eq('canJoinWithNext 对格子说不', canJoinWithNext(model, cellId(id, 0, 0)), false)
+  eq('canMergeIntoPrevious 对格子说不', canMergeIntoPrevious(model, cellId(id, 0, 0)), false)
+  eq('跨段删除不认格子端点', deleteSpan(model, { blockId: cellId(id, 0, 0), offset: 0 }, { blockId: cellId(id, 0, 0), offset: 1 }), null)
 }
 
 console.log('\n=== 21. 跨格查找与替换（含格内与段落各一处）===')
@@ -1151,12 +1410,27 @@ console.log('\n=== 21. 跨格查找与替换（含格内与段落各一处）===
   eq('段落里换成新词', plainText(findBlock(model, model.blocks[0].id)), '义务人申报如下')
   const cell = findContainer(model, cellId(table.id, 0, 1))
   eq('格里换成新词', cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join(''), '义务人')
+
+  // 格内多段落：每一段都要能被搜到、命中 id 是 .pN 形态、替换落在那一段上
+  const multi = parseMd(':::table\n| 甲{p}债务人乙 |\n:::')
+  const mhits = findMatches(multi, '债务人')
+  eq('第 1 段里的字也被搜到', mhits.length, 1)
+  eq('命中的 id 是 .pN 形态', mhits[0].blockId, cellParagraphId(multi.blocks[0].id, 0, 0, 1))
+  eq('命中的坐标按该段算', `${mhits[0].from}/${mhits[0].to}`, '0/3')
+  eq('替换写回那一段', replaceMatches(multi, mhits, '义务人'), 1)
+  eq('第 0 段没被连带', paraText(multi.blocks[0].rows[0].cells[0], 0), '甲')
+  eq('第 1 段换掉了', paraText(multi.blocks[0].rows[0].cells[0], 1), '义务人乙')
+  eq(
+    '格内多段的替换能落到 md 上',
+    toMd(multi),
+    ':::table\n| 甲{p}义务人乙 |\n:::',
+  )
 }
 
 console.log('\n=== 22. 表格片段渲染：接口约束（外层无 data-block-id、格内坐标、行区间）===')
 {
   // 这些约束是「量测与预览共用一套 DOM」的地基：外层若挂了 data-block-id，
-  // fragmentOf 会把整张表当成一个片段读回模型；格内若不挂，格内根本编辑不了。
+  // fragmentOf 会把整张表当成一个片段读回模型；格内每一段若不挂，那一段就编辑不了。
   const model = parseMd(':::table minLines=2\n> 单位：元\n| 甲 | 乙 |\n| 丙{br}丁 | 戊 |\n< 注：附注\n:::')
   const table = model.blocks[0]
   const html = renderTableFragment(table, 0, table.rows.length)
@@ -1167,13 +1441,36 @@ console.log('\n=== 22. 表格片段渲染：接口约束（外层无 data-block-
   eq('unit/note 行整行一格', (html.match(/colspan="2"/g) ?? []).length, 2)
   eq('unit 行右对齐', html.includes('text-align: right'), true)
   eq('note 行左对齐且顶端对齐', html.includes('text-align: left') && html.includes('vertical-align:top'), true)
-  eq('格内都挂了 data-block-id', (html.match(/data-block-id="/g) ?? []).length, 2 + 1 + 2 + 1)
+  eq('每格一层包装 wtp-cell，且包装层不挂 data-block-id', (html.match(/<div class="wtp-cell">/g) ?? []).length, 2 + 1 + 2 + 1)
+  eq('包装层绝不能挂 data-block-id', /class="wtp-cell"[^>]*data-block-id/.test(html), false)
+  eq('格内每一段都挂了 data-block-id', (html.match(/data-block-id="[^"]*"/g) ?? []).length, 2 + 1 + 2 + 1)
+  eq(
+    '段落 div 是 wtp-cellpara + wtp-<kind>（6 个格子各一段）',
+    (html.match(/class="wtp-cellpara wtp-listItem"/g) ?? []).length,
+    6,
+  )
   eq(
     '格内坐标是 cellId 形态且 from=0',
     html.includes(`data-block-id="${cellId(table.id, 1, 0)}" data-from="0" data-to="1"`),
     true,
   )
   eq('软换行渲染成带类的 <br>（与空段落占位区分）', html.includes('<br class="wtp-br">'), true)
+
+  // 格内多段落：每段一个 .wtp-cellpara，第 N 段的 data-block-id 带 .pN
+  const multi = parseMd(':::table\n| 甲{p}乙 | 丙 |\n:::').blocks[0]
+  const multiHtml = renderTableFragment(multi, 0, multi.rows.length)
+  eq('一格两段 → 两个 .wtp-cellpara', (multiHtml.match(/class="wtp-cellpara/g) ?? []).length, 3)
+  eq(
+    '第 1 段的 data-block-id 带 .p1',
+    multiHtml.includes(`data-block-id="${cellId(multi.id, 0, 0)}.p1"`),
+    true,
+  )
+  eq(
+    '第 1 段的坐标按它自己的长度算',
+    multiHtml.includes(`data-block-id="${cellId(multi.id, 0, 0)}.p1" data-from="0" data-to="1"`),
+    true,
+  )
+  eq('整格仍只挂一个 data-cell-id', (multiHtml.match(/data-cell-id="/g) ?? []).length, 2)
 
   const partial = renderTableFragment(table, 1, 3)
   eq('按行区间只渲那两行', (partial.match(/<tr/g) ?? []).length, 2)
@@ -1186,22 +1483,7 @@ console.log('\n=== 22. 表格片段渲染：接口约束（外层无 data-block-
 console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、归一化、行高 ===')
 {
   /** 直接造一张表（不走 md，才能造出「各 body 行格数参差」这类形状） */
-  const makeTable = (rows, columns = 1, minLines = 1) => ({
-    t: 'table',
-    id: 'tb1',
-    rows,
-    columns,
-    minLines,
-    cantSplit: true,
-  })
-  const bodyRow = (...texts) => ({
-    role: 'body',
-    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
-  })
-  const roleRow = (role, text = '') => ({
-    role,
-    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
-  })
+  // makeTable / bodyRow / roleRow 用文件开头那套（格内多段落形状）
   const shape = (table) => table.rows.map((r) => `${r.role}:${r.cells.length}`).join(',')
 
   // ---- insertBodyRow ----
@@ -1211,7 +1493,8 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     eq('插在中间后行数 +1', table.rows.length, 4)
     eq('新行是 body', table.rows[1].role, 'body')
     eq('新行格数 = 当时的 columns', table.rows[1].cells.length, 2)
-    eq('其余行没被挪动', table.rows[2].cells[0].inlines[0].text, 'c')
+    eq('新行每格都有一段（不变式）', table.rows[1].cells.every((c) => c.paragraphs.length === 1), true)
+    eq('其余行没被挪动', paraText(table.rows[2].cells[0]), 'c')
 
     const front = makeTable([bodyRow('a', 'b')], 2)
     eq('插在最前返回 0', insertBodyRow(front, 0), 0)
@@ -1306,8 +1589,9 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     insertColumn(table, 1)
     eq('插列只动 body 行', shape(table), 'unit:1,body:3,body:3,note:1')
     eq('unit 行格数不变', table.rows[0].cells.length, 1)
-    eq('新列内容为空', table.rows[1].cells[1].inlines.length, 0)
-    eq('原格向后挪', table.rows[1].cells[2].inlines[0].text, 'b')
+    eq('新列内容为空', table.rows[1].cells[1].paragraphs[0].inlines.length, 0)
+    eq('新列也是「一段空段」（不变式）', table.rows[1].cells[1].paragraphs.length, 1)
+    eq('原格向后挪', paraText(table.rows[1].cells[2]), 'b')
 
     // 参差行：at 按每行实际格数夹取，不要求先拍平
     const ragged = makeTable([bodyRow('a', 'b'), bodyRow('c', 'd', 'e')], 3)
@@ -1319,7 +1603,7 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     const del = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b', 'c'), bodyRow('d', 'e', 'f'), roleRow('note', 'n')], 3)
     eq('删列成功', removeColumn(del, 1), true)
     eq('删列只动 body 行', shape(del), 'unit:1,body:2,body:2,note:1')
-    eq('删掉的是第 1 列', del.rows[1].cells.map((c) => c.inlines[0]?.text).join(''), 'ac')
+    eq('删掉的是第 1 列', del.rows[1].cells.map((c) => paraText(c)).join(''), 'ac')
     eq('columns 重算', del.columns, 2)
 
     // 最后一列不可删：逐行逐格深比较，一格都不许动
@@ -1344,10 +1628,10 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     )
     insertColumn(zeroCol, 0)
     eq('第 0 列插列不动 unit/note', shape(zeroCol), 'unit:1,body:3,note:1')
-    eq('插列后 unit 行的文字还在', zeroCol.rows[0].cells[0].inlines[0].text, 'u')
-    eq('插列后 note 行的文字还在', zeroCol.rows[2].cells[0].inlines[0].text, 'n')
-    eq('新列插在 body 行的 0 号位', zeroCol.rows[1].cells[0].inlines.length, 0)
-    eq('body 行原格向后挪', zeroCol.rows[1].cells[1].inlines[0].text, 'a')
+    eq('插列后 unit 行的文字还在', paraText(zeroCol.rows[0].cells[0]), 'u')
+    eq('插列后 note 行的文字还在', paraText(zeroCol.rows[2].cells[0]), 'n')
+    eq('新列插在 body 行的 0 号位', zeroCol.rows[1].cells[0].paragraphs[0].inlines.length, 0)
+    eq('body 行原格向后挪', paraText(zeroCol.rows[1].cells[1]), 'a')
 
     const zeroDel = makeTable(
       [roleRow('unit', 'u'), bodyRow('a', 'b'), roleRow('note', 'n')],
@@ -1359,7 +1643,7 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     eq('第 0 列删列不动 unit/note', shape(zeroDel), 'unit:1,body:1,note:1')
     eq('删列后 unit 行逐格原样', JSON.stringify(zeroDel.rows[0]), zeroDelUnit)
     eq('删列后 note 行逐格原样', JSON.stringify(zeroDel.rows[2]), zeroDelNote)
-    eq('body 行删掉的确实是第 0 列', zeroDel.rows[1].cells[0].inlines[0].text, 'b')
+    eq('body 行删掉的确实是第 0 列', paraText(zeroDel.rows[1].cells[0]), 'b')
   }
 
   // ---- normalizeTable ----
@@ -1373,7 +1657,7 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     eq('参差 body 行不增不减（不被拍平）', shape(table), 'unit:1,body:1,body:3,note:1')
 
     const trim = makeTable([roleRow('unit', 'u'), bodyRow('a', 'b', 'c')], 3)
-    trim.rows[0].cells = [{ inlines: [] }, { inlines: [] }, { inlines: [] }]
+    trim.rows[0].cells = [emptyCell(), emptyCell(), emptyCell()]
     normalizeTable(trim)
     eq('unit 行被裁到只剩第 0 格', trim.rows[0].cells.length, 1)
 
@@ -1383,6 +1667,14 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
     const zero = makeTable([bodyRow()], 0)
     normalizeTable(zero)
     eq('全是空格时 columns 兜底为 1', zero.columns, 1)
+
+    // 坏格子（缺 paragraphs / 空数组）要被补成一段空段，坏输入不许把后续操作带崩
+    const broken = makeTable([bodyRow('a')], 1)
+    broken.rows[0].cells.push({ inlines: [] }, { paragraphs: [] })
+    normalizeTable(broken)
+    eq('缺 paragraphs 的格子补成一段空段', broken.rows[0].cells[1].paragraphs.length, 1)
+    eq('空 paragraphs 的格子补成一段空段', broken.rows[0].cells[2].paragraphs.length, 1)
+    eq('补出来的那一段是空的', broken.rows[0].cells[1].paragraphs[0].inlines.length, 0)
   }
 
   // ---- setMinLines ----
@@ -1409,24 +1701,8 @@ console.log('\n=== 23. 表格结构操作：增删行/列、unit&note 开关、�
 
 console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两组对齐 / 格首指令 ===')
 {
-  const makeTable = (rows, columns = 1, minLines = 1) => ({
-    t: 'table',
-    id: 'tb1',
-    rows,
-    columns,
-    minLines,
-    cantSplit: true,
-  })
-  const bodyRow = (...texts) => ({
-    role: 'body',
-    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
-  })
-  const roleRow = (role, text = '') => ({
-    role,
-    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
-  })
-  const cellText = (cell) =>
-    cell.inlines.map((i) => (i.t === 'text' ? i.text : '')).join('')
+  // makeTable / bodyRow / roleRow 用文件开头那套（格内多段落形状）
+  const cellText = (c) => paraText(c)
   const step = (atom) => JSON.stringify(atom)
 
   // ---- A1. stepCell：行优先、unit/note 整行一格、边界 ----
@@ -1524,11 +1800,11 @@ console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两�
 
   // ---- C. setCellKind / setContainerKind / 渲染钩子 / md 往返 ----
   {
-    const cell = { inlines: [{ t: 'text', text: '甲' }] }
-    setCellKind(cell, 'h2')
-    eq('setCellKind 设值', cell.kind, 'h2')
-    setCellKind(cell, 'listItem')
-    eq('回到 listItem 时删掉字段（模型不存冗余值）', 'kind' in cell, false)
+    const c0 = cellOf('甲')
+    setCellKind(c0, 'h2')
+    eq('setCellKind 设值', c0.kind, 'h2')
+    setCellKind(c0, 'listItem')
+    eq('回到 listItem 时删掉字段（模型不存冗余值）', 'kind' in c0, false)
 
     const model = parseMd('正文一段\n\n:::table\n| 甲 | 乙 |\n:::')
     const table = model.blocks.find((b) => b.t === 'table')
@@ -1536,10 +1812,21 @@ console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两�
     eq('setContainerKind 改段落', findBlock(model, model.blocks[0].id).kind, 'h1')
     setContainerKind(model, cellId(table.id, 0, 0), 'h3')
     eq('setContainerKind 改格子', findCell(model, cellId(table.id, 0, 0)).kind, 'h3')
+    // 带 .pN 的 id 也按「整格」处理（样式是格子级的）
+    setContainerKind(model, cellParagraphId(table.id, 0, 1, 0), 'h2')
+    eq('带 .p0 的 id 改的仍是整格', findCell(model, cellId(table.id, 0, 1)).kind, 'h2')
 
     const html = renderTableFragment(table, 0, table.rows.length)
-    eq('格内 div 带稳定钩子 wtp-cell + 该格样式 wtp-h3', html.includes('class="wtp-cell wtp-h3"'), true)
-    eq('没改过的格子仍是 wtp-cell wtp-listItem', html.includes('class="wtp-cell wtp-listItem"'), true)
+    eq('每格一层稳定钩子 wtp-cell', (html.match(/<div class="wtp-cell">/g) ?? []).length, 2)
+    eq('该格样式挂在段落 div 上（wtp-cellpara wtp-h3）', html.includes('class="wtp-cellpara wtp-h3"'), true)
+    eq('钩子层与样式层是两层（包装层不带 wtp-<kind>）', /class="wtp-cell wtp-/.test(html), false)
+    eq(
+      '没改过的格子仍是 wtp-cellpara wtp-listItem',
+      renderTableFragment(parseMd(':::table\n| 甲 | 乙 |\n:::').blocks[0], 0, 1).includes(
+        'class="wtp-cellpara wtp-listItem"',
+      ),
+      true,
+    )
 
     const md = toMd(model)
     eq('格内样式写进格首指令', md.includes('{@h3|甲}'), true)
@@ -1558,17 +1845,17 @@ console.log('\n=== 24. W4b-2：键盘跨格 / 删整表 / 格内换样式 / 两�
 
   // ---- D. setCellAlign ----
   {
-    const cell = { inlines: [] }
-    setCellAlign(cell, 'h', 'center')
-    eq('单维：水平', JSON.stringify(cell.align), JSON.stringify({ h: 'center' }))
-    setCellAlign(cell, 'v', 'middle')
-    eq('双维', JSON.stringify(cell.align), JSON.stringify({ h: 'center', v: 'middle' }))
-    setCellAlign(cell, 'h', null)
-    eq('清一维后另一维还在', JSON.stringify(cell.align), JSON.stringify({ v: 'middle' }))
-    setCellAlign(cell, 'v', null)
-    eq('两维都清掉后 align 字段消失', 'align' in cell, false)
-    setCellAlign(cell, 'h', null)
-    eq('本来就没有 align 时再清是空操作', 'align' in cell, false)
+    const c0 = cellOf()
+    setCellAlign(c0, 'h', 'center')
+    eq('单维：水平', JSON.stringify(c0.align), JSON.stringify({ h: 'center' }))
+    setCellAlign(c0, 'v', 'middle')
+    eq('双维', JSON.stringify(c0.align), JSON.stringify({ h: 'center', v: 'middle' }))
+    setCellAlign(c0, 'h', null)
+    eq('清一维后另一维还在', JSON.stringify(c0.align), JSON.stringify({ v: 'middle' }))
+    setCellAlign(c0, 'v', null)
+    eq('两维都清掉后 align 字段消失', 'align' in c0, false)
+    setCellAlign(c0, 'h', null)
+    eq('本来就没有 align 时再清是空操作', 'align' in c0, false)
 
     const model = parseMd(':::table\n| 甲 |\n:::')
     const table = model.blocks[0]
@@ -2120,22 +2407,7 @@ console.log('\n=== 27. 快捷键表：解析 / 匹配 / 覆盖 / 冲突（W6）=
 
 console.log('\n=== 28. 表格复选：矩形块 / 目标格列表 / 批量只改选中的格（W7）===')
 {
-  const makeTable = (rows, columns = 1, minLines = 1) => ({
-    t: 'table',
-    id: 'tb1',
-    rows,
-    columns,
-    minLines,
-    cantSplit: true,
-  })
-  const bodyRow = (...texts) => ({
-    role: 'body',
-    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
-  })
-  const roleRow = (role, text = '') => ({
-    role,
-    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
-  })
+  // makeTable / bodyRow / roleRow 用文件开头那套（格内多段落形状）
   const keys = (cells) => cells.map((c) => `${c.row},${c.col}`).join('|')
   const grid = makeTable(
     [roleRow('unit', 'u'), bodyRow('a', 'b', 'c'), bodyRow('d', 'e', 'f'), roleRow('note', 'n')],
@@ -2245,10 +2517,10 @@ console.log('\n=== 28. 表格复选：矩形块 / 目标格列表 / 批量只改
   eq('有一格不同 → 一律写目标值', nextAlignValue(['center', 'left'], 'center'), 'center')
   eq('空批不算「一致」（不能误清）', nextAlignValue([], 'center'), 'center')
 
-  // ---- 存储值（预判与落笔共用同一个读法） ----
-  eq('storedCellKind 的缺省语义是 listItem', storedCellKind({ inlines: [] }), 'listItem')
-  eq('storedCellAlign 缺省 null', storedCellAlign({ inlines: [] }, 'h'), null)
-  eq('storedCellAlign 读得到覆盖', storedCellAlign({ inlines: [], align: { v: 'bottom' } }, 'v'), 'bottom')
+  // ---- 存储值（预判与落笔共用同一个读法；只读 kind / align，与格内段落无关） ----
+  eq('storedCellKind 的缺省语义是 listItem', storedCellKind({}), 'listItem')
+  eq('storedCellAlign 缺省 null', storedCellAlign({}, 'h'), null)
+  eq('storedCellAlign 读得到覆盖', storedCellAlign({ align: { v: 'bottom' } }, 'v'), 'bottom')
 }
 
 console.log('\n=== 29. 表头 / 附注行恒「最小一行」：CSS 侧的规则（W7 第②条）===')

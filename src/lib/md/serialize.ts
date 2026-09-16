@@ -10,6 +10,7 @@
  */
 
 import type { BlockKind } from '../spec'
+import { cellParagraphs } from '../edit/table'
 import type {
   Block,
   CommentDef,
@@ -79,12 +80,18 @@ function serializeInlines(
 }
 
 /**
- * 单元格内容 → md。格内样式与两组对齐写成格首指令 `{@<kind>,<h>,<v>|正文}`，
+ * 单元格内容 → md。**段间写 `{p}`**（格内多段落，`| 甲{p}乙 |` 一格两段）；
+ * 格内样式与两组对齐写成格首指令 `{@<kind>,<h>,<v>|正文}`，
  * **token 顺序固定 kind → h → v**、只写非默认值，这样「模型 → md → 模型 → md」字节稳定；
  * 三个都没值时整条指令都不写（老样本因此一个字节不变）。
+ *
+ * 正文里真写 `{p}` 字面量的可逆性由 escapeText 保证（`{` → `\{`），与 `{br}` 同一条路：
+ * 写出去是 `\{p\}`、读回来是字面量 `{p}`，不会越滚越多、也不会被当成段落标记。
  */
 function cellText(cell: TableCellModel, comments: Map<number, CommentDef>): string {
-  const inner = serializeInlines(cell.inlines, comments)
+  const inner = cellParagraphs(cell)
+    .map((para) => serializeInlines(para.inlines, comments))
+    .join('{p}')
   const tokens: string[] = []
   if (cell.kind !== undefined && cell.kind !== 'listItem') tokens.push(cell.kind)
   if (cell.align?.h) tokens.push(cell.align.h)
@@ -198,7 +205,7 @@ export function normalizeBlocks(doc: DocModel): unknown[] {
         rows: block.rows.map((row) => ({
           role: row.role,
           cells: row.cells.map((cell) => ({
-            inlines: cell.inlines,
+            paragraphs: cellParagraphs(cell).map((para) => ({ inlines: para.inlines })),
             ...(cell.kind !== undefined ? { kind: cell.kind } : {}),
             ...(cell.align !== undefined ? { align: cell.align } : {}),
           })),

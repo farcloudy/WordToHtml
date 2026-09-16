@@ -4,9 +4,10 @@
  * 这里只改「一张给定的表」的内部形状，不碰 doc 的块顺序、不碰 DOM、不 import Vue ——
  * 「新锚点怎么按新下标重算」「撤销怎么记」都是组件层的事（WordPaper.vue 的 6 个表格操作）。
  *
- * 三条不变式，每改完 rows 都由 normalizeTable 收口：
+ * 四条不变式，每改完 rows 都由 normalizeTable 收口：
  *   · columns = body 行的最大格数，且至少 1；
  *   · unit / note 行天然整行一格，只保留第 0 格（渲染与导出都只用 cells[0]）；
+ *   · 每个格子恒有至少一段（`paragraphs.length >= 1`）；
  *   · rows 的顺序就是显示顺序（unit → body… → note）。
  *
  * 注意 cellId 里嵌的是行/列**下标**（`tb1.r2c1`），所以任何增删都会让其后的格子 id
@@ -14,8 +15,16 @@
  */
 
 import type { BlockKind } from '../spec'
-import type { CellVerticalAlign, DocModel, TableBlock, TableCellModel, TableRowModel } from '../types'
-import { parseCellId } from '../types'
+import type {
+  CellVerticalAlign,
+  DocModel,
+  Inline,
+  InlineHolder,
+  TableBlock,
+  TableCellModel,
+  TableRowModel,
+} from '../types'
+import { parseCellId, sliceStrict } from '../types'
 
 /** 按 id 找表格块。id 既可以是表格自己的 id，也可以是格子的 cellId（tableId.rNcM） */
 export function findTable(doc: DocModel, id: string): TableBlock | undefined {
@@ -42,12 +51,68 @@ export function removeTable(doc: DocModel, id: string): boolean {
   return true
 }
 
-/** 按 cellId 找格子（纯函数，便于 emitSelection / 单测） */
+/**
+ * 按 cellId 找格子（纯函数，便于 emitSelection / 单测）。
+ *
+ * **不管 `.pN` 后缀**：格子级操作（样式、对齐、结构增删）作用的是整格，
+ * 代入 `…r2c1.p3` 也返回第 2 行第 1 列那个格子。要取「那一段」用 findCellAt。
+ */
 export function findCell(doc: DocModel, cellIdValue: string): TableCellModel | undefined {
   const cell = parseCellId(cellIdValue)
   if (!cell) return undefined
   const table = findTable(doc, cell.tableId)
   return table?.rows[cell.row]?.cells[cell.col]
+}
+
+/**
+ * 格内段落；**容错**：`paragraphs` 缺失或是空数组时当成「一段空段」，绝不抛。
+ *
+ * 不变式是 `paragraphs.length >= 1`（解析、normalizeTable、cloneDoc 都保证），
+ * 所以这里造出来的兜底数组只服务「手搓模型 / 旧数据」这类坏输入；它是**临时对象**，
+ * 往里写东西不会回到模型 —— 要改模型请先把它补进 `cell.paragraphs`（normalizeTable 干这个）。
+ */
+export function cellParagraphs(cell: TableCellModel): InlineHolder[] {
+  const list = cell.paragraphs
+  return Array.isArray(list) && list.length > 0 ? list : [{ inlines: [] }]
+}
+
+/** 格内段数（容错口径同 cellParagraphs：坏输入恒为 1） */
+export function cellParagraphCount(cell: TableCellModel): number {
+  return cellParagraphs(cell).length
+}
+
+/** 一次格子查找的结果：格子本身 + 它的一段（`para` 越界返回 null） */
+export interface CellParagraphHit {
+  table: TableBlock
+  row: number
+  col: number
+  para: number
+  cell: TableCellModel
+  /** 段落本尊（不是包装对象 —— replaceRange 会写 `container.inlines`，包装对象写不回模型） */
+  paragraph: InlineHolder
+}
+
+/**
+ * 按 `…rNcM` / `…rNcM.pK` 取「格子 + 它的那一段」。越界（行 / 列 / 段）返回 null。
+ * 与 edit/model.ts 的 findContainer 同一套判据，只是把 table / row / col / para 一并带出来
+ * 给表格结构操作用（组件层不必自己解析 id 再逐层取）。
+ */
+export function findCellAt(doc: DocModel, id: string): CellParagraphHit | null {
+  const parsed = parseCellId(id)
+  if (!parsed) return null
+  const table = findTable(doc, parsed.tableId)
+  const cell = table?.rows[parsed.row]?.cells[parsed.col]
+  if (!table || !cell) return null
+  const paragraph = cellParagraphs(cell)[parsed.para]
+  if (!paragraph) return null
+  return {
+    table,
+    row: parsed.row,
+    col: parsed.col,
+    para: parsed.para,
+    cell,
+    paragraph,
+  }
 }
 
 /** 设格子的样式；kind === 'listItem'（缺省语义）时删除字段，保持模型不存冗余值 */
@@ -164,11 +229,16 @@ export function bodyInsertIndex(table: TableBlock, at: number): number {
   return note >= 0 ? note : table.rows.length
 }
 
+/** 一个空的格子：恒有一段空段（不变式 `paragraphs.length >= 1`） */
+export function emptyCell(): TableCellModel {
+  return { paragraphs: [{ inlines: [] }] }
+}
+
 /** 新建一行 body：格数取「当时」的 columns（之后 normalizeTable 才会重算） */
 function emptyBodyRow(columns: number): TableRowModel {
   return {
     role: 'body',
-    cells: Array.from({ length: Math.max(1, columns) }, () => ({ inlines: [] })),
+    cells: Array.from({ length: Math.max(1, columns) }, () => emptyCell()),
   }
 }
 
@@ -195,7 +265,7 @@ export function setRoleRow(table: TableBlock, role: 'unit' | 'note', on: boolean
   const has = table.rows.some((row) => row.role === role)
   if (on) {
     if (has) return
-    const row: TableRowModel = { role, cells: [{ inlines: [] }] }
+    const row: TableRowModel = { role, cells: [emptyCell()] }
     if (role === 'unit') table.rows.unshift(row)
     else table.rows.push(row)
   } else {
@@ -209,7 +279,7 @@ export function setRoleRow(table: TableBlock, role: 'unit' | 'note', on: boolean
 export function insertColumn(table: TableBlock, at: number): void {
   for (const row of table.rows) {
     if (row.role !== 'body') continue
-    row.cells.splice(clampIndex(at, row.cells.length + 1), 0, { inlines: [] })
+    row.cells.splice(clampIndex(at, row.cells.length + 1), 0, emptyCell())
   }
   normalizeTable(table)
 }
@@ -231,7 +301,10 @@ export function removeColumn(table: TableBlock, at: number): boolean {
   return true
 }
 
-/** columns = body 行最大格数（至少 1）；unit/note 行只保留第 0 格（渲染与导出都只用 cells[0]） */
+/**
+ * columns = body 行最大格数（至少 1）；unit/note 行只保留第 0 格（渲染与导出都只用 cells[0]）；
+ * 每个格子恒有至少一段（`paragraphs.length >= 1`，缺字段 / 空数组都补一段空段）。
+ */
 export function normalizeTable(table: TableBlock): void {
   let columns = 1
   for (const row of table.rows) {
@@ -240,10 +313,95 @@ export function normalizeTable(table: TableBlock): void {
   }
   table.columns = columns
   for (const row of table.rows) {
-    if (row.role === 'body') continue
-    row.cells = row.cells.slice(0, 1)
-    if (row.cells.length === 0) row.cells.push({ inlines: [] })
+    if (row.role !== 'body') {
+      row.cells = row.cells.slice(0, 1)
+      if (row.cells.length === 0) row.cells.push(emptyCell())
+    }
+    for (const cell of row.cells) {
+      if (!Array.isArray(cell.paragraphs) || cell.paragraphs.length === 0) {
+        cell.paragraphs = [{ inlines: [] }]
+      }
+    }
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 格内多段落（Enter 在格内新起一段）                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 在格内第 N 段的 `offset` 处把它切成两段：后半成为第 N+1 段，其后的段整体后移。
+ *
+ * 返回**新段落的 para 下标**（调用方据此拼 `cellParagraphId`），越界 / 找不到格子返回 null。
+ * 切分规则与 `splitBlock` 同源（都走 `sliceStrict`）：批注锚点按位置归属、软换行按位置归属，
+ * 所以格内切开后锚点仍然成对、锚定的文字不变。
+ *
+ * `kind` / `align` 是**格子级**的，切出来的两段当然共用同一套，不需要复制什么；
+ * `_tailSameKind` 只为与 `splitBlock(doc, id, offset, tailKind)` 的签名对称而保留。
+ */
+export function splitCellParagraph(
+  doc: DocModel,
+  id: string,
+  offset: number,
+  _tailSameKind: BlockKind,
+): number | null {
+  const hit = findCellAt(doc, id)
+  if (!hit) return null
+  const list = ensureCellParagraphs(hit.cell)
+  const paragraph = list[hit.para]
+  if (!paragraph) return null
+  const len = inlinesLength(paragraph.inlines)
+  const at = Math.max(0, Math.min(offset, len))
+  const tail: InlineHolder = { inlines: sliceStrict(paragraph.inlines, at, len) }
+  paragraph.inlines = sliceStrict(paragraph.inlines, 0, at)
+  list.splice(hit.para + 1, 0, tail)
+  return hit.para + 1
+}
+
+/**
+ * 结构操作前的**就地修复**：`paragraphs` 缺失 / 是空数组时补一段空段，写回模型。
+ *
+ * 与 `cellParagraphs` 的「临时兜底」不是一回事：那两个结构操作马上要改模型，兜底对象必须真的
+ * 进模型，否则改的是一份临时对象 —— 函数报「切好了」而模型一字未动
+ *（`props.model` 直给手搓模型时可触达；md 解析、normalizeTable、cloneDoc 三条正常路径都补齐过）。
+ */
+function ensureCellParagraphs(cell: TableCellModel): InlineHolder[] {
+  if (!Array.isArray(cell.paragraphs) || cell.paragraphs.length === 0) {
+    cell.paragraphs = [{ inlines: [] }]
+  }
+  return cell.paragraphs
+}
+
+/**
+ * 把第 `para`（> 0）段并进第 `para-1` 段，段数 -1。
+ *
+ * 返回**合并点**（前一段在合并前的长度，也就是插入符该落的地方），
+ * `para <= 0` / 越界 / 找不到格子一律返回 null（第 0 段之前没得并 —— 不许并到上一格）。
+ */
+export function mergeCellParagraph(doc: DocModel, id: string, para: number): number | null {
+  if (para <= 0) return null
+  const parsed = parseCellId(id)
+  if (!parsed) return null
+  const table = findTable(doc, parsed.tableId)
+  const cell = table?.rows[parsed.row]?.cells[parsed.col]
+  if (!cell) return null
+  const list = ensureCellParagraphs(cell)
+  const head = list[para - 1]
+  const tail = list[para]
+  if (!head || !tail) return null
+  const at = inlinesLength(head.inlines)
+  head.inlines = [...head.inlines, ...tail.inlines]
+  list.splice(para, 1)
+  return at
+}
+
+/** 一串 inline 的文字长度（软换行零宽、不占字符位） */
+function inlinesLength(inlines: readonly Inline[]): number {
+  let n = 0
+  for (const inline of inlines) {
+    if (inline.t === 'text') n += inline.text.length
+  }
+  return n
 }
 
 export function setMinLines(table: TableBlock, minLines: 1 | 2): void {

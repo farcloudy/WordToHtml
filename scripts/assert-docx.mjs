@@ -259,15 +259,25 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
    * 模型里的格文字 → Word 读回来的样子。
    * 软换行（<w:br/>）在 Word 的 Range.Text 里是**垂直制表符 chr(11)**，不是换行也不是空格；
    * 批注锚点不占字符。期望值必须按这个口径算，否则「格内的软换行被吞了」看不出来。
+   * 格内多段落（`{p}`）：Word 的段落标记在 Range.Text 里是 **chr(13)**，check-docx.ps1
+   * 只 TrimEnd 掉收尾的段落标记 / 单元格标记，中间的照原样留着，所以这里用 `\r` 拼接。
    */
   const cellText = (cell) =>
-    cell.inlines
-      .map((i) => (i.t === 'text' ? i.text : i.t === 'break' ? '\u000b' : ''))
-      .join('')
+    (cell.paragraphs?.length ? cell.paragraphs : [{ inlines: [] }])
+      .map((para) =>
+        para.inlines
+          .map((i) => (i.t === 'text' ? i.text : i.t === 'break' ? '\u000b' : ''))
+          .join(''),
+      )
+      .join('\r')
 
   const softBreakInModel = model.blocks
     .filter((b) => b.t === 'table')
-    .some((t) => t.rows.some((r) => r.cells.some((c) => c.inlines.some((i) => i.t === 'break'))))
+    .some((t) =>
+      t.rows.some((r) =>
+        r.cells.some((c) => (c.paragraphs ?? []).some((p) => p.inlines.some((i) => i.t === 'break'))),
+      ),
+    )
   if (softBreakInModel) {
     // Word 侧的直接证据：软换行在 Range.Text 里就是 chr(11)，读回来的格文字里必须看得到
     const wordSoft = dumpTables
@@ -290,8 +300,8 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
    */
   const renderedCells = (t, row) =>
     row.role === 'body'
-      ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? { inlines: [] })
-      : [row.cells[0] ?? { inlines: [] }]
+      ? Array.from({ length: t.columns }, (_, c) => row.cells[c] ?? { paragraphs: [{ inlines: [] }] })
+      : [row.cells[0] ?? { paragraphs: [{ inlines: [] }] }]
   const alignOf = (role, cell) =>
     ALIGN[
       cell.align?.h ??
@@ -361,7 +371,9 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
         eq(`${tag}·格${c}对齐`, cell.alignment, alignOf(row.role, model))
         eq(`${tag}·格${c}合并跨度`, cell.columnSpan, merged ? t.columns : 1)
         eq(`${tag}·格${c}垂直对齐`, cell.verticalAlignment, vAlignOf(model))
-        // 格内段落样式：能读就读（check-docx.ps1 读不到时留空字符串，不误报）
+        // 格内段落样式：能读就读（check-docx.ps1 读不到时留空字符串，不误报）。
+        // 它读的是格内**第一段**的样式名；样式是格子级的（每个 w:p 各挂一份同一个样式），
+        // 所以格内多段落时首段即代表，不需要逐段对账。
         if (typeof cell.style === 'string' && cell.style !== '') {
           cellStyleChecks += 1
           eq(`${tag}·格${c}样式`, cell.style, styleNameOf(model))

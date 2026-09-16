@@ -64,6 +64,7 @@ import type {
   TextBlock,
 } from '../types'
 import { defaultCellAlignH } from '../types'
+import { cellParagraphs, emptyCell } from '../edit/table'
 import { computeNumbering } from '../numbering'
 import { resolveSections } from '../section'
 import { lineUnitPlan, patchStylesXml } from './lineUnits'
@@ -302,21 +303,32 @@ function columnWidthsTwips(total: number, columns: number): number[] {
   return widths
 }
 
+/**
+ * 一个格子 → 它里面的**每一段**一个 `Paragraph`（同一个 `w:tc` 里按顺序放 N 个）。
+ *
+ * 格内多段落（Enter 在格内新起一段）在 Word 里的样子就是同一个 `w:tc` 里有多个 `w:p`；
+ * 段落样式与水平对齐是**格子级**的（`TableCellModel.kind` / `align`），所以每一段共用同一套。
+ * `kind === 'body'` 时**不挂样式**：正文就是 Word 的 Normal，styles.xml 里没有
+ * WT-Body 这条（paragraphStyles 刻意不定义它），挂了就是一条指向不存在样式的
+ * 悬空引用 —— 与 textBlockParagraph 对正文的处理保持一致。
+ *
+ * 坏输入（格子没有 paragraphs 字段）由 cellParagraphs 兜底成一段空段：`w:tc` 里必须至少有一个
+ * `w:p`，否则这份 docx Word 打不开。
+ */
 function cellParagraph(
   cell: TableCellModel,
   spec: Spec,
   alignment?: (typeof AlignmentType)[keyof typeof AlignmentType],
-): Paragraph {
-  // 格内文字可以换成别的样式（TableCellModel.kind），缺省仍是「列表段落」。
-  // kind === 'body' 时**不挂样式**：正文就是 Word 的 Normal，styles.xml 里没有
-  // WT-Body 这条（paragraphStyles 刻意不定义它），挂了就是一条指向不存在样式的
-  // 悬空引用 —— 与 textBlockParagraph 对正文的处理保持一致。
+): Paragraph[] {
   const kind = cell.kind ?? 'listItem'
-  return new Paragraph({
-    ...(kind === 'body' ? {} : { style: spec.styles[kind].id }),
-    ...(alignment ? { alignment } : {}),
-    children: inlineChildren(cell.inlines),
-  })
+  return cellParagraphs(cell).map(
+    (para) =>
+      new Paragraph({
+        ...(kind === 'body' ? {} : { style: spec.styles[kind].id }),
+        ...(alignment ? { alignment } : {}),
+        children: inlineChildren(para.inlines),
+      }),
+  )
 }
 
 /** 垂直对齐三档 → docx 的枚举（缺省值一律 top，与预览侧同源） */
@@ -374,24 +386,24 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
       for (let c = 0; c < block.columns; c += 1) {
         // 缺格补空：Word 的表格必须是矩形，补齐只发生在导出这一侧，
         // 模型仍按 md 原样存（少一格的书写方式不该被解析改写）。
-        const cell = row.cells[c] ?? { inlines: [] }
+        const cell = row.cells[c] ?? emptyCell()
         cells.push(
           new TableCell({
             borders: BODY_BORDERS,
             verticalAlign: VERTICAL_ALIGN[cell.align?.v ?? 'top'],
-            children: [cellParagraph(cell, spec, alignmentOf(cellAlignH('body', cell, spec)))],
+            children: cellParagraph(cell, spec, alignmentOf(cellAlignH('body', cell, spec))),
           }),
         )
       }
     } else {
       // unit / note 天然整行一格 → 展开成 columnSpan = columns
-      const cell = row.cells[0] ?? { inlines: [] }
+      const cell = row.cells[0] ?? emptyCell()
       cells = [
         new TableCell({
           columnSpan: block.columns,
           borders: NO_BORDERS,
           verticalAlign: VERTICAL_ALIGN[cell.align?.v ?? 'top'],
-          children: [cellParagraph(cell, spec, alignmentOf(cellAlignH(row.role, cell, spec)))],
+          children: cellParagraph(cell, spec, alignmentOf(cellAlignH(row.role, cell, spec))),
         }),
       ]
     }

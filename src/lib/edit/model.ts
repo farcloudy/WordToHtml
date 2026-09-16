@@ -25,8 +25,15 @@ import type {
   TextBlock,
   TextInline,
 } from '../types'
-import { allInlineHolders, inlinesText, nextBlockId, parseCellId, plainText } from '../types'
-import { findCell, setCellKind } from './table'
+import {
+  allInlineHolders,
+  inlinesText,
+  nextBlockId,
+  parseCellId,
+  plainText,
+  sliceStrict,
+} from '../types'
+import { cellParagraphs, findCell, findTable, setCellKind } from './table'
 import { insertSectionBreakAfter, removeSectionBreak } from './section'
 
 export interface BlockPoint {
@@ -135,9 +142,9 @@ export interface SectionSelectionContext {
 /**
  * 能承载一段可编辑文字的东西 —— 唯一要求就是有一串 inlines。
  *
- * 「块」不止 textBlock：表格的每个格子也是一段可编辑文字（单段落），
- * 编辑层把它当成一个「伪块」（id 用 cellId(tableId, r, c)）。所以本文件里的
- * 编辑操作统一吃**容器**，段落与格子走同一条路，不必各写一套。
+ * 「块」不止 textBlock：表格格子的**每一段**也是一段可编辑文字，编辑层把它当成一个
+ * 「伪块」（段落 0 用 `cellId(tableId, r, c)`，第 N 段是 `….pN`）。所以本文件里的
+ * 编辑操作统一吃**容器**，段落与格内段落走同一条路，不必各写一套。
  */
 export type InlineContainer = InlineHolder
 
@@ -149,18 +156,21 @@ export function findBlock(doc: DocModel, id: string): TextBlock | undefined {
 }
 
 /**
- * 按 id 找一个可编辑容器：段落按 id 命中；`tableId.rNcM` 按 cellId 命中最深的那个格子。
+ * 按 id 找一个可编辑容器：段落按 id 命中；`tableId.rNcM`（`…rNcM.pK`）命中格子里的**那一段**。
  *
- * 找不到（id 过期、格号越界、或者 id 其实是一张表的 id —— 表格本身不可编辑）返回 undefined，
+ * 返回的是段落**本尊**，不是包装对象 —— `replaceRange` 会写 `container.inlines`，
+ * 包装对象写不回模型。段落下标越界返回 undefined。
+ * 找不到（id 过期、格号 / 段号越界、或者 id 其实是一张表的 id —— 表格本身不可编辑）返回 undefined，
  * 调用方据此安全跳过。
  */
 export function findContainer(doc: DocModel, id: string): InlineContainer | undefined {
   const cell = parseCellId(id)
+  if (cell) {
+    const table = findTable(doc, cell.tableId)
+    const target = table?.rows[cell.row]?.cells[cell.col]
+    return target?.paragraphs?.[cell.para]
+  }
   for (const block of doc.blocks) {
-    if (cell) {
-      if (block.t !== 'table' || block.id !== cell.tableId) continue
-      return block.rows[cell.row]?.cells[cell.col]
-    }
     if (block.t === 'textBlock' && block.id === id) return block
   }
   return undefined
@@ -177,45 +187,6 @@ export function containerLength(container: InlineContainer): number {
 
 export function blockLength(block: TextBlock): number {
   return plainText(block).length
-}
-
-/**
- * 按字符区间切 inline 片段，批注锚点跟着它夹住的那段文字走。
- *
- * 与 types.ts 的 sliceInlines 的差别：那个是给分页用的 —— 它无条件保留所有
- * 批注锚点，好让跨页的每个片段都能把高亮画全。编辑读回时不能那样：
- * 把 [from,to) 的片段替换掉以后，[0,from) 与 [to,len) 里残留的锚点会变成
- * 重复的批注标记。所以这里按锚点的位置过滤：起点落在 [from,to) 内才留，
- * 终点落在 (from,to] 内才留。
- */
-export function sliceStrict(inlines: readonly Inline[], from: number, to: number): Inline[] {
-  const out: Inline[] = []
-  let cursor = 0
-  for (const inline of inlines) {
-    if (inline.t === 'commentStart') {
-      if (cursor >= from && cursor < to) out.push(inline)
-      continue
-    }
-    if (inline.t === 'commentEnd') {
-      if (cursor > from && cursor <= to) out.push(inline)
-      continue
-    }
-    if (inline.t === 'break') {
-      // 零宽，只能按位置归属：落在 [from,to) 就跟着这一片走。
-      // 与分页用的 sliceInlines 不同 —— 那里要在片首丢掉边界上那一枚（避免多出一个没记账的行盒），
-      // 编辑读回没有行盒可丢，保住它比丢掉好（切分段落时不会把换行弄没）。
-      if (cursor >= from && cursor < to) out.push(inline)
-      continue
-    }
-    const start = cursor
-    const end = cursor + inline.text.length
-    cursor = end
-    if (end <= from || start >= to) continue
-    const cutStart = Math.max(from, start) - start
-    const cutEnd = Math.min(to, end) - start
-    out.push({ ...inline, text: inline.text.slice(cutStart, cutEnd) })
-  }
-  return out
 }
 
 /**
@@ -410,8 +381,8 @@ function clampOffset(offset: number, len: number): number {
  * 修订模式下**不并段**：只把覆盖到的文字逐段标成 w:del 留在原处
  * （模型里没有「段落标记」这件东西，不能假装把它删了）。
  *
- * 两端必须是**段落**：表格格子（cellId）与换页标记不吃这条 —— 格子的单段落模型表达不了
- * 并格，那条路请调用方按容器各自删（见 WordPaper.vue 的 deleteSelection）。
+ * 两端必须是**段落**：表格格子（cellId）与换页标记不吃这条 —— 格内并段有它自己那条路
+ *（edit/table.ts 的 mergeCellParagraph），这条只认 textBlock。
  *
  * 返回删除后的落点（首段的切点）。两端颠倒的选区（反向选中）也认，内部先摆正。
  */
@@ -822,7 +793,13 @@ export function cloneDoc(doc: DocModel): DocModel {
           rows: block.rows.map((row) => ({
             role: row.role,
             cells: row.cells.map((cell) => ({
-              inlines: cell.inlines.map((inline): Inline => ({ ...inline })),
+              // 格内每一段都要新建（含 inlines 数组本身），只拷一层会让副本与原稿共享
+              // paragraphs / inlines，撤销与渲染快照复原时会被后续编辑连带改到。
+              // 用 cellParagraphs 而不是 cell.paragraphs：它顺带把「缺字段 / 空数组」的
+              // 坏输入补成一段空段，于是克隆出来的模型一定满足「恒 >= 1 段」这个不变式。
+              paragraphs: cellParagraphs(cell).map((para) => ({
+                inlines: para.inlines.map((inline): Inline => ({ ...inline })),
+              })),
               // kind / align 也要逐格拷：少拷一个字段，撤销与渲染快照就会「回到默认样式 / 默认对齐」
               ...(cell.kind !== undefined ? { kind: cell.kind } : {}),
               ...(cell.align !== undefined ? { align: { ...cell.align } } : {}),

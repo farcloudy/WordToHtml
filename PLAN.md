@@ -43,10 +43,18 @@
   `GOV_STYLES`（正文与各级标题三号 16pt、标题二号 22pt 方正小标宋简体、列表与页脚四号 14pt、
   行高一律固定 28.95pt = 网格行高）；`MARGIN_PRESETS` 由 `DOC_TEMPLATES` 派生。
   公文那套**每行 27 字**（GB/T 9704 写的是 28 字，原因见第 5 节），这是有意的偏差。
-- **单元格 = 可寻址的「伪块」**：`cellId(tableId, r, c)` → `` `${tableId}.r${r}c${c}` `` 挂在格内那层 div 上，
-  于是 `edit/dom.ts` 的坐标换算一行都不用改。**已否决**给坐标系加第二层（`blockId + row + col + offset`）。
-  代价：`edit/model.ts` 用 `findContainer(doc, id): { inlines: Inline[] }` 取代 `findBlock` 来吃容器。
-  ⚠️ `cellId` 里嵌的是**行/列下标**，任何增删都会让其后的格子 id 整体位移 —— 操作后的插入符必须按新下标重算。
+- **单元格 = 可寻址的「伪块」，格内**多段落**：一个格子装 `paragraphs: InlineHolder[]`（Word 的 `w:tc` 里本来就放得下多个 `w:p`），
+  每段与段落同一个形状，所以 `edit/model.ts` 的 `findContainer(doc, id): { inlines: Inline[] }` 一行都不用改就吃掉了它。
+  id 规则：第 0 段就是 `cellId(tableId, r, c)` → `` `${tableId}.r${r}c${c}` ``（既有 id 一字不改），第 N 段是 `` `${cellId(...)}.p${N}` ``（`cellParagraphId`）。
+  段落 div 挂 `data-block-id`，于是 `edit/dom.ts` 的坐标换算一行都不用改。**已否决**给坐标系加第二层（`blockId + row + col + paragraph + offset`）。
+  不变式：`paragraphs.length >= 1`（解析、`normalizeTable`、`cloneDoc` 都保证）；
+  结构操作（`splitCellParagraph` / `mergeCellParagraph`）动手前还会**就地把坏形状补齐**
+  （内部 `ensureCellParagraphs`）—— 手搓模型缺 `paragraphs` 时若只改一份临时兜底对象，
+  函数会报「切好了」而模型一字未动。
+  ⚠️ `cellId` 里嵌的是**行/列下标**，任何增删都会让其后的格子 id 整体位移 —— 操作后的插入符必须按新下标重算；段落下标同理（增删段会让 `.pN` 位移）。
+- **格内换段与并段是独立的一对操作**（`edit/table.ts` 的 `splitCellParagraph` / `mergeCellParagraph`），
+  不走 `splitBlock` / `mergeIntoPrevious` —— 那两条只认 `textBlock`，格内走它们会把整张表当段落切开。
+  `kind` / `align` 是**格子级**的（Word 的 cell 级属性也只有垂直对齐与宽度），格内各段共用一套。
 - **表格断行按行级**（单行不拆，可在行与行之间断开续页，`w:cantSplit` 语义），不是整表不拆。
 - **软换行走真 `<w:br/>`**（零宽 `BreakInline`），正文段落与表格格子同一条路（都走 Shift+Enter）。
   md 写法是 `{br}`，**不是** `\n`
@@ -55,7 +63,10 @@
   但可以逐格换成任意 `BlockKind`（`TableCellModel.kind?`，缺省 `listItem` 不落字段）；
   `kind === 'body'` 导出时**不挂 `w:pStyle`**（`WT-Body` 就是 Word 的 Normal，与正文同一取舍）。
 - **「列标题行」不独立表达**：`role` 只有 `unit` / `body` / `note`，要加粗居中就自己套格式
-  （逐格对齐已能解决居中）。因此 Word 那种「跨页自动重复标题行」不做。
+  （逐格对齐已能解决居中）。
+  ⚠️ 上一段里「因此 Word 那种『跨页自动重复标题行』不做」**已被 issues/20260916-1 第 4 条推翻**：
+  用户 2026-09-16 明确要这个功能，方案 A（表格级 `headerRows`）已过审，见
+  `issues/20260916-1-design.md` §4；在那一波落地之前，模型里还没有这个字段。
 - **节**：`blocks` 保持扁平 + `DocModel.sections?: SectionSettings[]`（**下标 = 节号**，长度 = 分节符数 + 1）；
   `SectionBreakBlock` 只剩 `{ t, id }`。首节 `linkPrevious` 在解析时强制 `false`；
   `resolveSections()` 必须对 `sections` 缺失/偏短兜底（手搓模型、旧 md、旧 docx 读回）。
@@ -85,7 +96,7 @@
 | 全局快捷键 | 项目里 `document` 上只有一处 `addEventListener`：`selectionchange`。要全局键盘得自己加监听 |
 | 选区感知 | `src/lib/edit/dom.ts` 的 `currentRange` / `selectedRanges` / `placeCaret` / `placeRange` / `placeCaretAfterBreak` / `pointToOffset` / `offsetToPoint` / `fragmentOf`；回显走 `WordPaper.vue` 的 `emitSelection` → `selection-change` 事件 → `WtpEditor.vue` |
 | 模型操作（纯函数层） | `src/lib/edit/model.ts`：`insertText` / `deleteRange` / `replaceRange` / `deleteSpan` / `splitBlock` / `mergeIntoPrevious` / `joinWithNext` / `setContainerKind` / `applyFormat` / `resolveRevisions` / `revisionSpanAt` / `hasRevisions` / `addComment` / `insertBreakAfter` / `removeBreak` / `cloneDoc` … |
-| 表格结构操作 | `src/lib/edit/table.ts`（纯函数）：`findTable` / `findCell` / `bodyRowIndexes` / `bodyInsertIndex` / `insertBodyRow` / `removeBodyRow` / `setRoleRow` / `insertColumn` / `removeColumn` / `normalizeTable` / `setMinLines` / `stepCell` / `verticalCell` / `setCellKind` / `setCellAlign` / `removeTable` |
+| 表格结构操作 | `src/lib/edit/table.ts`（纯函数）：`findTable` / `findCell`（**不管 `.pN`**，整格操作） / `findCellAt`（格子 + 那一段） / `cellParagraphs` / `cellParagraphCount` / `emptyCell` / `splitCellParagraph` / `mergeCellParagraph` / `bodyRowIndexes` / `bodyInsertIndex` / `insertBodyRow` / `removeBodyRow` / `setRoleRow` / `insertColumn` / `removeColumn` / `normalizeTable` / `setMinLines` / `stepCell` / `verticalCell` / `setCellKind` / `setCellAlign` / `removeTable` |
 | 节 | `src/lib/section.ts`（`resolveSections()` 等）+ `src/lib/edit/section.ts`（纯模型操作） |
 | 分页与分节 | `src/lib/render/paginate.ts`：`PageFragment`（含 `rowFrom/rowTo`）/ `stepNumbering` / 主循环；布局比对 `sameLayout`（`WordPaper.vue` 内） |
 | 量测 | `src/lib/render/measure.ts`：`measureDocument`（带增量缓存）、`MeasureCache`；**换规格表/换版心宽度时必须 `clearMeasureCache`**（缓存签名含版心宽度） |
@@ -290,7 +301,7 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
   它写的坐标只在**下一次重排之前**有效；重排之后由 `applyFragmentRanges()` 按 `pages.value` 把每个段落片段
   无条件重写一遍（放在 `refreshLayout` 的 `nextTick` 里、`placeCaret` **之前**，没有 anchor 也要跑）。
   不这样做就会留下「Vue 按旧 vnode 跳过属性写入」的脏值 —— 那是「页尾删除把断点字符复制进模型」的根因。
-  表格片段与格子不归它管（格子坐标恒为 `0..格内文字长度`，整段重渲染）。
+  表格片段与格子不归它管（**每一段**的坐标恒为 `0..该段文字长度`，整段重渲染）。
 - 判断插入符是否顶到片段左/右缘，必须按 **`fragmentOf(选区起点)`** 找片段；不能用 `fragmentAt`
   （相邻两片共用边界时会命中前一片，跨页那一退就接不了管）。
 - `Shift+Enter`（正文段落与格内同一条路）的落点走 `placeCaretAfterBreak()` + `RefreshOptions.afterBreak`，
@@ -312,24 +323,28 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
   **keydown Backspace / Delete**、**onPaste** 四处，且一律 `preventDefault`。
   浏览器原生删除会把相邻片段元素并成一个、其余直接删掉，而 Vue 手里还留着那些节点的 vnode —— 页面再也补不回来。
 - 每页一个 `contenteditable`，原生的删除**跨不过页边界**，页尾 Delete / 页首 Backspace 原本是空操作。
-- 选区里**夹着表格格子**时退回「各容器各自删掉选中的文字」（格子的单段落模型表达不了并格）。
+- 选区里**夹着表格格子**时退回「各容器各自删掉选中的文字」（段落的合并／切开只对 `textBlock` 有意义；
+  格内的并段走 `mergeCellParagraph`，跨格的段落标记本来就删不掉）。
 - 下一块是表格 / 换页标记时 `joinWithNext` 返回 `null`，调用方**不改模型也不放行**。
 
 **表格的 DOM 契约**
 
 - 表格片段外层只挂 `data-table-id` / `data-row-from` / `data-row-to`，**不挂 `data-block-id`**
   —— 否则 `fragmentOf()` 向上取「最近的 `data-block-id`」会把外层当成片段。
-  格内那层 div 才挂 `data-block-id = cellId(...)` + `data-from` / `data-to`；`<td>` 恒挂 `data-cell-id`（同值）。
+  格内是**两层**：包装层 `<div class="wtp-cell">` 是给脚本 / CSS 用的稳定钩子（**不挂 `data-block-id`**），
+  里面**每段**一个 `<div class="wtp-cellpara wtp-<kind>" data-block-id data-from data-to>`；
+  `<td>` 恒挂 `data-cell-id`（= 第 0 段的 id）。
 - 片段渲染的 **`v-for` key 必须带 `rowFrom` / `rowTo`**（同一张表各页片段的 `from` / `to` 都是 0，会撞键）。
-- 格内 div 的类名是 **`wtp-cell wtp-<kind>`**：`wtp-cell` 是给脚本 / CSS 用的**稳定钩子**，
-  `wtp-<kind>` 才是那条样式（不要把 `.wtp-listItem` 找回来 —— 它已经不出现在格子里了）。
+- 段落的 `data-block-id` 是 `cellId(...)`（第 0 段）/ `cellId(...).pN`（第 N 段）。
+  包装层**刻意没有任何 CSS 规则**：不给 margin / padding / min-height，段距与缩进全靠每段那条
+  `wtp-<kind>`（Word 在格内也逐段算段前段后），空段靠 `renderInlinesHtml` 的占位 `<br>` 撑高。
   `<td>` 上是 `wtp-td` + `wtp-td-<kind>`（表头/附注行另有 `wtp-td-plain`）。
 - **行高最小值落在 `<td>` 的 `height`**（表格格的 `height` 语义就是最小高度，内容更高照样撑开，
   与 docx 侧 `w:trHeight @ATLEAST` 同义）。**不能**写在格内那层 div 的 `min-height` 上：那样 div 自己就被撑满、
   `<td>` 上的 `vertical-align` 挪的是「已经填满格子的 div」，居中／底端一点视觉效果都没有。
 - **表头行与附注行的下限恒为「一行」**（`minLines=2` 也不变）—— 预览靠 `-min2` 的规则用
   `:not(.wtp-td-plain)` 把它们排除在外，导出侧同一处规则。
-- 逐格对齐：**水平落格内 div 的行内 `text-align`，垂直落 `<td>` 的行内 `vertical-align`**（写在 div 上无效）。
+- 逐格对齐：**水平落格内各段的行内 `text-align`，垂直落 `<td>` 的行内 `vertical-align`**（写在段落 div 上无效）。
   缺字段时的默认值：水平 unit → right、note → left、body → 该格样式；垂直一律 top。
   `EditorSelection.table` 的 `alignH` / `alignV` 是**已解析默认后**的实际值（按钮 active 态吃它）。
   对齐不改行高、不改换行点，所以**不改页数**；格内换样式会改行高，**页数可以变**（预期行为）。
@@ -363,8 +378,10 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
 
 - 表格 `width` 的 `type` **必须显式写 `DXA`**（库默认是 `AUTO`）；`w:tblW` 只在 `options.width` 存在时才写出。
 - `cantSplit` **只在 `TableRow` 上有**；行高用 `{ value: ptToTwips(...), rule: HeightRule.ATLEAST }`。
-- **单元格没有水平对齐字段**：右/左/居中只能落在格内 `Paragraph.alignment`；垂直对齐用
-  `TableCell.verticalAlign`（→ `w:vAlign`）。
+- **单元格没有水平对齐字段**：右/左/居中只能落在格内 `Paragraph.alignment`（**逐段各写一份**，因为样式与对齐是格子级的，格内每段都挂同一个样式）；垂直对齐用
+  `TableCell.verticalAlign`（→ `w:vAlign`，**一格一枚**）。
+- **格内多段落 = 同一个 `TableCell` 里放 N 个 `Paragraph`**（`docx/export.ts` 的 `cellParagraph` 返回数组）。
+  一个 `w:tc` 里必须**至少有一个 `w:p`**，所以坏输入（格子缺 `paragraphs`）由 `cellParagraphs` 兜底成一段空段。
 - `createPageSize` 在 `orientation=landscape` 时**自己互换** w/h —— 要传**纵向尺寸 + orientation**，
   写互换值会被换两遍。
 - 库对**每一节**都无条件写一个空 `<w:pgNumType/>`（API 抑制不了，语义等于不写），
@@ -472,7 +489,8 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
 
 行内标记的落点（`md → 模型 → docx`）：`**粗**` → 加粗运行、`__下划线__` → `TextInline.underline`
 → `<w:u w:val="single"/>`、`{+…}` → `w:ins`、`{-…}` → `w:del`、`{br}` → `<w:br/>`（Word 读回来是 `chr(11)`）、
-`[[文字|批注]]` → 批注锚点。`render/html.ts` 是「预览 / 量测 / 编辑读回」三处共用的同一套结构，
+`[[文字|批注]]` → 批注锚点。**格内另有段落标记 `{p}`**（只在表格格里认，正文里不是语法）
+→ 同一个 `w:tc` 里的下一个 `w:p`。`render/html.ts` 是「预览 / 量测 / 编辑读回」三处共用的同一套结构，
 所以改 HTML 结构等于同时动这三处。
 
 ---
@@ -481,9 +499,9 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
 
 | 命令 | 验的是什么 |
 | --- | --- |
-| `npm run verify:p1` | 生成 docx → **Word COM 打开** → 逐项读回 Word 实际生效的字体／字号／行距规则／段距／首行缩进字符数／样式归属（含 Word 是否把它认成内置样式）／页码域／修订／批注／**逐段下划线**（`w:u` 是否真的生效）／**表格**（行数、每行格数与整行合并、`cantSplit`、行高规则与**逐行磅值**、格内边框线型、**逐格样式与两组对齐**、表格总宽 ≈ 版心宽），与规格表对账；另在 OOXML 层面核对 `<w:u w:val="single"/>` 的处数、**软换行 `<w:br/>` 的处数**（Word 读回来的格文字里应是 chr(11)）与 `<w:tblW w:type="dxa">`／`w:tblLayout`／`w:trHeight`（逐行 = (**正文行** ? `minLines` : 1) × 该行各格样式行高的最大值 —— 表头行 / 附注行恒一行）／`w:gridSpan`／`w:pStyle`／`w:jc`／`w:vAlign` 与模型一致；**逐节**（W5）：Word 读回每节的纸张方向与页脚文本、`<w:pgSz>` 里 `w:orient` 与横排时宽高的互换、`<w:pgNumType w:start="1">` 只在声明「从 1 开始」的节出现、`<w:footerReference>` 只在独立设页脚的节出现（关联前节**不写**才继承），期望值一律由 `resolveSections()` 现推 |
+| `npm run verify:p1` | 生成 docx → **Word COM 打开** → 逐项读回 Word 实际生效的字体／字号／行距规则／段距／首行缩进字符数／样式归属（含 Word 是否把它认成内置样式）／页码域／修订／批注／**逐段下划线**（`w:u` 是否真的生效）／**表格**（行数、每行格数与整行合并、`cantSplit`、行高规则与**逐行磅值**、格内边框线型、**逐格样式与两组对齐**、表格总宽 ≈ 版心宽），与规格表对账；另在 OOXML 层面核对 `<w:u w:val="single"/>` 的处数、**软换行 `<w:br/>` 的处数**（Word 读回来的格文字里应是 chr(11)）与 `<w:tblW w:type="dxa">`／`w:tblLayout`／`w:trHeight`（逐行 = (**正文行** ? `minLines` : 1) × 该行各格样式行高的最大值 —— 表头行 / 附注行恒一行）／`w:gridSpan`／`w:pStyle`／`w:jc`／`w:vAlign` 与模型一致（**`w:pStyle` 与 `w:jc` 逐段计数：格内多段落时每段各一份，`w:vAlign` 是格子级、一格一枚**）；**格内多段落**另单独造一份最小 docx 在字节层验（同一个 `w:tc` 里 2 个 `w:p`、逐段 pStyle / `w:jc`、每格恰好一枚 `w:vAlign`、两段的文字各成一段；⚠️ 样本表里没有多段落格，所以 **Word COM 那一侧没对账**，见第 8 节）；**逐节**（W5）：Word 读回每节的纸张方向与页脚文本、`<w:pgSz>` 里 `w:orient` 与横排时宽高的互换、`<w:pgNumType w:start="1">` 只在声明「从 1 开始」的节出现、`<w:footerReference>` 只在独立设页脚的节出现（关联前节**不写**才继承），期望值一律由 `resolveSections()` 现推 |
 | `npm run verify:p2` | 分页器单测（含**表格行按行装箱、原子项不吃孤行控制、同页同表行合并、跨页断开**）+ 真实浏览器（Chrome，可用 `WTP_BROWSER` 覆盖）实测：**两套文件模板各自**的样式与版心宽（`contentBoxPx`）对账、每页不得溢出、页首与续排的间距豁免、**量测值与渲染值逐块对账（含表格：各行量测高合计 = 渲染出来的表格高）**、切模板后**版心几何必须换一套**（页数可以巧合地相同，不作判据）、宽视口（2200px）下**真的有两页同处一行**（同 `top`、间距 18px、纸宽未被压缩、页带不横向溢出）、窄视口（1000px）回落成一页一排、批注侧栏与正文锚点同源（含点击高亮）、**逐节几何（W5）**：页码 1 的出现次数 = 首节 + 声明了「从 1 开始」的节数、**命名 `@page` 只挂在横排纸上**（纵排走默认 `@page`，尺寸等价；挂上 `wtp-portrait` 会让每份纵排文档多打一张空白纸）且打印媒体下页数与 `break-before` 不被改坏、用「节」工具条把末节改成横排后**只有那一节的纸宽高对调**且纸数不变、横排纸不被压窄、还原 |
-| `npm run verify:p3` | 编辑操作纯函数单测（含**软换行的切片／往返、容器泛化（格内读改）、跨格查找替换**，以及 **`stepCell`/`verticalCell` 的跨格步进（含幻影格跳过）、`removeTable`、`removeBreak` 收紧、`setCellKind`/`setCellAlign` 与格首指令 `{@…}` 的 md 往返**）+ 真实浏览器实测：**敲字后片段仍是同一个 DOM 节点**（证明正常输入没有重排）、插入符落在刚敲完的字后面、行数变了要重排时插入符按坐标找回、回车分段／退格合并、加粗／下划线／改色、下划线的 md 往返、修订模式的增删标记、**接受／拒绝修订**（按钮只在选区含修订时亮、光标贴在修订串末尾也算、拒绝删除修订、接受插入修订、别处修订一个都没动、撤销能还原）、加批注（模型／侧栏／正文锚点三者对得上）、撤销重做、`ctrl+U`／`ctrl+shift+E`／`alt+4`（含无效输入的提示条）、三种特殊空格的码点（单测另外确认它们原样写进 docx 的 `document.xml`）、**切文件模板**（版心几何与量测行数都跟着换、插入符与选区按坐标找回、文字没丢）、打印（隐藏外壳**含查找面板、插入表格面板、表格上下文工具条与导航窗格**、真打一份 PDF 数页数并与版面页数对齐）、以及编辑后每页仍不溢出；**查找替换**（ctrl+F 开面板并聚焦查找框、匹配有高亮且当前那一处单独一层、查找不重建版面 DOM、上一个／下一个移动当前匹配、非法正则只弹提示且不高亮也不改模型、范围「当前选中的文本」只命中选区内、ctrl+G 聚焦替换框与替换一处、全部替换后模型与版面逐块一致）；**导航窗格**（条目数/编号前缀/文字/层级与模型算出的逐条一致、窗格 200px、点击跳转后插入符落在被点块的自动编号之后、正文打字不重建左栏、折叠按钮与顶栏开关）；**表格**（渲成 `.wtp-tableFrag`、外层不挂 `data-block-id`、各片渲染行数 = 行区间、格内打字同步到模型且不重排、**插入表格面板**：默认 2 行 3 列、`Esc` 只关面板不插表、选 4 行 2 列后新表按规格生成且插入符落在第一格、越界值两侧边界各测一次（999 行 / 0 列 → 30 行 / 1 列，0 行 / 999 列 → 1 行 / 12 列）；**表格编辑交互**：表格页常驻（光标不在格内时给提示、按钮全灰；进格后提示收起且按钮可用）、落点提示「第 N 行第 M 列」、点「下方插入行」后模型行数 +1 且 DOM 多一 `<tr>`、插入符仍在原格内容里、删列到最后一列时按钮禁用、行高与表头／附注 radio 各开关一次并把 `-min1`/`-min2` 反映到 DOM 类名、格内 Shift+Enter 后敲字进入新行（模型里排在 `break` 之后）、**正文段落里的 Shift+Enter**（不切段、末尾多一枚软换行、版面真的占两个行盒、换行后敲的字排在 `break` 之后且不把软换行复制成两枚）、格首 Backspace 与格尾 Delete 后模型与 `<td>` 数都不变；**表格收尾（W4b-2）**：Tab 行优先跨格且**最后一格按 Tab 后选区与模型都不变**、Shift+Tab 回上一格末尾、格首 ← / 格尾 → 跨格而格内中间不跨、点「删除表格」后模型少一个 `table` 块且 DOM 里不再有 `.wtp-tableFrag`、插入符落在上一块末尾、格内点样式 chip 后**只有那一格**的类名从 `wtp-listItem` 变成 `wtp-h2`、两组对齐按钮的 active 态与写进 DOM 的行内 `text-align` / `vertical-align`（含「再点同一个值 = 清覆盖」与「只作用于光标那一格」）；打印隐藏里也逐个验了新增的「水平 / 垂直 / 删除表格」按钮确实不显示）；**「节」工具条（W5）**：编辑模式常驻、节号回显「第 N 节 / 共 M 节」、首节「关联前节」与「从 1 开始」整组置灰、样本第 2 节（`--- link=off restart=on`）回显「否 / 是」、点「横向」后只有那一节的纸宽高对调且纸数不变、点「页码=关」后该节不再有页码元素而别的节照旧、来回切完还原且**默认值不落模型字段**、文末插分节符的空白页页码接着前一节往下数（新分节符默认不重排）、两档命名 `@page` 的 `size` 恰好互换且外边距归 0）；**删除的边界（issues/20260915）**：跨页段落**页尾连按 5 次 Backspace** 后模型长度恰好 −5、断点窗口不出现重复，且每一步都逐块核对「版面文字 = 模型文字」（坐标与 DOM 文字不能再差一个字符）；**页尾 Delete** 删掉的是下一页片段的首字（模型 −1，不是空操作）、**页首 Backspace** 删掉的是上一页片段的末字；**段尾 Delete** 把下一段接上来（块数 −1、文字拼接正确）、**段首 Backspace** 合并前一段；**跨段选区删除**后首块 = 「首块切点之前 + 末块切点之后」且中间各块消失；**全选整页删除**后该页的块合成一段（文字清空）且后面的文字前移；**粘贴替换跨块选区**后原选区被粘贴内容取代（不再只是插在选区开头）；上述每个动作再各 `ctrl+Z` 一步，验模型能原样退回（撤销快照必须记在改模型之前 —— 并段类操作一进去就动模型，记晚了撤销就是空操作）；**功能区标签页**（四枚标签「开始／插入／布局／表格」、默认停「开始」、四页常驻且同一时刻只有一页在 DOM 里、各页各管一摊、光标进出表格时版面不上移也不下移、打印时四页外壳逐页切过去验真的都不显示）；**格内垂直对齐**（最小两行 + 单行文字时三档对齐的文字顶端偏移各自落在 0 /（格高−文字高）/ 2 / 格高−文字高 上，且三档格高一致 —— 旧写法三档偏移完全相同）；**W6**：功能区四页（开始／插入／布局／表格）逐页量 `offsetHeight` **相等**（±1px）且都没被挤成两行、自定义快捷键表（URL 参数把表递进 demo；改绑后新组合生效、旧组合失效、未知动作名不改默认表）、`F4` 重复上一步（无可重复操作时空转 + 提示条且模型一字不改、换一处选中后重放也加粗、`ctrl+Z` 只退掉这次重放）、顶栏文件名（不再有 slogan、名字可编辑、导出名 = 名字 + `.docx`、空名兜底 `未命名.docx`、写了后缀不叠）、`::editor` 与顶栏两个开关的双向同步（源码里 `trackChanges=on` → 顶栏勾上且模型里为 true；取消勾选后序列化里那一行消失；`nav=off` → 导航窗格收起 + 序列化里出现 `nav=off`）；**W7 表格复选多格**：从格内拖到对角格**刷出 2×2**（模型坐标下恰好 4 格、DOM 上恰好 4 个 `<td>` 带高亮类、两者按 `data-cell-id` 对得上）、拖出格边界后**没有残留的原生选区**、刷选前后**每一页的 `offsetHeight` 与逐块量测值都不变**且版面片段仍是原来那些 DOM 节点（= 刷选不重排、不重建 DOM）、**在同格里拖动仍是普通的选文字**（原生选区真的选中了字、选中格数为 0）、`Ctrl+点击`追加「锚格↔点击格」的矩形（9 格）与**再点已选中的格 = 去掉那一块**、`Esc` 与点正文别处都能清空（高亮同时清干净）、**批量「居中」只改那 4 格**（隔壁格一个都没动、DOM 行内 `text-align` 逐格对得上、按钮 active 态跟上、复选保留、页数不变、`ctrl+Z` 一步退回整批）、**批量换样式只改那 4 格**（类名恰好 4 个、一步撤销退回）、**跨页表**（同一张表两片上都画到高亮）、**表头行 / 附注行在 `minLines=2` 时格高仍是一行**（正文行才是两行；切成最小一行后三种行都一样高，期望值由 `ptToPx(linePt)` 现推）；**W8 组件打包**：`template` prop 决定版心几何（与规格表现推的 `contentBoxPx` 对齐）与量测行数、`fileName` prop 决定顶栏与导出名、`author` prop 决定新加批注的作者名、`update:fileName` / `update:author` / `update:template` 把改动回传给使用方、`save_md` 收到的字符串 = `toMd(getModel())`（开修订模式时带 `::editor trackChanges=on`）、`ctrl+S` 与「保存」按钮一致且 `preventDefault` 被探针读到、`save_docx` 事件发出、`content` 留空（`?empty=1`）不报错且版面出得来；**W9 新增的二十个 `ctrl+alt+…` 组合键**：段落样式 `1/8/0` 写进模型的 `kind`、标红与取消颜色（`FF0000` / 颜色字段消失）、三种特殊空格的码点 `2003/2002/2005`、分节符与分页符都落在插入符所在段落之后、格内两组对齐 `H/J/K` 与 `←/Home/→` 写进格子的 `align.h` / `align.v`、光标不在格内与没有修订时都一字不改模型并弹出对应提示条 |
+| `npm run verify:p3` | 编辑操作纯函数单测（含**软换行的切片／往返、容器泛化（格内读改）、跨格查找替换**，**格内多段落**（`{p}` 的 md 往返与首段空 / 尾随空段边界、`cellParagraphId` / `parseCellId` 的 `.pN` 解析、`splitCellParagraph` 的切点与越界、`mergeCellParagraph` 的合并点与「第 0 段之前不并」、`findCellAt`、`allInlineHolders` 与 `cloneDoc` 都走遍格内每一段、`normalizeTable` 补齐坏格子、格内每一段的 pStyle / w:jc 渲染计数），以及 **`stepCell`/`verticalCell` 的跨格步进（含幻影格跳过）、`removeTable`、`removeBreak` 收紧、`setCellKind`/`setCellAlign` 与格首指令 `{@…}` 的 md 往返**）+ 真实浏览器实测：**敲字后片段仍是同一个 DOM 节点**（证明正常输入没有重排）、插入符落在刚敲完的字后面、行数变了要重排时插入符按坐标找回、回车分段／退格合并、加粗／下划线／改色、下划线的 md 往返、修订模式的增删标记、**接受／拒绝修订**（按钮只在选区含修订时亮、光标贴在修订串末尾也算、拒绝删除修订、接受插入修订、别处修订一个都没动、撤销能还原）、加批注（模型／侧栏／正文锚点三者对得上）、撤销重做、`ctrl+U`／`ctrl+shift+E`／`alt+4`（含无效输入的提示条）、三种特殊空格的码点（单测另外确认它们原样写进 docx 的 `document.xml`）、**切文件模板**（版心几何与量测行数都跟着换、插入符与选区按坐标找回、文字没丢）、打印（隐藏外壳**含查找面板、插入表格面板、表格上下文工具条与导航窗格**、真打一份 PDF 数页数并与版面页数对齐）、以及编辑后每页仍不溢出；**查找替换**（ctrl+F 开面板并聚焦查找框、匹配有高亮且当前那一处单独一层、查找不重建版面 DOM、上一个／下一个移动当前匹配、非法正则只弹提示且不高亮也不改模型、范围「当前选中的文本」只命中选区内、ctrl+G 聚焦替换框与替换一处、全部替换后模型与版面逐块一致）；**导航窗格**（条目数/编号前缀/文字/层级与模型算出的逐条一致、窗格 200px、点击跳转后插入符落在被点块的自动编号之后、正文打字不重建左栏、折叠按钮与顶栏开关）；**表格**（渲成 `.wtp-tableFrag`、外层不挂 `data-block-id`、各片渲染行数 = 行区间、**格内每一段各挂一个 `data-block-id` 而包装层 `.wtp-cell` 一个都不挂**、格内打字同步到模型且不重排、**插入表格面板**：默认 2 行 3 列、`Esc` 只关面板不插表、选 4 行 2 列后新表按规格生成且插入符落在第一格、越界值两侧边界各测一次（999 行 / 0 列 → 30 行 / 1 列，0 行 / 999 列 → 1 行 / 12 列）；**表格编辑交互**：表格页常驻（光标不在格内时给提示、按钮全灰；进格后提示收起且按钮可用）、落点提示「第 N 行第 M 列」、点「下方插入行」后模型行数 +1 且 DOM 多一 `<tr>`、插入符仍在原格内容里、删列到最后一列时按钮禁用、行高与表头／附注 radio 各开关一次并把 `-min1`/`-min2` 反映到 DOM 类名、格内 Shift+Enter 后敲字进入新行（模型里排在 `break` 之后）、**正文段落里的 Shift+Enter**（不切段、末尾多一枚软换行、版面真的占两个行盒、换行后敲的字排在 `break` 之后且不把软换行复制成两枚）、格首 Backspace 与格尾 Delete 后模型与 `<td>` 数都不变；**格内多段落（W10）**：格内 Enter 在落点把该段切成两段（块数与表格行数都不变、隔壁格不被牵连、插入符落到 `.p1` 且那时它还空着、DOM 里多出一个 `.wtp-cellpara.p1`）、在新段里打字只落在新段、格内三段时**量测行高跟着长**（行高按格内各段总高算）、回车与输入**各记一步撤销**（四级梯子逐级回退到 1 段）、第 1 段的段首 Backspace 与第 0 段的段尾 Delete 都**并成一段**且插入符停在合并点（`<td>` 数不变）、`ctrl+Z` 能把并段退回来、最后一段的段尾 Delete 仍是硬护栏、在第 1 段里按 Tab 照样跨到下一格而 Shift+Tab 落到**上一格最后一段的段尾**；**表格收尾（W4b-2）**：Tab 行优先跨格且**最后一格按 Tab 后选区与模型都不变**、Shift+Tab 回上一格末尾、格首 ← / 格尾 → 跨格而格内中间不跨、点「删除表格」后模型少一个 `table` 块且 DOM 里不再有 `.wtp-tableFrag`、插入符落在上一块末尾、格内点样式 chip 后**只有那一格**的类名从 `wtp-listItem` 变成 `wtp-h2`、两组对齐按钮的 active 态与写进 DOM 的行内 `text-align` / `vertical-align`（含「再点同一个值 = 清覆盖」与「只作用于光标那一格」）；打印隐藏里也逐个验了新增的「水平 / 垂直 / 删除表格」按钮确实不显示）；**「节」工具条（W5）**：编辑模式常驻、节号回显「第 N 节 / 共 M 节」、首节「关联前节」与「从 1 开始」整组置灰、样本第 2 节（`--- link=off restart=on`）回显「否 / 是」、点「横向」后只有那一节的纸宽高对调且纸数不变、点「页码=关」后该节不再有页码元素而别的节照旧、来回切完还原且**默认值不落模型字段**、文末插分节符的空白页页码接着前一节往下数（新分节符默认不重排）、两档命名 `@page` 的 `size` 恰好互换且外边距归 0）；**删除的边界（issues/20260915）**：跨页段落**页尾连按 5 次 Backspace** 后模型长度恰好 −5、断点窗口不出现重复，且每一步都逐块核对「版面文字 = 模型文字」（坐标与 DOM 文字不能再差一个字符）；**页尾 Delete** 删掉的是下一页片段的首字（模型 −1，不是空操作）、**页首 Backspace** 删掉的是上一页片段的末字；**段尾 Delete** 把下一段接上来（块数 −1、文字拼接正确）、**段首 Backspace** 合并前一段；**跨段选区删除**后首块 = 「首块切点之前 + 末块切点之后」且中间各块消失；**全选整页删除**后该页的块合成一段（文字清空）且后面的文字前移；**粘贴替换跨块选区**后原选区被粘贴内容取代（不再只是插在选区开头）；上述每个动作再各 `ctrl+Z` 一步，验模型能原样退回（撤销快照必须记在改模型之前 —— 并段类操作一进去就动模型，记晚了撤销就是空操作）；**功能区标签页**（四枚标签「开始／插入／布局／表格」、默认停「开始」、四页常驻且同一时刻只有一页在 DOM 里、各页各管一摊、光标进出表格时版面不上移也不下移、打印时四页外壳逐页切过去验真的都不显示）；**格内垂直对齐**（最小两行 + 单行文字时三档对齐的文字顶端偏移各自落在 0 /（格高−文字高）/ 2 / 格高−文字高 上，且三档格高一致 —— 旧写法三档偏移完全相同）；**W6**：功能区四页（开始／插入／布局／表格）逐页量 `offsetHeight` **相等**（±1px）且都没被挤成两行、自定义快捷键表（URL 参数把表递进 demo；改绑后新组合生效、旧组合失效、未知动作名不改默认表）、`F4` 重复上一步（无可重复操作时空转 + 提示条且模型一字不改、换一处选中后重放也加粗、`ctrl+Z` 只退掉这次重放）、顶栏文件名（不再有 slogan、名字可编辑、导出名 = 名字 + `.docx`、空名兜底 `未命名.docx`、写了后缀不叠）、`::editor` 与顶栏两个开关的双向同步（源码里 `trackChanges=on` → 顶栏勾上且模型里为 true；取消勾选后序列化里那一行消失；`nav=off` → 导航窗格收起 + 序列化里出现 `nav=off`）；**W7 表格复选多格**：从格内拖到对角格**刷出 2×2**（模型坐标下恰好 4 格、DOM 上恰好 4 个 `<td>` 带高亮类、两者按 `data-cell-id` 对得上）、拖出格边界后**没有残留的原生选区**、刷选前后**每一页的 `offsetHeight` 与逐块量测值都不变**且版面片段仍是原来那些 DOM 节点（= 刷选不重排、不重建 DOM）、**在同格里拖动仍是普通的选文字**（原生选区真的选中了字、选中格数为 0）、`Ctrl+点击`追加「锚格↔点击格」的矩形（9 格）与**再点已选中的格 = 去掉那一块**、`Esc` 与点正文别处都能清空（高亮同时清干净）、**批量「居中」只改那 4 格**（隔壁格一个都没动、DOM 行内 `text-align` 逐格对得上、按钮 active 态跟上、复选保留、页数不变、`ctrl+Z` 一步退回整批）、**批量换样式只改那 4 格**（类名恰好 4 个、一步撤销退回）、**跨页表**（同一张表两片上都画到高亮）、**表头行 / 附注行在 `minLines=2` 时格高仍是一行**（正文行才是两行；切成最小一行后三种行都一样高，期望值由 `ptToPx(linePt)` 现推）；**W8 组件打包**：`template` prop 决定版心几何（与规格表现推的 `contentBoxPx` 对齐）与量测行数、`fileName` prop 决定顶栏与导出名、`author` prop 决定新加批注的作者名、`update:fileName` / `update:author` / `update:template` 把改动回传给使用方、`save_md` 收到的字符串 = `toMd(getModel())`（开修订模式时带 `::editor trackChanges=on`）、`ctrl+S` 与「保存」按钮一致且 `preventDefault` 被探针读到、`save_docx` 事件发出、`content` 留空（`?empty=1`）不报错且版面出得来；**W9 新增的二十个 `ctrl+alt+…` 组合键**：段落样式 `1/8/0` 写进模型的 `kind`、标红与取消颜色（`FF0000` / 颜色字段消失）、三种特殊空格的码点 `2003/2002/2005`、分节符与分页符都落在插入符所在段落之后、格内两组对齐 `H/J/K` 与 `←/Home/→` 写进格子的 `align.h` / `align.v`、光标不在格内与没有修订时都一字不改模型并弹出对应提示条 |
 | `npm run verify:lib` | 库产物（`dist-lib/`）：在 node 里真 `import` 一次不抛异常、`WtpEditor`（与内部组件 `WordPaper`）确实导出、原有纯函数导出还在、**样式产物存在且非空**（`wordtohtml.css`，里面有外壳与 `.wtp-*` 规则）、`vue` 保持 external（产物里 `import "vue"` 而不是内联一份运行时） |
 | `npm run verify:pages` | 同一份源码**逐套模板**各生成一份 docx 与 Word 比页数、节数与页码重排次数（期望值由模型推：页码 1 恰好出现「首节 1 次 + 声明了从 1 开始的节数」次；预览页数与 Word 逐套对齐），并确认两套模板的**版心几何**确实不同（切模板换整套版心的证据 —— 页数可以巧合地相同，不能拿它当判据）；默认模板之外的模板再用内置样本过一次 Word 逐项对账（`assert-docx --template`） |
 | `npm run verify` | 以上全部 + 类型检查 |
@@ -547,8 +565,13 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
    但**在幻影格里打字仍然不落模型**（`findContainer` 找不到那些格）。
 7. **`columns` 只能由数据行回推**：手搓模型里 `columns` 大于所有数据行的格数时，md 往返会把它收窄
    （md 语法没有表达「总列数」的地方）。真实路径（手写 md、UI）不受影响；真要修就给围栏加个 `columns=`。
-8. **表格里的批注锚点**在模型 / md / docx 三层都已支持，但**样本与 Word 对账没覆盖**
-    （为避开 `assert-docx` 里「批注 1 条」那条既有断言）。需要时补一条样本。
+8. **两处表格特性没进 Word 对账**（模型 / md / docx 三层都已支持，只是样本里没有、`assert-docx` 就验不到）：
+   ① **表格里的批注锚点** —— 为避开 `assert-docx` 里「批注 1 条」那条既有断言；
+   ② **格内多段落**（`{p}`）—— 字节层已验（`verify-docx` 另造一份最小 docx），但 Word COM 那一侧读不到。
+   补 ② 的做法是在样本表里加一格 `{p}`，**但那会牵动一批按样本格子文字定位的断言**：
+   2026-09-16 试过给 `数控加工中心` 那格加 `{p}`，`verify:p3` 当场红 28 条（
+   `caretAtEndOf('数控加工中心')` 落在新多出来的第 0 段、段数/行高/垂直对齐的期望全偏）；
+   要补就得先把那些断言的定位方式换成「格子 + 段落下标」，不是加一行样本就完事。
 9. **半截 `[[`（未闭合的批注括号）**会把其后的 `| b |` 一起吞进同一格 —— 内容不丢、往返稳定，
     只是格数比旧算法少一个，记录备查。
 10. **`formatAmount` 的分组校验偏松**：正则首段是不限长的 `\d+`，`1234,567`、`12345,678` 这类非规范分组

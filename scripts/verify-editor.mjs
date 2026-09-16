@@ -1770,20 +1770,34 @@ try {
             el.querySelectorAll(':scope > table > tbody > tr').length ===
             Number(el.dataset.rowTo) - Number(el.dataset.rowFrom),
         ),
-        cells: document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]').length,
-        firstCellText: document.querySelector('.wtp-table .wtp-cell[data-block-id]')
+        // 格内每一段一个 .wtp-cellpara[data-block-id]；外层 .wtp-cell 是纯包装、不挂 id
+        cells: document.querySelectorAll('.wtp-table .wtp-cellpara[data-block-id]').length,
+        wrappers: document.querySelectorAll('.wtp-table .wtp-cell').length,
+        wrapperHasBlockId: Array.from(
+          document.querySelectorAll('.wtp-table .wtp-cell'),
+        ).some((el) => el.dataset.blockId !== undefined),
+        firstCellText: document.querySelector('.wtp-table .wtp-cellpara[data-block-id]')
           ?.textContent,
       }
     })
+    // 渲染侧缺格会补空（矩形化），所以按「渲染后的格」数段
+    const parasInRow = (row) =>
+      row.role === 'body'
+        ? Array.from({ length: t.columns }, (_, c) => row.cells[c]).reduce(
+            (m, c) => m + (c?.paragraphs?.length ?? 1),
+            0,
+          )
+        : (row.cells[0]?.paragraphs?.length ?? 1)
+    const eqCellCount = t.rows.reduce((n, row) => n + parasInRow(row), 0)
+    const eqWrapperCount = t.rows.reduce((n, row) => n + (row.role === 'body' ? t.columns : 1), 0)
+
     ok('表格渲成了 .wtp-tableFrag', surface.frags >= 1)
     eq('表格外层不挂 data-block-id（否则会被当成片段读回）', surface.outerHasBlockId, false)
     eq('各片渲染的行数合计 = 模型行数', surface.renderedRows, t.rows.length)
     ok('每个表格片段渲染的行数 = 它的行区间（行没被拆开）', surface.spansMatch)
-    eq(
-      '格内那层都挂了 data-block-id',
-      surface.cells,
-      t.rows.reduce((n, row) => n + (row.role === 'body' ? t.columns : 1), 0),
-    )
+    eq('格内每一段都挂了 data-block-id', surface.cells, eqCellCount)
+    eq('一格一个包装层（包装层不挂 data-block-id）', surface.wrappers, eqWrapperCount)
+    eq('包装层确实没挂 data-block-id', surface.wrapperHasBlockId, false)
 
     // 格内打字：模型必须同步，且版式没变（正常输入不得重排）
     // 目标格子是「数控加工中心」那一格：样本表第 0 行是 unit 行，第 1 行是正文表头
@@ -1798,7 +1812,7 @@ try {
     await page.waitForTimeout(300)
     const afterT = await getModel()
     const afterTable = afterT.blocks.find((b) => b.t === 'table')
-    const afterCell = (afterTable?.rows[2]?.cells[0]?.inlines ?? [])
+    const afterCell = (afterTable?.rows[2]?.cells[0]?.paragraphs?.[0]?.inlines ?? [])
       .map((i) => (i.t === 'text' ? i.text : ''))
       .join('')
     ok(
@@ -1915,11 +1929,14 @@ try {
   console.log('\n=== V. 表格编辑交互（W4b-1）：上下文工具条、增删行列、unit/note、行高、Shift+Enter、边界护栏 ===')
   const sampleTable = (model) => model.blocks.find((b) => b.t === 'table')
   const modelTable = async () => sampleTable(await getModel())
-  const cellText = (t, r, c) =>
-    (t?.rows?.[r]?.cells?.[c]?.inlines ?? [])
-      .map((i) => (i.t === 'text' ? i.text : ''))
-      .join('')
-  const cellInlines = (t, r, c) => t?.rows?.[r]?.cells?.[c]?.inlines ?? []
+  /** 格内第 p 段（缺省第 0 段）—— 格内是多段落的，读格内文字一律按段读 */
+  const cellPara = (t, r, c, p = 0) => t?.rows?.[r]?.cells?.[c]?.paragraphs?.[p] ?? { inlines: [] }
+  const cellParas = (t, r, c) => t?.rows?.[r]?.cells?.[c]?.paragraphs ?? []
+  const cellText = (t, r, c, p = 0) =>
+    (cellPara(t, r, c, p).inlines ?? []).map((i) => (i.t === 'text' ? i.text : '')).join('')
+  const cellInlines = (t, r, c, p = 0) => cellPara(t, r, c, p).inlines ?? []
+  /** 格内各段文字用 `|` 连起来（多段断言的便捷形式） */
+  const parasTextOf = (t, r, c) => cellParas(t, r, c).map((_, p) => cellText(t, r, c, p)).join('|')
   /** 表格在页面上的 DOM 概况（片段的 tr 加起来应等于模型行数） */
   const tableDom = () =>
     page.evaluate(() => ({
@@ -2073,6 +2090,12 @@ try {
   const typedIdx = typedInlines.findIndex((i) => i.t === 'text' && i.text.includes('X'))
   ok('Shift+Enter 后插入符落在换行之后（敲的字排在 break 之后）', breakIdx >= 0 && typedIdx > breakIdx)
   eq('换行后敲的字没打回上一行', cellText(typedV4, shiftRow, 0), '检测仪器X')
+  eq(
+    '换行之后敲的字没把软换行复制成两枚（格内也一样）',
+    typedInlines.filter((i) => i.t === 'break').length,
+    1,
+  )
+  eq('格内仍只有一段（软换行不切段）', cellParas(typedV4, shiftRow, 0).length, 1)
   const v4Caret = await page.evaluate(() => window.__wtpTest.caretInfo())
   eq('插入符仍在同一格', v4Caret?.blockId, `${typedV4?.id ?? ''}.r${shiftRow}c0`)
   await checkNoOverflow('V4 Shift+Enter 后')
@@ -2165,6 +2188,281 @@ try {
     guardDom.tds,
   )
   await checkNoOverflow('V5 边界护栏后')
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== V6. 格内多段落（W10）：Enter 分段 / 段首 Backspace 并段 / 段尾 Delete 并段 / Tab 落格尾 ===',
+  )
+  /*
+   * 格内多段落 = Word 的「同一个 w:tc 里放多个 w:p」。这里盯四件事：
+   *   ① Enter 在格内切段（同格、同 kind），插入符落到新段，**表格没被当成段落切开**；
+   *   ② 段首 Backspace / 段尾 Delete 是**并段**（删掉那个段落标记），不跨格；
+   *   ③ 第 0 段段首与最后一段段尾仍是硬护栏（不许并到相邻格 —— 那样会当场并掉 <td>）；
+   *   ④ Tab / Shift+Tab 的「格首 / 格尾」按第 0 段与最后一段算。
+   */
+  await openApp('表格')
+  const v6Table = await modelTable()
+  const v6Id = v6Table?.id ?? ''
+  const v6Row = 2
+  /** 页面上某个块 id 的段落 div 的类名（找不到返回 missing） */
+  const paraClassOf = (id) =>
+    page.evaluate(
+      (x) => document.querySelector(`.wtp-cellpara[data-block-id="${x}"]`)?.className ?? 'missing',
+      id,
+    )
+  /** 量测里某一行表格的高度（与分页同一口径） */
+  const measuredRowHeight = (tableIdValue, row) =>
+    page.evaluate(
+      ({ id, r }) => {
+        const hit = window.__wtpPaper
+          .getMeasurements()
+          .find((m) => m.t === 'tableRow' && m.blockId === id && m.row === r)
+        return hit ? Math.round(hit.height * 100) / 100 : -1
+      },
+      { id: tableIdValue, r: row },
+    )
+  /** 把插入符放进**指定块 id** 的第 off 个字符（setCaret 按文字找，多段落时不够用） */
+  const setCaretInBlock = (blockId, off) =>
+    page.evaluate(
+      ({ id, offset }) => {
+        const el = document.querySelector(`[data-block-id="${id}"]`)
+        if (!el) return null
+        const host = el.closest('[contenteditable="true"]')
+        if (host) host.focus()
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+        let remaining = offset
+        let node = walker.nextNode()
+        let last = null
+        while (node && remaining > node.data.length) {
+          remaining -= node.data.length
+          last = node
+          node = walker.nextNode()
+        }
+        const range = document.createRange()
+        if (node) range.setStart(node, Math.min(remaining, node.data.length))
+        else if (last) range.setStart(last, last.data.length)
+        else range.setStart(el, 0)
+        range.collapse(true)
+        const sel = document.getSelection()
+        sel.removeAllRanges()
+        sel.addRange(range)
+        return { blockId: id, offset }
+      },
+      { id: blockId, offset: off },
+    )
+
+  const v6BlocksBefore = (await getModel()).blocks.length
+  const v6RowsBefore = v6Table?.rows.length
+  const v6HeightBefore = await measuredRowHeight(v6Id, v6Row)
+
+  // ---- ① Enter：在落点切段，插入符落到新段 ----
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  const v6Entered = await modelTable()
+  eq('格内 Enter：同一格变两段', cellParas(v6Entered, v6Row, 0).length, 2)
+  eq('第一段文字不变', cellText(v6Entered, v6Row, 0, 0), '数控加工中心')
+  eq('第二段是空的', cellText(v6Entered, v6Row, 0, 1), '')
+  eq('块数不变（表格没被当成段落切开）', (await getModel()).blocks.length, v6BlocksBefore)
+  eq('行数不变', v6Entered?.rows.length, v6RowsBefore)
+  eq('隔壁格没被牵连', cellParas(v6Entered, v6Row, 1).length, 1)
+  const v6Caret1 = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符落到新那一段', v6Caret1?.blockId, `${v6Id}.r${v6Row}c0.p1`)
+  eq('插入符在新段开头', v6Caret1?.offset, 0)
+  eq(
+    'DOM 里多出一个 .wtp-cellpara.p1',
+    await paraClassOf(`${v6Id}.r${v6Row}c0.p1`),
+    'wtp-cellpara wtp-listItem',
+  )
+  eq(
+    '那一段的 data-to 是 0（新段是空的）',
+    await page.evaluate(
+      (id) => document.querySelector(`[data-block-id="${id}"]`)?.dataset.to ?? 'missing',
+      `${v6Id}.r${v6Row}c0.p1`,
+    ),
+    '0',
+  )
+
+  // ---- ② 新段里敲字：落在新段、上一段不动；再回车到第 3 段，行高必须跟着长 ----
+  await page.keyboard.insertText('X')
+  await page.waitForTimeout(300)
+  const v6Typed = await modelTable()
+  eq('敲的字落在新段里', cellText(v6Typed, v6Row, 0, 1), 'X')
+  eq('上一段没被改', cellText(v6Typed, v6Row, 0, 0), '数控加工中心')
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  await page.keyboard.insertText('Y')
+  await page.waitForTimeout(300)
+  const v6Three = await modelTable()
+  eq('再回车：三段', cellParas(v6Three, v6Row, 0).length, 3)
+  eq('三段各是各自的内容', cellText(v6Three, v6Row, 0, 2), 'Y')
+  ok(
+    '行高按格内各段总高算（3 行 > 最小 2 行，量测行高变大）',
+    (await measuredRowHeight(v6Id, v6Row)) > v6HeightBefore,
+    `${v6HeightBefore} → ${await measuredRowHeight(v6Id, v6Row)}`,
+  )
+
+  // ---- ③ 撤销：一次退一步（回车与输入各记一步，梯子逐级回退）----
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const v6Undo1 = await modelTable()
+  eq('撤销第 1 步：只退掉最后敲的那个字', cellText(v6Undo1, v6Row, 0, 2), '')
+  eq('撤销第 1 步后仍是 3 段', cellParas(v6Undo1, v6Row, 0).length, 3)
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const v6Undo2 = await modelTable()
+  eq('撤销第 2 步：第二次回车被退掉（回到 2 段）', cellParas(v6Undo2, v6Row, 0).length, 2)
+  eq('撤销第 2 步：打过的那个字还在', cellText(v6Undo2, v6Row, 0, 1), 'X')
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const v6Undo3 = await modelTable()
+  eq('撤销第 3 步：X 那次输入被退掉（段数不变）', cellParas(v6Undo3, v6Row, 0).length, 2)
+  eq('撤销第 3 步：第二段空了', cellText(v6Undo3, v6Row, 0, 1), '')
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const v6Undo4 = await modelTable()
+  eq('撤销第 4 步：第一次回车被退掉，回到 1 段', cellParas(v6Undo4, v6Row, 0).length, 1)
+  eq('回到 1 段后文字完整', cellText(v6Undo4, v6Row, 0, 0), '数控加工中心')
+  eq(
+    '回到 1 段后 DOM 里那一段也没了',
+    await paraClassOf(`${v6Id}.r${v6Row}c0.p1`),
+    'missing',
+  )
+  await checkNoOverflow('V6 Enter / 撤销后')
+
+  // ---- ④ 段首 Backspace：并进上一段，插入符落在合并点 ----
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  await page.keyboard.insertText('Y')
+  await page.waitForTimeout(300)
+  const v6Two = await modelTable()
+  eq('（前置）两段', cellParas(v6Two, v6Row, 0).length, 2)
+  eq('（前置）第二段是 Y', cellText(v6Two, v6Row, 0, 1), 'Y')
+  const v6DomBeforeMerge = await tableDom()
+  await setCaretInBlock(`${v6Id}.r${v6Row}c0.p1`, 0)
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Backspace')
+  await page.waitForTimeout(300)
+  const v6Merged = await modelTable()
+  eq('段首 Backspace：并成一段', cellParas(v6Merged, v6Row, 0).length, 1)
+  eq('并段后文字接起来', cellText(v6Merged, v6Row, 0, 0), '数控加工中心Y')
+  eq('行数不变', v6Merged?.rows.length, v6RowsBefore)
+  eq('并段后 <td> 数没变（原生没并掉相邻格）', (await tableDom()).tds, v6DomBeforeMerge.tds)
+  const v6Caret2 = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('插入符落在合并点', v6Caret2?.offset, '数控加工中心'.length)
+  eq('插入符仍在同一格第 0 段', v6Caret2?.blockId, `${v6Id}.r${v6Row}c0`)
+  eq(
+    'DOM 里那一段没了',
+    await paraClassOf(`${v6Id}.r${v6Row}c0.p1`),
+    'missing',
+  )
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const v6UndoMerge = await modelTable()
+  eq('撤销能把并段退回来', cellParas(v6UndoMerge, v6Row, 0).length, 2)
+  eq('退回的两段内容都在', cellText(v6UndoMerge, v6Row, 0, 1), 'Y')
+
+  // ---- ⑤ 段尾 Delete：把下一段接上来（与并段同一条路，方向相反）----
+  await setCaretInBlock(`${v6Id}.r${v6Row}c0`, '数控加工中心'.length)
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Delete')
+  await page.waitForTimeout(300)
+  const v6Joined = await modelTable()
+  eq('段尾 Delete：并成一段', cellParas(v6Joined, v6Row, 0).length, 1)
+  eq('并段后文字接起来', cellText(v6Joined, v6Row, 0, 0), '数控加工中心Y')
+  eq(
+    '插入符停在同一处（合并点）',
+    (await page.evaluate(() => window.__wtpTest.caretInfo()))?.offset,
+    '数控加工中心'.length,
+  )
+
+  // ---- ⑥ 最后一段的段尾 Delete / 第 0 段段首 Backspace：硬护栏，一字不许动 ----
+  const v6LastText = cellText(v6Joined, v6Row, 0, 0)
+  const v6GuardDom = await tableDom()
+  await setCaretInBlock(`${v6Id}.r${v6Row}c0`, v6LastText.length)
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Delete')
+  await page.waitForTimeout(300)
+  eq('单段格的段尾 Delete：文字不变', cellText(await modelTable(), v6Row, 0, 0), v6LastText)
+  eq('单段格的段尾 Delete：<td> 数没变', (await tableDom()).tds, v6GuardDom.tds)
+
+  // ---- ⑦ Tab / Shift+Tab：格首 = 第 0 段 0、格尾 = 最后一段末尾 ----
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  await page.keyboard.insertText('Z')
+  await page.waitForTimeout(300)
+  const v6TabTable = await modelTable()
+  eq('（前置）两段（第二段 Z）', cellText(v6TabTable, v6Row, 0, 1), 'Z')
+  await setCaretInBlock(`${v6Id}.r${v6Row}c0.p1`, 1)
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Tab')
+  await page.waitForTimeout(250)
+  const v6Tab = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('在第 1 段里按 Tab：照样跨到下一格', v6Tab?.blockId, `${v6Id}.r${v6Row}c1`)
+  eq('落点是下一格第 0 段的格首', v6Tab?.offset, 0)
+  await page.keyboard.press('Shift+Tab')
+  await page.waitForTimeout(250)
+  const v6BackTab = await page.evaluate(() => window.__wtpTest.caretInfo())
+  eq('Shift+Tab 回到上一格的**最后一段**', v6BackTab?.blockId, `${v6Id}.r${v6Row}c0.p1`)
+  eq('落点是那一段的段尾', v6BackTab?.offset, 1)
+  eq('跨格只挪选区、模型一字不改', cellParas(await modelTable(), v6Row, 0).length, 2)
+  await checkNoOverflow('V6 Tab / Shift+Tab 后')
+
+  // ---- ⑧ 多行粘贴：每一行落成一个**段落**（不再落成软换行）----
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  await page.evaluate(() => {
+    const dt = new DataTransfer()
+    dt.setData('text/plain', '甲\n乙\n丙')
+    document
+      .querySelector('.wtp-content')
+      .dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }))
+  })
+  await page.waitForTimeout(400)
+  const v6Pasted = await modelTable()
+  eq('多行粘贴：第一行接在落点后面（同一段）', cellText(v6Pasted, v6Row, 0, 0), '数控加工中心甲')
+  eq('多行粘贴：每行一段（共 3 段）', cellParas(v6Pasted, v6Row, 0).length, 3)
+  eq('多行粘贴：第二段', cellText(v6Pasted, v6Row, 0, 1), '乙')
+  eq('多行粘贴：第三段', cellText(v6Pasted, v6Row, 0, 2), '丙')
+  eq(
+    '多行粘贴不落软换行（换行就是分段）',
+    cellParas(v6Pasted, v6Row, 0).every((para) => para.inlines.every((i) => i.t !== 'break')),
+    true,
+  )
+  eq('多行粘贴不改行数', v6Pasted?.rows.length, v6RowsBefore)
+  eq('多行粘贴不改页数之外的块数', (await getModel()).blocks.length, v6BlocksBefore)
+
+  // ---- ⑨ 结构操作（增删行列）不丢格内段落与文字 ----
+  await subButton('下方插入行').click()
+  await page.waitForTimeout(350)
+  const v6RowAdded = await modelTable()
+  eq('插入行：行数 +1', v6RowAdded?.rows.length, (v6Pasted?.rows.length ?? 0) + 1)
+  eq('插入行：多段格子仍是 3 段', cellParas(v6RowAdded, v6Row, 0).length, 3)
+  eq('插入行：三段文字一字不丢', cellText(v6RowAdded, v6Row, 0, 2), '丙')
+  eq('插入行：整格文字拼起来也对', parasTextOf(v6RowAdded, v6Row, 0), '数控加工中心甲|乙|丙')
+  await subButton('左侧插入列').click()
+  await page.waitForTimeout(350)
+  const v6ColAdded = await modelTable()
+  eq('插入列：列数 +1', v6ColAdded?.columns, (v6RowAdded?.columns ?? 0) + 1)
+  eq('插入列：多段格子仍是 3 段（内容右移）', cellParas(v6ColAdded, v6Row, 1).length, 3)
+  eq('插入列：文字也没丢', parasTextOf(v6ColAdded, v6Row, 1), '数控加工中心甲|乙|丙')
+  // 删列删的是**落点那一列**，所以先把光标放进刚插出来的空格子（不然删掉的就是多段那格）
+  await setCaretInBlock(`${v6Id}.r${v6Row}c0`, 0)
+  await page.waitForTimeout(200)
+  await subButton('删除列').click()
+  await page.waitForTimeout(350)
+  const v6ColRemoved = await modelTable()
+  eq('删除列：列数回到原值', v6ColRemoved?.columns, v6RowAdded?.columns)
+  eq('删除列：多段格子的 3 段还在（内容回到第 0 列）', parasTextOf(v6ColRemoved, v6Row, 0), '数控加工中心甲|乙|丙')
+  await checkNoOverflow('V6 粘贴与增删行列后')
 
   /* ------------------------------------------------------------------ */
   console.log(
@@ -2294,19 +2592,22 @@ try {
   eq('只有那一格变（其余格一个都没动）', changedCells.join('|'), '2,0')
   // 类名从 wtp-listItem 换成 wtp-h2；按文本定位那一格（片段可能分页）
   const chipDom = await page.evaluate(() => {
-    const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+    const cells = Array.from(
+      document.querySelectorAll('.wtp-table .wtp-cellpara[data-block-id]'),
+    )
     const target = cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))
     return {
       target: target ? target.className : 'missing',
-      h2: document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2').length,
-      h2Text: Array.from(document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2'))
+      h2: document.querySelectorAll('.wtp-table .wtp-cellpara.wtp-h2').length,
+      h2Text: Array.from(document.querySelectorAll('.wtp-table .wtp-cellpara.wtp-h2'))
         .map((el) => el.textContent)
         .join(','),
     }
   })
   ok(
     'DOM 里那一格的类名从 wtp-listItem 变成 wtp-h2',
-    chipDom.target.split(' ').includes('wtp-cell') && chipDom.target.split(' ').includes('wtp-h2'),
+    chipDom.target.split(' ').includes('wtp-cellpara') &&
+      chipDom.target.split(' ').includes('wtp-h2'),
     JSON.stringify(chipDom),
   )
   ok(
@@ -2337,9 +2638,11 @@ try {
   eq('点「居中」写进模型（align.h=center）', cellAlign(await modelTable(), 2, 0)?.h, 'center')
   eq('点「居中」后该按钮高亮', (await activeLabels('水平')).join(','), '居中')
   eq(
-    '水平对齐写进格内 div 的行内 text-align',
+    '水平对齐写进格内段落 div 的行内 text-align',
     await page.evaluate(() => {
-      const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+      const cells = Array.from(
+        document.querySelectorAll('.wtp-table .wtp-cellpara[data-block-id]'),
+      )
       return cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))?.style.textAlign ?? 'missing'
     }),
     'center',
@@ -2356,7 +2659,9 @@ try {
   eq(
     '垂直对齐写进 <td> 的行内 vertical-align（写在格内 div 上无效）',
     await page.evaluate(() => {
-      const cells = Array.from(document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'))
+      const cells = Array.from(
+        document.querySelectorAll('.wtp-table .wtp-cellpara[data-block-id]'),
+      )
       const target = cells.find((el) => (el.textContent ?? '').includes('数控加工中心'))
       return target?.closest('td')?.style.verticalAlign ?? 'missing'
     }),
@@ -2933,8 +3238,10 @@ try {
    */
   const cellMetrics = () =>
     page.evaluate(() => {
+      // 量的是**段落 div**（格内那层文字）而不是包装层：垂直对齐动的是格内内容盒，
+      // 包装层只是壳，量它会把「一格多段」时的多行高度算进来。
       const cell = Array.from(
-        document.querySelectorAll('.wtp-table .wtp-cell[data-block-id]'),
+        document.querySelectorAll('.wtp-table .wtp-cellpara[data-block-id]'),
       ).find((el) => (el.textContent ?? '').includes('数控加工中心'))
       const td = cell?.closest('td')
       if (!cell || !td) return null
@@ -3322,7 +3629,7 @@ try {
   async function cellCharSpan(cellIdValue, i, j) {
     return page.evaluate(
       ({ id, i: from, j: to }) => {
-        const cell = document.querySelector(`.wtp-cell[data-block-id="${id}"]`)
+        const cell = document.querySelector(`.wtp-cellpara[data-block-id="${id}"]`)
         if (!cell) return null
         const node = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT).nextNode()
         if (!node) return null
@@ -3358,7 +3665,8 @@ try {
       (list) =>
         list.map(
           (id) =>
-            document.querySelector(`.wtp-cell[data-block-id="${id}"]`)?.style.textAlign ?? 'none',
+            document.querySelector(`.wtp-cellpara[data-block-id="${id}"]`)?.style.textAlign ??
+            'none',
         ),
       ids,
     )
@@ -3536,14 +3844,16 @@ try {
   eq('隔壁格一个都没动（带 kind 的格只多了这 4 个）', kindCountOf(af5Applied) - kindCountOf(af5), 4)
   eq(
     'DOM 里恰好 4 格是 wtp-h2',
-    await page.evaluate(() => document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2').length),
+    await page.evaluate(
+      () => document.querySelectorAll('.wtp-table .wtp-cellpara.wtp-h2').length,
+    ),
     4,
   )
   eq(
     '那 4 格的类名就是这 4 个 id',
     (
       await page.evaluate(() =>
-        Array.from(document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2'))
+        Array.from(document.querySelectorAll('.wtp-table .wtp-cellpara.wtp-h2'))
           .map((el) => el.dataset.blockId ?? '')
           .sort(),
       )
@@ -4063,7 +4373,12 @@ console.log(
     '金额格式、特殊空格、切文件模板、打印（含新增对齐/删表按钮的隐藏、两档命名 @page）、查找替换（面板/高亮/范围/替换一处与全部）、' +
     '导航窗格（条目与模型一致、点击跳转、折叠）、表格（渲染/格内读回/插入表格面板选规格与越界夹回）、' +
     '表格编辑交互（表格页常驻与置灰规则、落点提示、增删行列、unit/note 与行高 radio、格内 Shift+Enter 落点、' +
-    '格首 Backspace 与格尾 Delete 护栏）、表格收尾（Tab/Shift+Tab 与 ←/→ 跨格、最后一格 Tab 无响应、' +
+    '格首 Backspace 与格尾 Delete 护栏）、' +
+    '格内多段落（W10：格内 Enter 在落点切段且块数/行数不变、插入符落到新段并能在新段里打字、' +
+    'DOM 多出一个 .wtp-cellpara.p1、第 3 段时量测行高跟着长、回车与输入各记一步撤销（四级梯子逐级回退）、' +
+    '段首 Backspace 与段尾 Delete 都并成一段且插入符停在合并点、并段后 <td> 数不变、撤销能退回并段、' +
+    '最后一段段尾 Delete 仍是护栏、在第 1 段里按 Tab 照样跨格而 Shift+Tab 落到上一格最后一段的段尾）、' +
+    '表格收尾（Tab/Shift+Tab 与 ←/→ 跨格、最后一格 Tab 无响应、' +
     '删除整表后插入符落上一块末尾、格内点样式 chip 只改那一格、两组对齐的 active 态与行内样式、对齐不改页数）、' +
     '节工具条（常驻、节号回显、首节与「关联前节=是」的置灰、改方向后逐页几何横竖互换且页数不变、' +
     '关页码后该节不再有页码元素而别的节不受影响、默认值不落模型字段）、' +

@@ -114,6 +114,11 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    * —— 一行里各格取自己样式的那条，实际行高天然是各格的最大值
    * （docx 侧的 w:trHeight 用同一条规则算，两侧同源）。
    *
+   * 格内是「一层包装 `div.wtp-cell` + 每段一个 `div.wtp-cellpara.wtp-<kind>`」（格内多段落）：
+   * **包装层刻意没有任何规则** —— 不给它 margin / padding / min-height，段距与缩进全靠每段那条
+   * `wtp-<kind>`（Word 在格内也逐段算段前段后）；空段的高度靠 `renderInlinesHtml` 的占位 `<br>`
+   * 撑出来，不另加 min-height。
+   *
    * **表头行 / 附注行（`td.wtp-td-plain`）恒为一行高**（W7）：`minLines` 只管正文行，
    * 所以带 `-min2` 的那条规则把 plain 行排除在外，plain 行的下限由下面不带 `-min2` 的
    * 那条规则提供（1 行高）。两行的高度是「整张表的装饰」而不是内容，

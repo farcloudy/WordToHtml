@@ -122,13 +122,20 @@ export interface TableCellAlign {
 }
 
 /**
- * 单元格内容：单段落；软换行（Shift+Enter 的 <w:br/>）作为零宽 inline 存在 inlines 里。
+ * 单元格内容：**多段落**（Word 的单元格本来就放得下多个 `w:p`，Enter 在格内新起一段）。
  *
+ * 每段与段落同一个形状（`InlineHolder`），于是编辑层「找容器 → 直接改它的 inlines」那条路
+ * 一行都不用改：段落下标进 id（`cellId(...)` 恒指第 0 段，第 N 段是 `` `${cellId(...)}.p${N}` ``）。
+ * 软换行（Shift+Enter 的 `<w:br/>`）仍是零宽 inline，落在某一段的 inlines 里。
+ *
+ * 不变式：`paragraphs.length >= 1`（解析、`normalizeTable`、`cloneDoc` 都保证）。
+ *
+ * `kind` / `align` 是**格子级**的（Word 的 cell 级属性也只有垂直对齐与宽度），格内各段共用；
  * `kind` 缺省是 `listItem`（列表段落）—— 老样本与老 docx 因此一个字节都不用变；
  * 显式设成 `listItem` 时 `setCellKind` 会把字段删掉（模型里不存冗余值）。
  */
 export interface TableCellModel {
-  inlines: Inline[]
+  paragraphs: InlineHolder[]
   kind?: BlockKind
   align?: TableCellAlign
 }
@@ -158,23 +165,39 @@ export interface TableBlock {
 export type Block = TextBlock | SectionBreakBlock | PageBreakBlock | TableBlock
 
 /**
- * 单元格在编辑层里的「伪块」id。
+ * 单元格在编辑层里的「伪块」id，**恒指格内的第 0 段**。
  *
  * 单元格也挂 data-block-id，于是 edit/dom.ts 的坐标换算（fragmentOf 向上取最近的
  * data-block-id）不用改一行就能把光标落进格子里 —— 代价只是编辑层按 id 找容器。
+ * 第 N（N > 0）段的 id 见 cellParagraphId()。
  */
 export function cellId(tableId: string, r: number, c: number): string {
   return `${tableId}.r${r}c${c}`
 }
 
-const CELL_ID_RE = /^(.*)\.r(\d+)c(\d+)$/
+/**
+ * 格内第 para 段的伪块 id。para 为 0 时就是 cellId(tableId, r, c) 本身
+ * —— 既有的格子 id 与断言一字不改，第 2 段起才带 `.pN` 后缀。
+ */
+export function cellParagraphId(tableId: string, r: number, c: number, para: number): string {
+  return para === 0 ? cellId(tableId, r, c) : `${cellId(tableId, r, c)}.p${para}`
+}
 
-/** cellId() 的反向解析；不是单元格 id 时返回 null */
-export function parseCellId(id: string): { tableId: string; row: number; col: number } | null {
+const CELL_ID_RE = /^(.*)\.r(\d+)c(\d+)(?:\.p(\d+))?$/
+
+/** cellId() / cellParagraphId() 的反向解析；不是单元格 id 时返回 null。`para` 缺省为 0 */
+export function parseCellId(
+  id: string,
+): { tableId: string; row: number; col: number; para: number } | null {
   const m = CELL_ID_RE.exec(id)
   const tableId = m?.[1]
   if (m === null || !tableId) return null
-  return { tableId, row: Number(m[2]), col: Number(m[3]) }
+  return {
+    tableId,
+    row: Number(m[2]),
+    col: Number(m[3]),
+    para: m[4] === undefined ? 0 : Number(m[4]),
+  }
 }
 
 /**
@@ -280,10 +303,12 @@ export interface InlineHolder {
 }
 
 /**
- * 全篇所有可编辑容器的 inlines（段落 + 表格每个格子），按文档顺序。
+ * 全篇所有可编辑容器的 inlines（段落 + 表格每个格子的**每一段**），按文档顺序。
  *
- * 修订标记、批注锚点都可能落在格子里，所以全篇扫描（找修订 id 最大值、清批注锚点……
- * 这类事）必须走这一条，只遍历 blocks 里能看到的 textBlock 会漏。
+ * 修订标记、批注锚点都可能落在格子里 —— 而且是格子里的任何一段，所以全篇扫描
+ *（找修订 id 最大值、清批注锚点……这类事）必须走这一条：只遍历 blocks 里能看到的
+ * textBlock 会漏，只取每格第 0 段同样会漏。
+ * 模型坏掉（格子没有 paragraphs 字段）时跳过这一格，不抛。
  */
 export function allInlineHolders(doc: DocModel): InlineHolder[] {
   const out: InlineHolder[] = []
@@ -294,7 +319,9 @@ export function allInlineHolders(doc: DocModel): InlineHolder[] {
     }
     if (block.t !== 'table') continue
     for (const row of block.rows) {
-      for (const cell of row.cells) out.push(cell)
+      for (const cell of row.cells) {
+        for (const para of cell.paragraphs ?? []) out.push(para)
+      }
     }
   }
   return out
@@ -360,6 +387,47 @@ export function sliceInlines(inlines: readonly Inline[], from: number, to: numbe
     }
     if (inline.t !== 'text') {
       out.push(inline)
+      continue
+    }
+    const start = cursor
+    const end = cursor + inline.text.length
+    cursor = end
+    if (end <= from || start >= to) continue
+    const cutStart = Math.max(from, start) - start
+    const cutEnd = Math.min(to, end) - start
+    out.push({ ...inline, text: inline.text.slice(cutStart, cutEnd) })
+  }
+  return out
+}
+
+/**
+ * **编辑用**的切片：与 sliceInlines 同一个坐标系，边界规则不同。
+ *
+ * 批注锚点：sliceInlines 是给分页用的，无条件保留所有锚点，好让跨页的每个片段都能把高亮画全。
+ * 编辑读回不能那样 —— 把 `[from,to)` 的片段替换掉以后，`[0,from)` 与 `[to,len)` 里残留的锚点
+ * 会变成重复的批注标记。所以这里按位置过滤：起点落在 `[from,to)` 内才留，终点落在 `(from,to]` 内才留。
+ *
+ * 软换行（零宽）：这里落在 `[from,to)` 就保住 —— 编辑读回没有行盒可丢，保住它比丢掉好
+ * （切分段落时不会把换行弄没）；sliceInlines 反过来要在片首/片尾丢掉边界上那一枚。
+ *
+ * **它住在这里而不是 `edit/model.ts`**：编辑层（切段、替换）与表格结构层（格内分段，
+ * 见 `edit/table.ts`）都要用它，放在 model.ts 会让那两个模块互相 import 成环。
+ * 这里是模型的纯函数层，谁都能引。
+ */
+export function sliceStrict(inlines: readonly Inline[], from: number, to: number): Inline[] {
+  const out: Inline[] = []
+  let cursor = 0
+  for (const inline of inlines) {
+    if (inline.t === 'commentStart') {
+      if (cursor >= from && cursor < to) out.push(inline)
+      continue
+    }
+    if (inline.t === 'commentEnd') {
+      if (cursor > from && cursor <= to) out.push(inline)
+      continue
+    }
+    if (inline.t === 'break') {
+      if (cursor >= from && cursor < to) out.push(inline)
       continue
     }
     const start = cursor

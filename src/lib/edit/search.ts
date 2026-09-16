@@ -2,15 +2,16 @@
  * 查找与替换的纯函数层（不碰 DOM，可在 node 里单测）。
  *
  * 坐标系与 edit/model.ts 一致：偏移是**模型文字坐标**，不含标题自动编号前缀。
- * 查找跑在每个**可编辑容器**的可搜索文字上 —— 段落，以及表格的每个格子
- *（格子 id 用 cellId，与预览 DOM 的 data-block-id 同一套）。可搜索文字 = 把容器内
- * 文字按顺序连起来、但跳过删除修订的文字；批注锚点与软换行不占字符，都不会让匹配漏掉。
+ * 查找跑在每个**可编辑容器**的可搜索文字上 —— 段落，以及表格格子的每一段
+ *（段落 0 用 cellId、第 N 段用 `cellId.pN`，与预览 DOM 的 data-block-id 同一套）。
+ * 可搜索文字 = 把容器内文字按顺序连起来、但跳过删除修订的文字；批注锚点与软换行不占字符，
+ * 都不会让匹配漏掉。
  *
  * 默认大小写敏感（与公文场景一致，不做「忽略大小写」选项）。
  */
 
 import type { DocModel, Inline, InlineHolder, RevMark, TextInline } from '../types'
-import { cellId } from '../types'
+import { cellParagraphId } from '../types'
 import { containerLength, deleteRange, findContainer, replaceRange } from './model'
 
 /** 匹配区间（模型文字坐标） */
@@ -88,8 +89,12 @@ function searchRuns(inlines: readonly Inline[]): SearchRun[] {
 }
 
 /**
- * 全篇可搜索的容器（段落 + 表格格子），带各自的 id（格子用 cellId，与 DOM 的
- * data-block-id 同一套）。查找/替换因此天然覆盖格内文字。
+ * 全篇可搜索的容器（段落 + 表格格子的**每一段**），带各自的 id
+ * （段落用块 id、格内段落用 `cellId` / `cellId.pN`，与 DOM 的 data-block-id 同一套）。
+ * 查找/替换因此天然覆盖格内每一段的文字。
+ *
+ * 这里直接读 `cell.paragraphs`、不走 cellParagraphs 的兜底：搜索报出来的 id 必须能
+ * 被 findContainer 找到（替换要写回模型），而兜底造出来的那一假段并不在模型里。
  */
 function searchableContainers(doc: DocModel): { id: string; inlines: readonly Inline[] }[] {
   const out: { id: string; inlines: readonly Inline[] }[] = []
@@ -101,7 +106,9 @@ function searchableContainers(doc: DocModel): { id: string; inlines: readonly In
     if (block.t !== 'table') continue
     block.rows.forEach((row, r) => {
       row.cells.forEach((cell, c) => {
-        out.push({ id: cellId(block.id, r, c), inlines: cell.inlines })
+        ;(cell.paragraphs ?? []).forEach((para, p) => {
+          out.push({ id: cellParagraphId(block.id, r, c, p), inlines: para.inlines })
+        })
       })
     })
   }

@@ -70,7 +70,6 @@ import {
   replaceRange,
   resolveRevisions,
   setContainerKind as setContainerKindOp,
-  sliceStrict,
   splitBlock,
   updateComment as updateCommentOp,
 } from '../lib/edit/model'
@@ -83,15 +82,20 @@ import type {
 import {
   bodyInsertIndex,
   bodyRowIndexes,
+  cellParagraphCount,
+  cellParagraphs,
   cellRectBetween,
   cellRectIndexOf,
   cellsChangingAlign,
   cellsChangingKind,
   cellsInRects,
+  emptyCell,
   findCell,
+  findCellAt,
   findTable,
   insertBodyRow,
   insertColumn,
+  mergeCellParagraph,
   nextAlignValue,
   normalizeCellCol,
   removeBodyRow,
@@ -102,6 +106,7 @@ import {
   setMinLines,
   setRoleRow,
   sortCells,
+  splitCellParagraph,
   stepCell,
   storedCellKind,
   verticalCell,
@@ -128,12 +133,14 @@ import type { Align, BlockKind, DeepPartial, Spec } from '../lib/spec'
 import {
   allInlineHolders,
   cellId,
+  cellParagraphId,
   commentScopes,
   defaultCellAlignH,
   nextBlockId,
   parseCellId,
   resolveEditorFlags,
   sliceInlines,
+  sliceStrict,
 } from '../lib/types'
 import type {
   CellVerticalAlign,
@@ -1503,9 +1510,9 @@ function onKeydown(event: KeyboardEvent): void {
      * Shift+Enter 在**任何**容器里都是软换行（Word 的 `<w:br/>`）—— 正文段落与表格格子走同一条路，
      * 插入符落到换行之后（软换行零宽，通用还原规则会把它放回换行之前，那里的字也就打回上一行）。
      *
-     * 不带 Shift 的 Enter 在格内一律不接管（单元格是单段落，分段表达不出来）—— 但护栏现在就得有：
-     * 不拦的话回车会掉进 insertParagraphBreak，把整张表当段落切开。
-     * （insertParagraphBreak 里还有一道 findBlock 兜底，两道都在，免得日后改一处漏一处。）
+     * 不带 Shift 的 Enter 落在格子里时**在格内新起一段**（Word 的语义：`w:tc` 里再放一个 `w:p`），
+     * 走 splitCellParagraph；正文里仍是切分段落。两条都在这里 preventDefault —— 放给浏览器的话，
+     * 回车会掉进 insertParagraphBreak 把整张表当成一个段落切开。
      */
     const point = caretPoint()
     event.preventDefault()
@@ -1513,7 +1520,10 @@ function onKeydown(event: KeyboardEvent): void {
       if (point) insertSoftBreak(point)
       return
     }
-    if (point && isTableCell(point.blockId)) return
+    if (point && isTableCell(point.blockId)) {
+      insertCellParagraphBreak(point)
+      return
+    }
     insertParagraphBreak()
     return
   }
@@ -1524,11 +1534,27 @@ function onKeydown(event: KeyboardEvent): void {
     if (!point) return
     /*
      * 格内退格单独守住：格首那一退如果放给浏览器，原生会把相邻 `<td>` 的 DOM 并掉，
-     * 表格结构当场就坏了（格内偏移为 0 = 光标顶在格首；格子的前缀恒为 0）。
-     * 格内别的位置不动，交给浏览器在格内正常退格。
+     * 表格结构当场就坏了（格内偏移为 0 = 光标顶在段首；格子的前缀恒为 0）。
+     *   · 不在段首 → 交给浏览器在段内正常退格；
+     *   · 第 0 段段首 → 只拦住、什么都不做（不许并到上一格）；
+     *   · 第 N（N>0）段段首 → 与同格上一段合并（一次撤销，插入符落在合并点）。
      */
     if (isTableCell(point.blockId)) {
-      if (point.offset <= prefixLength(point.blockId)) event.preventDefault()
+      const parsed = parseCellId(point.blockId)
+      const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+      if (!parsed || offset > 0) return
+      event.preventDefault()
+      if (parsed.para === 0) return
+      // 撤销快照必须记在改模型之前（并完再记就退回不去了）
+      pushHistory(point)
+      const merged = mergeCellParagraph(doc.value, point.blockId, parsed.para)
+      if (merged === null) return
+      const id = cellParagraphId(parsed.tableId, parsed.row, parsed.col, parsed.para - 1)
+      refreshLayout({
+        anchor: { blockId: id, offset: prefixLength(id) + merged },
+        force: true,
+      })
+      void nextTick(emitSelection)
       return
     }
     /*
@@ -1580,14 +1606,29 @@ function onKeydown(event: KeyboardEvent): void {
     if (!point) return
     if (isTableCell(point.blockId)) {
       /*
-       * 格尾的 Delete 同样是结构性的：不拦的话原生会跟下一格合并。
-       * 只在「格内偏移已到格文字长度」时接管，格内其它位置留给浏览器。
+       * 格内的 Delete 同样是结构性的：不拦的话原生会跟下一格合并。
+       *   · 不在段尾 → 交给浏览器在段内正常向后删；
+       *   · 最后一段的段尾 → 只拦住、什么都不做（不许并到下一格）；
+       *   · 其余段尾 → 把下一段接上来（删掉那个「段落标记」），插入符仍停在合并点。
        */
+      const parsed = parseCellId(point.blockId)
       const cellContainer = findContainer(doc.value, point.blockId)
-      if (!cellContainer) return
-      if (point.offset >= prefixLength(point.blockId) + containerLength(cellContainer)) {
-        event.preventDefault()
-      }
+      if (!parsed || !cellContainer) return
+      const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+      if (offset < containerLength(cellContainer)) return
+      event.preventDefault()
+      const cell = findCell(doc.value, point.blockId)
+      const last = cell ? cellParagraphCount(cell) - 1 : 0
+      if (parsed.para >= last) return
+      // 撤销快照必须记在改模型之前（并完再记就退回不去了）
+      pushHistory(point)
+      const merged = mergeCellParagraph(doc.value, point.blockId, parsed.para + 1)
+      if (merged === null) return
+      refreshLayout({
+        anchor: { blockId: point.blockId, offset: prefixLength(point.blockId) + merged },
+        force: true,
+      })
+      void nextTick(emitSelection)
       return
     }
     const container = findContainer(doc.value, point.blockId)
@@ -1629,8 +1670,9 @@ function onKeydown(event: KeyboardEvent): void {
   }
   /*
    * ← / → 跨格：只在键盘事件不带任何修饰键、且落点在格内时才考虑。
-   * 判据是「落点已在格内偏移 0」（←）或「落点已到该格文字末尾」（→），
-   * 满足才接管；其余一律 return 走原路，别影响段落里的左右移动。
+   * 判据是「落点已在该**格**的首 / 末」—— 格内多段落之后，格首 = 第 0 段的 0、
+   * 格尾 = 最后一段的末尾；段内其它位置（含第 1 段的段首）一律 return 走原路，
+   * 交给浏览器在同一格内正常左右移动。
    */
   if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
     if (mod || event.altKey || event.shiftKey) return
@@ -1642,9 +1684,11 @@ function onKeydown(event: KeyboardEvent): void {
     if (!point || !cell || !table) return
     const container = findContainer(doc.value, point.blockId)
     if (!container) return
+    const target = findCell(doc.value, point.blockId)
     const start = prefixLength(point.blockId)
-    const atStart = point.offset <= start
-    const atEnd = point.offset >= start + containerLength(container)
+    const lastPara = target ? cellParagraphCount(target) - 1 : 0
+    const atStart = cell.para === 0 && point.offset <= start
+    const atEnd = cell.para === lastPara && point.offset >= start + containerLength(container)
     const dir = event.key === 'ArrowLeft' ? 'prev' : 'next'
     if (dir === 'prev' ? !atStart : !atEnd) return
     const step = stepCell(table, cell.row, cell.col, dir)
@@ -1674,18 +1718,27 @@ function onKeydown(event: KeyboardEvent): void {
 
 /**
  * 把插入符落到目标格。跨格**只挪原生选区、不改模型、不 refreshLayout**（DOM 没重建）。
- * 落点偏移按显示坐标算（格子的自动编号前缀恒为 0，仍按既有写法扣一次更稳），
- * 落完补一次 emitSelection，让工具条的落点提示跟上。
+ *
+ * 「格首 / 格尾」在格内多段落之后是：`start` = **第 0 段**的开头、`end` = **最后一段**的末尾
+ * —— step 给的是「格」，段落下标由这里现算。落点偏移按显示坐标算（格子的自动编号前缀恒为 0，
+ * 仍按既有写法扣一次更稳），落完补一次 emitSelection，让工具条的落点提示跟上。
  */
 function moveCaretToCell(tableId: string, step: CellStep): void {
   const rootEl = root.value
   if (!rootEl) return
-  const id = cellId(tableId, step.row, step.col)
+  const cell = findCell(doc.value, cellId(tableId, step.row, step.col))
+  const para = step.at === 'end' && cell ? cellParagraphCount(cell) - 1 : 0
+  const id = cellParagraphId(tableId, step.row, step.col, para)
   const container = findContainer(doc.value, id)
   if (!container) return
   const offset = prefixLength(id) + (step.at === 'end' ? containerLength(container) : 0)
   placeCaret(rootEl, { blockId: id, offset })
   emitSelection()
+}
+
+/** 页面上承载某个块 id 的那个 div（格内段落也一样，靠 data-block-id 找） */
+function blockEl(rootEl: HTMLElement, blockId: string): HTMLElement | null {
+  return rootEl.querySelector<HTMLElement>(`[data-block-id="${CSS.escape(blockId)}"]`)
 }
 
 /** 插入符的 rect top；拿不到（选区不在、rect 退化成长宽都为 0）返回 null —— 调用方据此 fail-open */
@@ -1732,8 +1785,9 @@ function charRectTop(frag: HTMLElement, which: 'first' | 'last'): number | null 
 }
 
 /**
- * ↑ / ↓ 的落点判定：插入符 top ≈ 格内首字符 top → 已在首视觉行（↑ 接管、↓ 不接管）；
- * ≈ 末字符 top → 已在末视觉行（↓ 接管、↑ 不接管）；中间视觉行一律不接管。
+ * ↑ / ↓ 的落点判定：插入符 top ≈ 该格**首视觉行**（第 0 段的第一个字）→ 已在首行
+ * （↑ 接管、↓ 不接管）；≈ **末视觉行**（最后一段的最后一个字）→ 已在末行（↓ 接管、↑ 不接管）；
+ * 中间视觉行一律不接管。格内多段落时「格的首/末行」就是第一段的首行与最后一段的末行。
  * 任何一处取不到（rect 退化、首末字符缺失）或抛异常 → 返回 null（fail-open）。
  */
 function visualLineStep(
@@ -1745,13 +1799,14 @@ function visualLineStep(
   try {
     const rootEl = root.value
     if (!rootEl) return null
-    const frag = rootEl.querySelector<HTMLElement>(
-      `[data-block-id="${CSS.escape(cellId(table.id, row, col))}"]`,
-    )
-    if (!frag) return null
+    const cell = findCell(doc.value, cellId(table.id, row, col))
+    const last = cell ? cellParagraphCount(cell) - 1 : 0
+    const firstFrag = blockEl(rootEl, cellParagraphId(table.id, row, col, 0))
+    const lastFrag = blockEl(rootEl, cellParagraphId(table.id, row, col, last))
+    if (!firstFrag || !lastFrag) return null
     const caretTop = caretRectTop()
-    const firstTop = charRectTop(frag, 'first')
-    const lastTop = charRectTop(frag, 'last')
+    const firstTop = charRectTop(firstFrag, 'first')
+    const lastTop = charRectTop(lastFrag, 'last')
     if (caretTop === null || firstTop === null || lastTop === null) return null
     const tol = 1
     if (dir === 'up' && Math.abs(caretTop - firstTop) <= tol) {
@@ -1784,9 +1839,28 @@ function insertSoftBreak(point: DisplayPoint): void {
   })
 }
 
-/** 这个 id 是表格格子（`tableId.rNcM`）还是普通段落？格子的结构性操作都得绕开 */
+/** 这个 id 是表格格子（`tableId.rNcM` / `…rNcM.pK`）还是普通段落？格子的结构性操作都得绕开 */
 function isTableCell(blockId: string): boolean {
   return parseCellId(blockId) !== null
+}
+
+/**
+ * 回车落在格内：在落点把**该段**切成两段（同一格子、同 kind），插入符落到新段开头。
+ *
+ * 与段落那条（insertParagraphBreak）走的是两套模型操作：这里只动格内的 paragraphs 数组，
+ * 不碰 doc.blocks —— 否则整张表会被当成一个段落切开。
+ * `kind` / `align` 是格子级的，新段自动继承，不需要复制什么（`tailSameKind` 只是签名对称）。
+ */
+function insertCellParagraphBreak(point: DisplayPoint): void {
+  const hit = findCellAt(doc.value, point.blockId)
+  if (!hit) return
+  const offset = Math.max(0, point.offset - prefixLength(point.blockId))
+  pushHistory(point)
+  const created = splitCellParagraph(doc.value, point.blockId, offset, storedCellKind(hit.cell))
+  if (created === null) return
+  const id = cellParagraphId(hit.table.id, hit.row, hit.col, created)
+  refreshLayout({ anchor: { blockId: id, offset: prefixLength(id) }, force: true })
+  void nextTick(emitSelection)
 }
 
 /** 回车：在落点切开当前块。标题类段落回车后接一个正文段（公文习惯：标题一行一段） */
@@ -1830,24 +1904,30 @@ function onPaste(event: ClipboardEvent): void {
 
   if (isTableCell(point.blockId)) {
     /*
-     * 单元格是单段落，分段在这里表达不出来。多行粘贴把换行变成**软换行**
-     * （而不是像段落那样往后切段）—— 若不特判，splitBlock 对格子是空操作，
-     * 后面的行会被静默丢掉。
+     * 多行粘贴落成**多个段落**（格内多段落之后，换行就是分段 —— 与正文同一条语义；
+     * 换行用 Shift+Enter 的软换行表达）。若不这么走，后面的行会被静默丢掉。
      */
-    const container = findContainer(doc.value, point.blockId)
-    if (!container) return
-    const offset = Math.max(0, point.offset - prefixLength(point.blockId))
-    const inlines: Inline[] = []
-    lines.forEach((line, i) => {
-      if (i > 0) inlines.push({ t: 'break' })
-      if (line !== '') inlines.push({ t: 'text', text: line })
-    })
-    replaceRange(container, offset, offset, inlines)
+    const parsed = parseCellId(point.blockId)
+    if (!parsed) return
+    const cellModel = findCell(doc.value, point.blockId)
+    const kind: BlockKind = cellModel ? storedCellKind(cellModel) : 'listItem'
+    let para = parsed.para
+    let id = point.blockId
+    let offset = Math.max(0, point.offset - prefixLength(point.blockId))
+    for (let i = 0; i < lines.length; i += 1) {
+      if (i > 0) {
+        const created = splitCellParagraph(doc.value, id, offset, kind)
+        if (created === null) break
+        para = created
+        id = cellParagraphId(parsed.tableId, parsed.row, parsed.col, para)
+        offset = 0
+      }
+      const line = lines[i] ?? ''
+      insertText(doc.value, id, offset, line)
+      offset += line.length
+    }
     refreshLayout({
-      anchor: {
-        blockId: point.blockId,
-        offset: prefixLength(point.blockId) + offset + lines.join('').length,
-      },
+      anchor: { blockId: id, offset: prefixLength(id) + offset },
       force: true,
     })
     return
@@ -2357,7 +2437,7 @@ function insertTable(rows: number = NEW_TABLE_ROWS, columns: number = NEW_TABLE_
     cantSplit: true,
     rows: Array.from({ length: bodyRows }, () => ({
       role: 'body',
-      cells: Array.from({ length: cols }, () => ({ inlines: [] })),
+      cells: Array.from({ length: cols }, () => emptyCell()),
     })),
   }
   doc.value.blocks.splice(at, 0, table)
@@ -2380,6 +2460,8 @@ interface TableCaretTarget {
   row: number
   /** 列下标；unit/note 行天然只有一格，恒为 0 */
   col: number
+  /** 光标所在**段**在格内的下标（格内多段落；结构操作后按新下标重算） */
+  para: number
   /** 格内模型偏移（格子的前缀恒为 0，仍按现有写法扣一次更稳） */
   offset: number
   /** 改之前那一刻的落点，记进撤销栈用 */
@@ -2400,6 +2482,7 @@ function tableTarget(): TableCaretTarget | null {
     table,
     row: cell.row,
     col: cell.col,
+    para: cell.para,
     offset: Math.max(0, point.offset - prefixLength(point.blockId)),
     point,
   }
@@ -2418,17 +2501,27 @@ function bodyOrdinal(table: TableBlock, row: number): number {
  * 表格结构操作的收尾：按**新下标**重算锚点 → 重排 → 把选区回显给工具条。
  *
  * `cellId` 里嵌的是行/列下标（`tb1.r2c1`），任何增删都会让其后的格子 id 整体位移，
- * 所以新锚点只能拿新下标重新组，不能沿用旧 id；偏移也要夹到该格的新长度以内。
+ * 所以新锚点只能拿新下标重新组，不能沿用旧 id；偏移也要夹到该格那一段的新长度以内。
+ * 段落下标同理要夹（改行不改段，但光标原来停在第 3 段、而目标格只有 1 段时得退回来）。
  */
-function finishTableOp(target: TableCaretTarget, row: number, col: number, offset: number): void {
+function finishTableOp(
+  target: TableCaretTarget,
+  row: number,
+  col: number,
+  offset: number,
+  para: number = target.para,
+): void {
   const table = target.table
   const r = Math.min(Math.max(0, row), Math.max(0, table.rows.length - 1))
   const cellCount = table.rows[r]?.cells.length ?? 0
   const c = Math.min(Math.max(0, col), Math.max(0, cellCount - 1))
   const cell = table.rows[r]?.cells[c]
-  const at = Math.min(Math.max(0, offset), cell ? containerLength(cell) : 0)
+  const list = cell ? cellParagraphs(cell) : []
+  const p = Math.min(Math.max(0, para), Math.max(0, list.length - 1))
+  const holder = list[p]
+  const at = Math.min(Math.max(0, offset), holder ? containerLength(holder) : 0)
   refreshLayout({
-    anchor: { blockId: cellId(target.tableId, r, c), offset: at },
+    anchor: { blockId: cellParagraphId(target.tableId, r, c, p), offset: at },
     force: true,
   })
   /*
@@ -2942,7 +3035,8 @@ function applyCellsAlign(part: 'h' | 'v', value: string): boolean {
  *
  * 重排会重建 DOM，插入符必须按坐标放回去。点位优先沿用落点（复选把原生选区塌掉之后
  * 它仍在起点格里），落点不在这张表里就用第一格 —— 一次批量只 `pushHistory` 一次，
- * 撤销一步就能退回整批。
+ * 撤销一步就能退回整批。**段落下标也沿用落点**（格内多段落时，批量改样式不该把光标
+ * 从第 3 段挪回第 1 段），越界再退回来。
  */
 function finishCellsOp(group: { tableId: string; table: TableBlock; cells: CellRef[] }): void {
   const first = group.cells[0]
@@ -2950,13 +3044,21 @@ function finishCellsOp(group: { tableId: string; table: TableBlock; cells: CellR
   const parsed = caret ? parseCellId(caret.blockId) : null
   const inside = parsed?.tableId === group.tableId && group.table.rows[parsed.row] !== undefined
   const row = inside && parsed ? parsed.row : (first?.row ?? 0)
-  const col = inside && parsed ? normalizeCellCol(group.table, parsed.row, parsed.col) : (first?.col ?? 0)
+  const col = inside && parsed
+    ? normalizeCellCol(group.table, parsed.row, parsed.col)
+    : (first?.col ?? 0)
   const cell = group.table.rows[row]?.cells[col]
+  const list = cell ? cellParagraphs(cell) : []
+  const para = Math.min(
+    Math.max(0, inside && parsed ? parsed.para : 0),
+    Math.max(0, list.length - 1),
+  )
   const offset = caret && inside ? caret.offset - prefixLength(caret.blockId) : 0
+  const holder = list[para]
   refreshLayout({
     anchor: {
-      blockId: cellId(group.tableId, row, col),
-      offset: Math.min(Math.max(0, offset), cell ? containerLength(cell) : 0),
+      blockId: cellParagraphId(group.tableId, row, col, para),
+      offset: Math.min(Math.max(0, offset), holder ? containerLength(holder) : 0),
     },
     force: true,
   })
