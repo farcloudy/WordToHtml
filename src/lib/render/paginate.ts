@@ -54,6 +54,10 @@ export interface MeasuredTableRow {
   row: number
   /** 实测行高（px） */
   height: number
+  /** 本表前几行是标题行（0 = 不重复）；同一张表的每一行都带同一个值 */
+  repeatRows?: number
+  /** 这些标题行的实测高之和（px）；0 = 不重复 */
+  headerHeight?: number
 }
 
 export type MeasuredItem = MeasuredBlock | MeasuredBreak | MeasuredTableRow
@@ -87,6 +91,18 @@ export interface PageFragment {
   /** 表格片段：本片覆盖的表格行区间 [rowFrom, rowTo)（半开）。段落片段没有这两个字段 */
   rowFrom?: number
   rowTo?: number
+  /**
+   * 表格片段：这一片要在正文行之前**先渲出的重复行区间** `[0, headerTo)`。
+   *
+   * 只有「这张表已经在更早的页上落过行、而本片不是它的第一片」时才带它 ——
+   * 也就是 Word 的 `w:tblHeader` 在续页顶端的重复。渲染侧把它当**只读装饰**
+   * （不挂 data-block-id / data-cell-id，见 render/html.ts），分页侧已经按
+   * `headerHeight` 把这一页的可用高度扣掉。
+   *
+   * 恒有 `headerTo <= rowFrom`（见 paginate 主循环里那条不变式）：一片**绝不重复
+   * 它自己已经含有的行** —— 否则同一行会被正本与重复行渲两遍。
+   */
+  headerTo?: number
 }
 
 /** 是不是表格片段（`kind` 为空、带行区间） */
@@ -193,8 +209,11 @@ export function paginate(
    * 每行一个片段就会渲出「一行一张表」，边框与列宽各算各的。
    * 跨页时必须断开（页间本来就不是同一个 `<table>`），所以只在「本页最后一个片段
    * 就是同一张表」时才往后延 rowTo，否则新起一个片段（continuation = 不是从第 0 行开始）。
+   *
+   * `headerTo` 只在**新起**片段时写入；往后延 rowTo 的那条路天然保留了已经定好的值
+   * （续页顶端那批重复行不会因为多放了一行正文就消失）。
    */
-  const placeTableRow = (item: MeasuredTableRow): void => {
+  const placeTableRow = (item: MeasuredTableRow, headerTo: number): void => {
     const last = fragments[fragments.length - 1]
     if (last !== undefined && last.rowFrom !== undefined && last.blockId === item.blockId) {
       last.rowTo = item.row + 1
@@ -207,6 +226,7 @@ export function paginate(
       continuation: item.row > 0,
       rowFrom: item.row,
       rowTo: item.row + 1,
+      ...(headerTo > 0 ? { headerTo } : {}),
     })
   }
 
@@ -249,10 +269,41 @@ export function paginate(
        * 不能让它落进下面的 widow/orphan 算术：那里的 `take = Math.min(fit, rowsLeft - 2)`
        * 对单行项会算成 -1 → take=0 → 整项挪到下一页。「放不下就整行挪走」行为上恰好是对的，
        * 但那是副作用，不是承诺 —— 显式写出来才不会在别人动孤行控制时被带坏。
+       *
+       * 重复标题行（w:tblHeader）就在这一支里记账：续页顶端那批重复行占掉的高度，
+       * 从这一页的可用高度里先扣掉（cursor 从 headerHeight 起算）。
+       *
+       * **结构性不变式（每一片都成立）：`headerTo ?? 0 <= rowFrom ?? 0`** ——
+       * 一片**绝不重复它自己已经含有的行**。续页片的重复区间一律取
+       * `min(repeatRows, rowFrom)`，所以「首片只放得下 1 行、而 headerRows = 2」时
+       * 续页片只重复第 0 行；把第 1 行既当重复行又当正文行渲两遍会让
+       * 「DOM 行数 = 模型行数」当场不成立，而 docx 只写 `w:tblHeader`
+       * （Word 的内容流里不会画两遍），预览与 Word 的断行/页数就分家了。
+       * 退化情形（标题块比整页还高、起表那次换页救不了）下，这条就是唯一的安全网。
        */
-      if (cursor > 0 && item.height > contentHeight - cursor) newPage()
-      // cursor 已是 0 却仍放不下（一行比整页还高）：兜底放下去，否则会死循环
-      placeTableRow(item)
+      const repeat = item.repeatRows ?? 0
+      const headerHeight = item.headerHeight ?? 0
+      /*
+       * 起表：一张表的**第一次**落行要把整个标题块带上同一页。
+       *
+       * 判据就是「本页剩余空间放不下整个标题块」：因为逐行装箱每行都要求
+       * `cursor + headerHeight <= contentHeight`，换页之后前 `min(headerRows, 行数)`
+       * 行必然一个接一个放得下（累加不会越过 headerHeight），首片自然含足整个标题块 ——
+       * 照段落孤行控制那条「至少 N 行」的思路。`cursor === 0`（已经在页首）当然不换。
+       * 只有「标题块比整页还高」这种退化情形才退回逐行装箱，那时由上面那条不变式兜底。
+       */
+      if (item.row === 0 && headerHeight > 0 && cursor > 0 && headerHeight > contentHeight - cursor) {
+        newPage()
+      }
+      if (cursor > 0 && item.height > contentHeight - cursor) {
+        // 「这张表已经在更早的页上落过行」= 本片不是它的第一片 → 新页是续页，顶端要留重复行
+        const continuationPage = repeat > 0 && item.row > 0
+        newPage()
+        if (continuationPage) cursor = headerHeight
+      }
+      // cursor 已是 0（或只剩被重复行占掉的那点高度）却仍放不下：兜底放下去，否则会死循环
+      // —— 上面那次 newPage 每行最多发生一次，所以「重复行 + 一行正文都放不下」时只是溢出，不会卡住
+      placeTableRow(item, repeat > 0 && item.row > 0 ? Math.min(repeat, item.row) : 0)
       cursor += item.height
       continue
     }

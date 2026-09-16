@@ -98,6 +98,7 @@ import {
   mergeCellParagraph,
   nextAlignValue,
   normalizeCellCol,
+  normalizeTable,
   removeBodyRow,
   removeColumn,
   removeTable as removeTableOp,
@@ -136,6 +137,7 @@ import {
   cellParagraphId,
   commentScopes,
   defaultCellAlignH,
+  headerRowCount,
   nextBlockId,
   parseCellId,
   resolveEditorFlags,
@@ -350,7 +352,7 @@ function fragmentHtml(frag: PageFragment): string {
   if (frag.rowFrom !== undefined) {
     const table = tablesById.value.get(frag.blockId)
     if (!table) return ''
-    return renderTableFragment(table, frag.rowFrom, frag.rowTo ?? frag.rowFrom + 1)
+    return renderTableFragment(table, frag.rowFrom, frag.rowTo ?? frag.rowFrom + 1, frag.headerTo ?? 0)
   }
   const block = blocksById.value.get(frag.blockId)
   if (!block) return ''
@@ -515,7 +517,11 @@ function sameLayout(
         // 表格片段的行区间也要比：漏比会导致「分页变了却不重建 DOM」，
         // 页面上的表还是上一轮的若干行
         fa.rowFrom !== fb.rowFrom ||
-        fa.rowTo !== fb.rowTo
+        fa.rowTo !== fb.rowTo ||
+        // 续页顶端的重复标题行也要比：改「重复标题行」时片段的 from/to 可以完全不变
+        //（重复行不占模型区间），漏比就会留下旧版面 —— 页数已经按重复行算过了，
+        // 而画面上那批重复行还在 / 还没出来
+        fa.headerTo !== fb.headerTo
       ) {
         return false
       }
@@ -1008,6 +1014,8 @@ function tableContextOf(
     minLines: table.minLines,
     hasUnit: table.rows.some((r) => r.role === 'unit'),
     hasNote: table.rows.some((r) => r.role === 'note'),
+    // 已解析值（不暴露原始字段）：radio 要的是「现在实际重不重复」
+    repeatHeader: headerRowCount(table) > 0,
     alignH: cellModel?.align?.h ?? defaultCellAlignH(role, styleAlign),
     alignV: cellModel?.align?.v ?? 'top',
   }
@@ -2641,6 +2649,36 @@ function setTableRoleRow(role: 'unit' | 'note', on: boolean): void {
   repeatable(() => applyTableRoleRow(role, on))
 }
 
+/**
+ * 「重复标题行」radio（Word 的 w:tblHeader）。
+ *
+ * 目标行 = 光标所在行 / 整格复选覆盖到的行（走 cellTargets，与对齐、格内样式同一条路）；
+ * `on` → `headerRows = max(目标行号) + 1`（即「第一行到这一行都算标题行」），
+ * `off` → 字段删掉（默认值不落模型）。与 OOXML 的语义一致：w:tblHeader 只在
+ * 「这一行**之上**每一行也都是标题行」时才真的重复，所以只能表达成前导区间。
+ *
+ * 一行都不会变（本来就是同一个值）→ 返回 false，一步都不记撤销。
+ * 只改一个数字，不增删行列，所以**不清空复选**（列下标没位移）。
+ */
+function applyTableRepeatHeader(on: boolean): boolean {
+  const group = cellTargets()
+  if (!group) return false
+  const { table, cells } = group
+  const current = headerRowCount(table)
+  const next = on ? Math.min(Math.max(...cells.map((cell) => cell.row)) + 1, table.rows.length) : 0
+  if (next === current) return false
+  pushHistory(caretPoint())
+  if (next > 0) table.headerRows = next
+  else delete table.headerRows
+  normalizeTable(table)
+  finishCellsOp(group)
+  return true
+}
+
+function setTableRepeatHeader(on: boolean): boolean {
+  return repeatable(() => applyTableRepeatHeader(on))
+}
+
 /* -------------------------------------------------------------------------- */
 /* 表格：删除整表与两组对齐（W4b-2）                                            */
 /* -------------------------------------------------------------------------- */
@@ -3514,6 +3552,8 @@ defineExpose({
   removeTableColumn,
   setTableMinLines,
   setTableRoleRow,
+  /** 重复标题行（w:tblHeader）：前导 N 行在每个续页顶端重复；返回「这一步真的改了模型没有」 */
+  setTableRepeatHeader,
   // 表格：删除整表与两组对齐（W4b-2）
   removeTable,
   setTableCellAlignH,

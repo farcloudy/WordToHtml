@@ -160,9 +160,30 @@ export interface TableBlock {
   minLines: 1 | 2
   /** 默认 true（「默认禁止跨页断行」= 行不跨页断开，即 Word 的 w:cantSplit） */
   cantSplit: boolean
+  /**
+   * 前 N 行是**标题行**，在每一个续页的顶端重复出现（Word 的 w:tblHeader）。
+   * 缺省 0 且不落字段（与 minLines / cantSplit 同一套「默认值不落模型」的约定）；
+   * 有效区间是 `rows[0 .. headerRows)`，归一化时夹到 `[0, rows.length]`（见 normalizeTable）。
+   *
+   * 为什么是表格级一个数字而不是行级标记：OOXML 的 w:tblHeader 语义是「这一行**之上**
+   * 每一行也都是标题行时才重复」，标在第 3 行而前两行没标等于没标 —— 表格级没有死状态。
+   */
+  headerRows?: number
 }
 
 export type Block = TextBlock | SectionBreakBlock | PageBreakBlock | TableBlock
+
+/**
+ * 有效的前导标题行数（区间是 `rows[0 .. N)`）：缺省 / `<= 0` 一律 0（不重复），
+ * 越界夹到行数。渲染、量测、分页、导出四处都走这一个函数 —— 解析与 normalizeTable
+ * 虽然已经夹过一次，但那管不到手搓模型与旧数据，读侧再夹一次才不会冒出第二套口径
+ * （两套口径的后果是「预览重复 1 行、docx 重复 2 行」这种两边对不上的分家）。
+ */
+export function headerRowCount(table: TableBlock): number {
+  const raw = table.headerRows
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 0
+  return Math.max(0, Math.min(Math.floor(raw), table.rows.length))
+}
 
 /**
  * 单元格在编辑层里的「伪块」id，**恒指格内的第 0 段**。

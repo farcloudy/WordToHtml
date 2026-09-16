@@ -10,7 +10,8 @@ import { contentBoxPx, lineSpacePt, ptToPx } from '../spec'
 import type { Spec } from '../spec'
 import { computeNumbering } from '../numbering'
 import { resolveSections } from '../section'
-import type { DocModel } from '../types'
+import type { DocModel, TableBlock } from '../types'
+import { headerRowCount } from '../types'
 import { renderInlinesHtml, renderTableFragment } from './html'
 import type { MeasuredBlock, MeasuredItem, MeasuredTableRow } from './paginate'
 
@@ -205,7 +206,7 @@ export function measureDocument(
 
   const pendingTables: {
     el: HTMLElement
-    id: string
+    block: TableBlock
     signature: string
   }[] = []
 
@@ -225,9 +226,9 @@ export function measureDocument(
       cache?.set(item.id, { signature: item.signature, measured })
     }
     for (const item of pendingTables) {
-      const rows = measureTableRows(item.el, item.id)
-      resolvedTables.set(item.id, rows)
-      cache?.set(item.id, { signature: item.signature, measured: rows })
+      const rows = measureTableRows(item.el, item.block)
+      resolvedTables.set(item.block.id, rows)
+      cache?.set(item.block.id, { signature: item.signature, measured: rows })
     }
 
     root.removeChild(probe)
@@ -256,7 +257,9 @@ export function measureDocument(
       // 表格走独立分支：整张表渲进探针，只量每行的实测高（行是原子的，不量 rowStarts）
       alive.add(block.id)
       const html = renderTableFragment(block, 0, block.rows.length)
-      const signature = `table\u0000${width}\u0000${html}`
+      // 签名带上 headerRows：改「重复标题行」一个字都不改渲出来的 HTML（重复行不在量测路径里），
+      // 漏进签名就会缓存命中 → 分页仍按旧的 headerHeight 记账（radio 点了没反应）
+      const signature = `table\u0000${width}\u0000${headerRowCount(block)}\u0000${html}`
       const cached = cache?.get(block.id)
       if (cached && cached.signature === signature && Array.isArray(cached.measured)) {
         resolvedTables.set(block.id, cached.measured)
@@ -266,7 +269,7 @@ export function measureDocument(
       el.className = 'wtp-tableFrag'
       el.innerHTML = html
       probe.appendChild(el)
-      pendingTables.push({ el, id: block.id, signature })
+      pendingTables.push({ el, block, signature })
       continue
     }
     if (block.t !== 'textBlock') continue
@@ -315,11 +318,22 @@ export function measureDocument(
 }
 
 /** 一张表里每一行的实测高（px）。行序就是 block.rows 的顺序 */
-function measureTableRows(el: HTMLElement, tableId: string): MeasuredTableRow[] {
-  return Array.from(el.querySelectorAll('tr')).map((tr, row) => ({
+function measureTableRows(el: HTMLElement, block: TableBlock): MeasuredTableRow[] {
+  const rows = Array.from(el.querySelectorAll('tr')).map((tr, row) => ({
     t: 'tableRow' as const,
-    blockId: tableId,
+    blockId: block.id,
     row,
     height: tr.getBoundingClientRect().height,
   }))
+  /*
+   * 重复标题行：前 N 行的实测高之和（0 = 不重复）。**逐行加起来现算**而不是另量一遍 ——
+   * 探针里渲的是整张表（重复行不进量测路径），这 N 行的高度上面刚量到。
+   * 同一张表每一行都带同一对值，分页侧不必自己攒状态。
+   * 归零时两个字段都不落（与「默认值不落模型」同一条约定，也让默认表的量测值逐字节不变）。
+   */
+  const repeat = headerRowCount(block)
+  if (repeat <= 0) return rows
+  let headerHeight = 0
+  for (let r = 0; r < repeat; r += 1) headerHeight += rows[r]?.height ?? 0
+  return rows.map((row) => ({ ...row, repeatRows: repeat, headerHeight }))
 }

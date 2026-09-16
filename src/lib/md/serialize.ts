@@ -21,6 +21,7 @@ import type {
   TableBlock,
   TableCellModel,
 } from '../types'
+import { headerRowCount } from '../types'
 
 const PREFIX: Record<BlockKind, string> = {
   title: '# ',
@@ -100,12 +101,14 @@ function cellText(cell: TableCellModel, comments: Map<number, CommentDef>): stri
 }
 
 /**
- * 表格块 → md 围栏。kwarg 只写非默认值（minLines 默认 1、cantSplit 默认 true），
- * 顺序固定 minLines 在前、cantSplit 在后 —— 这样「模型 → md → 模型 → md」字节稳定。
+ * 表格块 → md 围栏。kwarg 只写非默认值（minLines 默认 1、headerRows 默认 0、cantSplit 默认 true），
+ * 顺序固定 minLines → headerRows → cantSplit —— 这样「模型 → md → 模型 → md」字节稳定。
  */
 function tableLines(block: TableBlock, comments: Map<number, CommentDef>): string[] {
   let fence = ':::table'
   if (block.minLines !== 1) fence += ` minLines=${block.minLines}`
+  const header = headerRowCount(block)
+  if (header > 0) fence += ` headerRows=${header}`
   if (!block.cantSplit) fence += ' cantSplit=no'
 
   const out = [fence]
@@ -202,6 +205,9 @@ export function normalizeBlocks(doc: DocModel): unknown[] {
         columns: block.columns,
         minLines: block.minLines,
         cantSplit: block.cantSplit,
+        // 归一后的有效值（缺省 / 越界都算 0）—— 与 md 侧「只写非默认值」同一套口径，
+        // 否则「headerRows: 0」与「不落字段」会被判成往返不一致
+        ...(headerRowCount(block) > 0 ? { headerRows: headerRowCount(block) } : {}),
         rows: block.rows.map((row) => ({
           role: row.role,
           cells: row.cells.map((cell) => ({

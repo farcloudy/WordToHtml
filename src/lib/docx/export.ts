@@ -63,7 +63,7 @@ import type {
   TableRowRole,
   TextBlock,
 } from '../types'
-import { defaultCellAlignH } from '../types'
+import { defaultCellAlignH, headerRowCount } from '../types'
 import { cellParagraphs, emptyCell } from '../edit/table'
 import { computeNumbering } from '../numbering'
 import { resolveSections } from '../section'
@@ -372,8 +372,11 @@ function rowLinePt(row: TableRowModel, columns: number, spec: Spec): number {
  */
 function tableBlock(block: TableBlock, spec: Spec): Table {
   const total = contentWidthTwips(spec)
+  // 前 N 行挂 w:tblHeader（Word 的「跨页重复标题行」）；N 由 headerRowCount 现夹，
+  // 与预览 / 分页侧同一个口径
+  const header = headerRowCount(block)
 
-  const rows = block.rows.map((row) => {
+  const rows = block.rows.map((row, r) => {
     // 行高按该行各格样式的最大 linePt（缺格按 listItem），与预览侧同一条规则；
     // 表头行 / 附注行恒**一行**（W7）—— `minLines` 只管正文行：这两行是整张表的装饰，
     // 跟着行高设置一起变高只会白白把表格撑长（预览侧同一条规则，见 render/css.ts 的表格一段）。
@@ -409,6 +412,9 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
     }
 
     return new TableRow({
+      // 前 header 行是标题行（w:tblHeader）：Word 在每一个续页顶端自动重复它们。
+      // 其余（w:trHeight ATLEAST、cantSplit、w:tblW、边框）一字不改。
+      ...(r < header ? { tableHeader: true } : {}),
       cantSplit: block.cantSplit,
       height: { value: rowHeight, rule: HeightRule.ATLEAST },
       children: cells,

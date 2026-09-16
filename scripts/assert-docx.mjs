@@ -15,6 +15,7 @@ import { readFileSync } from 'node:fs'
 import {
   DOC_TEMPLATES,
   computeNumbering,
+  headerRowCount,
   lengthToPx,
   lineSpacePt,
   plainText,
@@ -393,6 +394,50 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
 
   if (modelTables.length > 0 && cellStyleChecks === 0) {
     failures.push('Word 侧一个格内样式名都没读到 —— 格内样式（w:pStyle）对账等于没验')
+  }
+
+  /*
+   * 重复标题行：Word 侧 `w:tblHeader` 的落点就是 `Row.HeadingFormat`。
+   * 期望值一律由模型现推（`row < headerRows ? true : false`），不写死行号 ——
+   * 表里增删一行、或者把标题行从 1 改成 2，这里都跟着模型走。
+   *
+   * **样本里一个 headerRows 都没有时不判失败**，只打一行「没验」：撤回样本里那一行
+   * 是允许的处置（见 .qwen/tmp/w11-task.md 第七节），判失败会把它变成一条假红。
+   */
+  {
+    const marked = modelTables.filter((t) => headerRowCount(t) > 0)
+    if (marked.length === 0) {
+      console.log('注意 重复标题行：样本里没有重复标题行，这一项没验')
+    } else {
+      let checked = 0
+      let readable = 0
+      modelTables.forEach((t, ti) => {
+        const dt = dumpTables[ti]
+        if (!dt) return
+        const want = headerRowCount(t)
+        t.rows.forEach((_row, ri) => {
+          const dr = dt.rows?.[ri]
+          if (!dr) return
+          checked += 1
+          // dump 里没有这个字段就是不验（Word COM 的 Boolean 可能是 true/false，也可能是 -1/1）
+          if (!Object.prototype.hasOwnProperty.call(dr, 'headingFormat')) return
+          readable += 1
+          const hf = dr.headingFormat
+          const got = hf === true || hf === 1 || hf === -1
+          eq(`表${ti}·行${ri}·重复标题行（HeadingFormat）`, got, ri < want)
+        })
+      })
+      if (readable === 0) {
+        console.log(
+          `注意 重复标题行：模型里标了 ${marked.length} 张表（共 ${checked} 行），` +
+            '但 Word dump 里没有 HeadingFormat 字段（check-docx.ps1 未导出该属性）—— 这一项没验',
+        )
+      } else {
+        console.log(
+          `ok   重复标题行：${readable} 行的 Row.HeadingFormat 与模型 headerRows 逐行对上`,
+        )
+      }
+    }
   }
 
   if (failures.length === before) {

@@ -408,15 +408,16 @@ function parseEditorKwargs(attrs: string): EditorSettings | undefined {
   return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
-/** 表格围栏的起始行：`:::table`，后面可跟 minLines=1|2、cantSplit=yes|no */
+/** 表格围栏的起始行：`:::table`，后面可跟 minLines=1|2、headerRows=N、cantSplit=yes|no */
 const TABLE_FENCE_RE = /^:::\s*table\b(.*)$/
 /** 表格围栏的结束行（trim 后逐字比较） */
 const TABLE_FENCE_END = ':::'
 
-/** 解析围栏行后面的 kwarg；只认 minLines / cantSplit，其余忽略 */
-function parseTableFence(attrs: string): { minLines: 1 | 2; cantSplit: boolean } {
+/** 解析围栏行后面的 kwarg；只认 minLines / headerRows / cantSplit，其余忽略 */
+function parseTableFence(attrs: string): { minLines: 1 | 2; cantSplit: boolean; headerRows: number } {
   let minLines: 1 | 2 = 1
   let cantSplit = true
+  let headerRows = 0
   for (const m of attrs.matchAll(/([A-Za-z]+)\s*=\s*(\S+)/g)) {
     const key = m[1]
     const value = m[2]
@@ -424,8 +425,9 @@ function parseTableFence(attrs: string): { minLines: 1 | 2; cantSplit: boolean }
     else if (key === 'minLines' && value === '1') minLines = 1
     else if (key === 'cantSplit' && value === 'yes') cantSplit = true
     else if (key === 'cantSplit' && value === 'no') cantSplit = false
+    else if (key === 'headerRows') headerRows = Number.parseInt(value ?? '', 10)
   }
-  return { minLines, cantSplit }
+  return { minLines, cantSplit, headerRows }
 }
 
 /** src[i] 处是不是被反斜杠转义（前面连续的反斜杠个数为奇数） */
@@ -624,7 +626,7 @@ function parseTableBlock(
   attrs: string,
   ctx: InlineContext,
 ): { block: TableBlock; end: number } | null {
-  const { minLines, cantSplit } = parseTableFence(attrs)
+  const { minLines, cantSplit, headerRows } = parseTableFence(attrs)
   const rows: TableRowModel[] = []
   let closed = false
 
@@ -662,8 +664,21 @@ function parseTableBlock(
     if (row.role === 'body') columns = Math.max(columns, row.cells.length)
   }
 
+  // headerRows 夹到 [0, 行数]：写 0 / 负数 / 超过行数一律收口，归零时不落字段
+  // （「默认值不落模型」的既有约定）。夹到行数就是「整张表都是标题行」这个退化态，
+  // 它在 Word 里是「每一页都把整张表重复一遍」，渲染 / 分页 / 导出按同一个 N 走。
+  const header = Math.max(0, Math.min(Number.isFinite(headerRows) ? headerRows : 0, rows.length))
+
   return {
-    block: { t: 'table', id: nextBlockId('tb'), rows, columns, minLines, cantSplit },
+    block: {
+      t: 'table',
+      id: nextBlockId('tb'),
+      rows,
+      columns,
+      minLines,
+      cantSplit,
+      ...(header > 0 ? { headerRows: header } : {}),
+    },
     end: i,
   }
 }

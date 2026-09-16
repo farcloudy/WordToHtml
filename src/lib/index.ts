@@ -54,6 +54,7 @@ export {
   commentScopes,
   defaultCellAlignH,
   emptyDoc,
+  headerRowCount,
   inlinesText,
   nextBlockId,
   parseCellId,

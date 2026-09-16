@@ -1081,7 +1081,13 @@ defineExpose({
       class="toolbar sub-toolbar table-toolbar panel panel-table"
     >
       <span class="tk-hint">{{ tableCtx ? `表格 · ${tableHint}` : '表格' }}</span>
-      <span v-if="!tableCtx" class="tk-empty">把光标放进表格的格子里后可用</span>
+      <!--
+        这句提示只在「光标不在格子里」时露面，与左边的「表格」其实说的是同一件事。
+        写这么短是有账要算的：这一排控件加起来的宽度已经逼到 1700px 视口的边上，
+        多一个字就会让它折成两行 —— 而四页功能区高度必须一致（见下面 .panel 的注释与
+        verify-editor 的「四页高度」断言），折行会让下面整块版面跟着上移 32px。
+      -->
+      <span v-if="!tableCtx" class="tk-empty">光标放进表格后可用</span>
 
       <span class="tk-group">
         <span class="tk-label">行</span>
@@ -1224,6 +1230,36 @@ defineExpose({
             :disabled="!tableCtx"
             :checked="tableCtx?.hasNote === false"
             @click="paper?.setTableRoleRow('note', false)"
+          />
+          无
+        </label>
+      </span>
+
+      <span class="tk-group">
+        <span
+          class="tk-label"
+          title="从第一行到光标（或整格复选）所在行的那几行，在每个续页的顶端重复一次"
+          >重复标题行</span
+        >
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-headerrows"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.repeatHeader === true"
+            @click="paper?.setTableRepeatHeader(true)"
+          />
+          有
+        </label>
+        <label class="tk-radio" @mousedown.prevent>
+          <input
+            @mousedown.prevent
+            type="radio"
+            name="tk-headerrows"
+            :disabled="!tableCtx"
+            :checked="tableCtx?.repeatHeader === false"
+            @click="paper?.setTableRepeatHeader(false)"
           />
           无
         </label>

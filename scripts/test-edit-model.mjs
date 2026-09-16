@@ -1014,6 +1014,53 @@ console.log('\n=== 17. 表格：md 往返 / cellId / cloneDoc 深拷贝 ===')
   )
 }
 
+console.log('\n=== 17a0. 重复标题行 headerRows：md kwarg / 归一化 / cloneDoc（W11）===')
+{
+  const one = parseMd(':::table minLines=2 headerRows=1 cantSplit=no\n| 甲 | 乙 |\n| 1 | 2 |\n:::')
+  const table = one.blocks[0]
+  eq('headerRows 从围栏读出', table.headerRows, 1)
+  eq(
+    'kwarg 顺序固定 minLines → headerRows → cantSplit（字节稳定）',
+    toMd(one).split('\n')[0],
+    ':::table minLines=2 headerRows=1 cantSplit=no',
+  )
+  eq('再往返一次字节仍稳定', toMd(parseMd(toMd(one))), toMd(one))
+  eq(
+    '往返结构一致（含 headerRows）',
+    JSON.stringify(normalizeBlocks(parseMd(toMd(one)))),
+    JSON.stringify(normalizeBlocks(one)),
+  )
+
+  // 归一化：<= 0 / 非数字 → 不落字段；超过行数 → 夹到行数
+  eq('headerRows=0 不落字段', 'headerRows' in parseMd(':::table headerRows=0\n| a |\n:::').blocks[0], false)
+  eq('headerRows 缺省不落字段', 'headerRows' in parseMd(':::table\n| a |\n:::').blocks[0], false)
+  eq('headerRows 非数字不落字段', 'headerRows' in parseMd(':::table headerRows=x\n| a |\n:::').blocks[0], false)
+  eq(
+    'headerRows 超过行数时夹到行数',
+    parseMd(':::table headerRows=9\n| a |\n| b |\n:::').blocks[0].headerRows,
+    2,
+  )
+  eq(
+    '夹到行数后写出来也是夹过的值',
+    toMd(parseMd(':::table headerRows=9\n| a |\n| b |\n:::')).split('\n')[0],
+    ':::table headerRows=2',
+  )
+
+  // 增删行之后 N 要跟着新行数走（normalizeTable 收口），不留「N > 行数」的死状态
+  const grown = parseMd(':::table headerRows=2\n| a |\n| b |\n| c |\n:::')
+  removeBodyRow(grown.blocks[0], 1)
+  eq('删一行后 headerRows 仍合法', grown.blocks[0].headerRows, 2)
+  removeBodyRow(grown.blocks[0], 1)
+  eq('删到只剩一行时 headerRows 被夹成 1', grown.blocks[0].headerRows, 1)
+
+  // cloneDoc 漏拷 headerRows 会让撤销 / 渲染快照「重复行凭空消失」
+  const marked = parseMd(':::table headerRows=1\n| a |\n| b |\n:::')
+  const clone = cloneDoc(marked)
+  eq('cloneDoc 拷了 headerRows', clone.blocks[0].headerRows, 1)
+  clone.blocks[0].headerRows = 2
+  eq('副本与原件不共享这个字段', marked.blocks[0].headerRows, 1)
+}
+
 console.log('\n=== 17a. 格内多段落：md `{p}` / 段落下标 / 切分与合并 ===')
 {
   // 段间用 {p}：一个格子里两段（Word 的 w:tc 里放两个 w:p）

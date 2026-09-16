@@ -132,12 +132,37 @@ export function renderInlinesHtml(
  *     `data-cell-id` 是给**整格复选**的高亮用的：它只由模型决定（与选中态无关），
  *     所以量测缓存签名、逐块量测对账都不受影响；选中高亮由组件在 DOM 上按它挂类名
  *     （见 css.ts 的 CELL_SELECTION_CLASS）。
+ *   · `headerTo > 0 && rowFrom > 0` 时，片段顶端先渲一遍 `rows[0..headerTo)` 作**重复标题行**
+ *     （Word 的跨页重复表头）：同一张 `<table>` 内，`<tr>` 加 `wtp-tr-repeat`，
+ *     格内则**不挂任何可寻址属性**（见 tableCellHtml 的 decorative）——
+ *     同一格在版面里出现两份可寻址元素会让 retagFragments / syncPlain 读重、
+ *     整格刷选（td[data-cell-id]）也会认错格。
  */
-export function renderTableFragment(block: TableBlock, rowFrom: number, rowTo: number): string {
+export function renderTableFragment(
+  block: TableBlock,
+  rowFrom: number,
+  rowTo: number,
+  headerTo = 0,
+): string {
   const columns = Math.max(1, block.columns)
   const from = Math.max(0, rowFrom)
   const to = Math.min(block.rows.length, Math.max(from, rowTo))
+  /*
+   * 续页顶端的**重复标题行**（Word 的 w:tblHeader）：只在本片不是第一片
+   * （`from > 0`）且模型声明了标题行时才渲。它进的是**同一个 `<table>` / `<tbody>`**
+   * ——「一页一张表」这条不能破，多渲一张表边框与列宽就各算各的了。
+   */
+  const repeat = from > 0 ? Math.max(0, Math.min(Math.floor(headerTo) || 0, block.rows.length)) : 0
   const rows: string[] = []
+  for (let r = 0; r < repeat; r += 1) {
+    const row = block.rows[r]
+    if (!row) continue
+    rows.push(
+      row.role === 'body'
+        ? tableBodyRow(block, row, r, columns, true)
+        : tablePlainRow(block, row, r, columns, true),
+    )
+  }
   for (let r = from; r < to; r += 1) {
     const row = block.rows[r]
     if (!row) continue
@@ -158,6 +183,11 @@ function cssTextAlign(a: Align): string {
  * 段距与缩进全靠每段的 `wtp-<kind>`（Word 在格内也逐段算段前段后），包装层不写任何
  * margin / padding / min-height；空段靠 renderInlinesHtml 的占位 `<br>` 撑出高度。
  * `divStyle` 只写给每段（水平对齐逐段生效）。
+ *
+ * `decorative = true` 是**重复标题行**那条路：类名与文字一字不变（几何必须与正文行同貌，
+ * 否则量测与渲染的大小对不上），但**一个可寻址属性都不挂** —— 同一格在续页里出现两份
+ * `data-block-id` 会让 `retagFragments` / `syncPlain` 读重、`fragmentOf` 认错格，
+ * 整格刷选也会把重复那份当成真的格子。重复行是只读装饰，本来也不该可编辑。
  */
 function tableCellHtml(
   tableId: string,
@@ -165,16 +195,16 @@ function tableCellHtml(
   c: number,
   cell: TableCellModel,
   divStyle = '',
+  decorative = false,
 ): string {
   const kind = cell.kind ?? 'listItem'
   const style = divStyle === '' ? '' : ` style="${divStyle}"`
   const paras = cellParagraphs(cell)
     .map((para, p) => {
-      const length = inlinesText(para.inlines).length
-      return (
-        `<div class="wtp-cellpara wtp-${kind}" data-block-id="${cellParagraphId(tableId, r, c, p)}" ` +
-        `data-from="0" data-to="${length}"${style}>${renderInlinesHtml(para.inlines)}</div>`
-      )
+      const ids = decorative
+        ? ''
+        : ` data-block-id="${cellParagraphId(tableId, r, c, p)}" data-from="0" data-to="${inlinesText(para.inlines).length}"`
+      return `<div class="wtp-cellpara wtp-${kind}"${ids}${style}>${renderInlinesHtml(para.inlines)}</div>`
     })
     .join('')
   return `<div class="wtp-cell">${paras}</div>`
@@ -185,6 +215,7 @@ function tableBodyRow(
   row: TableRowModel,
   r: number,
   columns: number,
+  decorative = false,
 ): string {
   const cells: string[] = []
   for (let c = 0; c < columns; c += 1) {
@@ -195,12 +226,17 @@ function tableBodyRow(
     const divStyle = cell.align?.h ? `text-align: ${cssTextAlign(cell.align.h)}` : ''
     const tdStyle = cell.align?.v ? ` style="vertical-align:${cell.align.v}"` : ''
     const tdClass = `wtp-td wtp-td-${cell.kind ?? 'listItem'}`
+    const id = decorative ? '' : ` data-cell-id="${cellId(block.id, r, c)}"`
     cells.push(
-      `<td class="${tdClass}" data-cell-id="${cellId(block.id, r, c)}"${tdStyle}>` +
-        `${tableCellHtml(block.id, r, c, cell, divStyle)}</td>`,
+      `<td class="${tdClass}"${id}${tdStyle}>` +
+        `${tableCellHtml(block.id, r, c, cell, divStyle, decorative)}</td>`,
     )
   }
-  return `<tr>${cells.join('')}</tr>`
+  // contenteditable=false 挡的是**改内容**，不是「不给插入符落进去的机会」——
+  // 实测选区仍可能落进重复行。真落进去敲的字只存在于 DOM、进不了模型
+  // （重复行没有 data-block-id 可以读回），而布局没变时不会重排，
+  // 那半个字就会一直挂在版面与模型之外 —— 所以重复行是纯装饰，别指望它可编辑
+  return `<tr${decorative ? ' class="wtp-tr-repeat" contenteditable="false"' : ''}>${cells.join('')}</tr>`
 }
 
 function tablePlainRow(
@@ -208,6 +244,7 @@ function tablePlainRow(
   row: TableRowModel,
   r: number,
   columns: number,
+  decorative = false,
 ): string {
   const cell = row.cells[0] ?? emptyCell()
   // unit 右对齐、note 左对齐是角色默认（不是覆盖），所以这里也照写行内 ——
@@ -216,9 +253,12 @@ function tablePlainRow(
   const v = cell.align?.v ?? 'top'
   const divStyle = `text-align: ${cssTextAlign(h)}`
   const tdClass = `wtp-td wtp-td-plain wtp-td-${cell.kind ?? 'listItem'}`
+  const trClass = decorative ? 'wtp-tr-plain wtp-tr-repeat' : 'wtp-tr-plain'
+  const id = decorative ? '' : ` data-cell-id="${cellId(block.id, r, 0)}"`
+  const ce = decorative ? ' contenteditable="false"' : ''
   return (
-    `<tr class="wtp-tr-plain"><td class="${tdClass}" data-cell-id="${cellId(block.id, r, 0)}" ` +
+    `<tr class="${trClass}"${ce}><td class="${tdClass}"${id} ` +
     `colspan="${columns}" style="vertical-align:${v}">` +
-    `${tableCellHtml(block.id, r, 0, cell, divStyle)}</td></tr>`
+    `${tableCellHtml(block.id, r, 0, cell, divStyle, decorative)}</td></tr>`
   )
 }

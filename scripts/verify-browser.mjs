@@ -28,6 +28,7 @@ import {
   STYLE_KEYS,
   commentScopes,
   contentBoxPx,
+  headerRowCount,
   lengthToPx,
   lineSpacePt,
   parseMd,
@@ -91,6 +92,20 @@ const analyzePage = (kinds) => {
         // 它的身份在 data-table-id 上 —— 对账表格时必须用这个键，否则永远取不到渲染高
         tableId: el.dataset.tableId ?? '',
         height,
+        // 续页顶端的重复标题行（.wtp-tr-repeat）不是内容，也**不在量测路径里**
+        // （量测渲的是整张表本来的那几行）。单独报出来，node 侧比较时从 height 里减掉，
+        // 两边口径才对得上；反过来「把重复行也从量测里去掉」是反做法，量测里根本没有它们。
+        repeatHeight: round(
+          Array.from(el.querySelectorAll('tr.wtp-tr-repeat')).reduce(
+            (n, tr) => n + tr.getBoundingClientRect().height,
+            0,
+          ),
+        ),
+        // 重复标题行的**条数**（重复了几行）—— 「高度减法」只管几何，数量、是不是长在同一张
+        // 表里它都看不出来；node 侧拿这一项与模型推出来的 headerRows 逐片对账（首片必须是 0）
+        repeatRows: el.querySelectorAll('tr.wtp-tr-repeat').length,
+        // 表格片段的行区间起点（只有表格片段挂 data-row-from）：判「这是不是本表的第一片」
+        rowFrom: el.dataset.rowFrom === undefined ? null : Number(el.dataset.rowFrom),
         marginTop: round(mt),
         marginBottom: round(mb),
         text: (el.textContent ?? '').slice(0, 14),
@@ -390,7 +405,9 @@ try {
           const key = it.tableId || it.blockId
           if (key === '') continue
           const cur = rendered.get(key) ?? { height: 0, pieces: 0 }
-          cur.height += it.height
+          // 重复标题行只存在于**续页的渲染**里（量测路径里没有它们），
+          // 所以渲染那一侧减掉它们的实测高，才与「各行量测高之和」同一口径
+          cur.height += it.height - (it.repeatHeight ?? 0)
           cur.pieces += 1
           rendered.set(key, cur)
         }
@@ -437,6 +454,64 @@ try {
           `  ${match ? 'ok  ' : 'BAD '} 表格       ` +
             `量测各行合计=${String(round2(measuredTotal)).padStart(7)}px ` +
             `渲染${String(r.height).padStart(7)}px(${r.pieces}片) id=${id}`,
+        )
+      }
+
+      /*
+       * 重复标题行（w:tblHeader）的**数量**：高度减法只管几何，重复了几行、是不是长在同一张
+       * 表里它一概不判别。这里逐片与模型推出来的 headerRows 对账 ——
+       * 首片（rowFrom === 0）必须是 0 条，续页片每一片都必须正好 headerRows 条；
+       * 再加一条结构性不变式：重复行数 <= 本片正文起始行（一片绝不重复它自己含有的行，
+       * 否则同一行被正本与重复行渲两遍，而 docx 只写 w:tblHeader → 预览与 Word 分家）。
+       */
+      const model = report.model ?? parseMd(report.source ?? '')
+      const tableBlocks = new Map(
+        (model.blocks ?? []).filter((b) => b.t === 'table').map((b) => [b.id, b]),
+      )
+      const fragsOfTable = new Map()
+      for (const p of report.pages) {
+        for (const it of p.items) {
+          if (it.tableId === '' || it.rowFrom === null) continue
+          if (!fragsOfTable.has(it.tableId)) fragsOfTable.set(it.tableId, [])
+          fragsOfTable.get(it.tableId).push(it)
+        }
+      }
+      if (fragsOfTable.size === 0) {
+        failures.push(`${tag} 版面上一个表格片段都没有 —— 重复标题行这一项等于没验`)
+      } else {
+        let checked = 0
+        for (const [id, frags] of fragsOfTable) {
+          const block = tableBlocks.get(id)
+          if (!block) {
+            failures.push(`${tag} 版面上的表格片段 ${id} 在模型里找不到 —— 版面与模型对不上`)
+            continue
+          }
+          const want = headerRowCount(block)
+          for (const f of [...frags].sort((a, b) => a.rowFrom - b.rowFrom)) {
+            checked += 1
+            /*
+             * 期望值就是那条不变式：一片重复的行 = min(headerRows, rowFrom)（首片 rowFrom=0 ⇒ 0 条）。
+             * 写成「首片 0、其余 want」会把「标题块高过整页」的退化表假红 —— 那时 paginate 只重复
+             * rowFrom 以上的行（见 PLAN 4.3 的不变式 `headerTo <= rowFrom`），页面本身是对的。
+             */
+            const expect = Math.min(want, f.rowFrom)
+            if (f.repeatRows !== expect) {
+              failures.push(
+                `${tag} 表格片段 ${id} 第 ${f.rowFrom} 行起重复了 ${f.repeatRows} 行，` +
+                  `应为 min(headerRows=${want}, rowFrom=${f.rowFrom}) = ${expect}`,
+              )
+            }
+            if (f.repeatRows > f.rowFrom) {
+              failures.push(
+                `${tag} 表格片段 ${id} 第 ${f.rowFrom} 行起重复了 ${f.repeatRows} 行 —— ` +
+                  '重复区间与本片正文重叠，同一行会被渲两遍',
+              )
+            }
+          }
+        }
+        console.log(
+          `  ok   重复标题行：${fragsOfTable.size} 张表的 ${checked} 个片段，` +
+            '重复行条数逐片 = min(headerRows, 该片起行)（首片 0 条、不与自己含有的行重叠）',
         )
       }
     }

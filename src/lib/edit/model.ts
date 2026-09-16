@@ -64,6 +64,11 @@ export interface TableSelectionContext {
   hasUnit: boolean
   hasNote: boolean
   /**
+   * 这张表有没有「重复标题行」（模型里 `headerRows > 0` 的**已解析值**）。
+   * 给出去的是 boolean 而不是那个数字：功能区那组 radio 只有 有 / 无 两档。
+   */
+  repeatHeader: boolean
+  /**
    * 已按角色默认值解析过的实际水平对齐；按钮高亮要按它，不按有没有覆盖。
    * **整格复选**时给的是整批的一致值 —— 选中的格里对不齐（有覆盖、值不同）就整个省略，
    * 调用方的按钮因此不该有一个显示成 active。
@@ -790,6 +795,9 @@ export function cloneDoc(doc: DocModel): DocModel {
           columns: block.columns,
           minLines: block.minLines,
           cantSplit: block.cantSplit,
+          // headerRows 漏拷的后果很隐蔽：撤销栈与渲染快照里的表「不重复标题行」，
+          // 而编辑中的模型有 —— 撤销一步、或者切个模板，重复行就没了
+          ...(block.headerRows !== undefined ? { headerRows: block.headerRows } : {}),
           rows: block.rows.map((row) => ({
             role: row.role,
             cells: row.cells.map((cell) => ({

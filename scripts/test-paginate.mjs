@@ -26,6 +26,45 @@ function eq(label, actual, expected) {
   ok(label, actual === expected, `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`)
 }
 
+/**
+ * 表格片段的结构性不变式（W11b）：**一片绝不重复它自己已经含有的行**。
+ *
+ * 续页片的重复区间是 `[0, headerTo)`、本片正文区间是 `[rowFrom, rowTo)`，两者必须不相交
+ * —— 相交就是同一行被正本与重复行渲两遍（DOM 行数 ≠ 模型行数，而 docx 只写 w:tblHeader，
+ * Word 的内容流里不会画两遍）。遍历所有片段，一片都不许漏。
+ */
+function noRepeatOverlap(label, pages) {
+  const bad = []
+  let seen = 0
+  for (const p of pages) {
+    for (const f of p.fragments) {
+      if (f.rowFrom === undefined) continue
+      seen += 1
+      if ((f.headerTo ?? 0) > f.rowFrom) {
+        bad.push(`${f.blockId} headerTo=${f.headerTo} rowFrom=${f.rowFrom}`)
+      }
+    }
+  }
+  return ok(
+    `${label}：${seen} 个表格片段都满足 headerTo <= rowFrom（重复行不与本片正文重叠）`,
+    seen > 0 && bad.length === 0,
+    bad.join('；'),
+  )
+}
+
+/** 整篇渲出的表格行去重后的条数：重复区间 [0,headerTo) 与正文区间 [rowFrom,rowTo) 都算渲出 */
+function renderedRowCount(pages) {
+  const rows = new Set()
+  for (const p of pages) {
+    for (const f of p.fragments) {
+      if (f.rowFrom === undefined) continue
+      for (let r = 0; r < (f.headerTo ?? 0); r += 1) rows.add(r)
+      for (let r = f.rowFrom; r < f.rowTo; r += 1) rows.add(r)
+    }
+  }
+  return rows.size
+}
+
 /** 造一个测量结果：把 length 个字符均匀分到 rows 行 */
 function block(id, { kind = 'body', rows, length, lineHeight = 25, spaceBefore = 0, spaceAfter = 0 }) {
   const rowStarts = []
@@ -468,6 +507,133 @@ console.log('\n=== 13. 表格与段落混排、换页标记、超版心兜底 ==
   eq('超版心行不死循环', huge.length, 2)
   eq('第1页放下那一行', `${huge[0].fragments[0].rowFrom}/${huge[0].fragments[0].rowTo}`, '0/1')
   eq('第2页是下一行', `${huge[1].fragments[0].rowFrom}/${huge[1].fragments[0].rowTo}`, '1/2')
+}
+
+console.log('\n=== 14. 重复标题行（w:tblHeader）：续页片带 headerTo、并按重复行高扣可用高度 ===')
+{
+  const row = (id, r, height, extra = {}) => ({ t: 'tableRow', blockId: id, row: r, height, ...extra })
+  /** 6 行 / 每行 25px / 版心 100px = 每页 4 行；前 1 行是标题行（25px） */
+  const repeat1 = { repeatRows: 1, headerHeight: 25 }
+
+  // ---- 不标 headerRows：与改动前逐字节相同（片段上不该多出 headerTo） ----
+  const plainPages = paginate([0, 1, 2, 3, 4, 5].map((r) => row('tb1', r, 25)), { contentHeight: 100 })
+  eq('不标：页数', plainPages.length, 2)
+  eq('不标：第1页 0/4', `${plainPages[0].fragments[0].rowFrom}/${plainPages[0].fragments[0].rowTo}`, '0/4')
+  eq('不标：第2页 4/6', `${plainPages[1].fragments[0].rowFrom}/${plainPages[1].fragments[0].rowTo}`, '4/6')
+  ok('不标：第一片不带 headerTo', plainPages[0].fragments[0].headerTo === undefined)
+  ok('不标：续页片也不带 headerTo（默认值不落字段）', plainPages[1].fragments[0].headerTo === undefined)
+
+  // ---- 标 1 行：第一片不带 headerTo；续页让出 25px → 每页只剩 3 行 ----
+  const markedPages = paginate(
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((r) => row('tb1', r, 25, repeat1)),
+    { contentHeight: 100 },
+  )
+  const noRepeat = paginate([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((r) => row('tb1', r, 25)), {
+    contentHeight: 100,
+  })
+  eq('标 1 行：页数（4 + 3 + 3）', markedPages.length, 3)
+  eq(
+    '同样 10 行不标时是 4 + 4 + 2（标了以后每页少一行，正是重复行占掉的高度）',
+    noRepeat.map((p) => p.fragments[0].rowTo).join(','),
+    '4,8,10',
+  )
+  ok('标 1 行：第一片不带 headerTo（它本来就是第一页，重复行还没有意义）', markedPages[0].fragments[0].headerTo === undefined)
+  eq('标 1 行：第1页仍放 4 行', `${markedPages[0].fragments[0].rowFrom}/${markedPages[0].fragments[0].rowTo}`, '0/4')
+  eq('标 1 行：第2页的区间', `${markedPages[1].fragments[0].rowFrom}/${markedPages[1].fragments[0].rowTo}`, '4/7')
+  eq('标 1 行：第1页续页片带 headerTo=1', markedPages[1].fragments[0].headerTo, 1)
+  eq('标 1 行：第3页的区间', `${markedPages[2].fragments[0].rowFrom}/${markedPages[2].fragments[0].rowTo}`, '7/10')
+  eq('标 1 行：第2页续页片也带 headerTo=1', markedPages[2].fragments[0].headerTo, 1)
+  ok(
+    '续页片「正文行高 + headerHeight」正好装满版心（可用高度真的少了那一行）',
+    markedPages.slice(1).every((p) => {
+      const f = p.fragments[0]
+      const h = (f.rowTo - f.rowFrom) * 25 + 25
+      return h === 100
+    }),
+  )
+  eq(
+    '整张表 10 行一行不多一行不少',
+    markedPages.reduce((n, p) => n + (p.fragments[0].rowTo - p.fragments[0].rowFrom), 0),
+    10,
+  )
+
+  // ---- 表的第一片就是新页（上一块把它挤下去）：仍不带 headerTo ----
+  const pushed = paginate(
+    [block('p', { rows: 1, length: 10, lineHeight: 76 }), ...[0, 1].map((r) => row('tb1', r, 25, repeat1))],
+    { contentHeight: 100 },
+  )
+  eq('表被挤到第 2 页', pushed.length, 2)
+  ok(
+    '表的第一片不带 headerTo —— 它在页顶也是从第 0 行开始，没有「重复」可言',
+    pushed[1].fragments[0].headerTo === undefined,
+  )
+
+  // ---- 「重复行 + 一行正文」都放不下：按兜底硬放，不死循环 ----
+  const tiny = paginate([0, 1, 2].map((r) => row('tb1', r, 25, repeat1)), { contentHeight: 30 })
+  eq('版心只剩 30px 也不死循环（一行一页）', tiny.length, 3)
+  eq('第1页放第 0 行', `${tiny[0].fragments[0].rowFrom}/${tiny[0].fragments[0].rowTo}`, '0/1')
+  ok('第2页仍是续页（带 headerTo）', tiny[1].fragments[0].headerTo === 1)
+  eq('第3页放最后一行', `${tiny[2].fragments[0].rowFrom}/${tiny[2].fragments[0].rowTo}`, '2/3')
+
+  // ---- 遍历上面每一组片段：结构性不变式「一片绝不重复它自己含有的行」 ----
+  noRepeatOverlap('不标', plainPages)
+  noRepeatOverlap('标 1 行', markedPages)
+  noRepeatOverlap('表被挤到新页', pushed)
+  noRepeatOverlap('版心只剩 30px', tiny)
+
+  // ---- W11b-1：起表处只剩 1 行空间、headerRows=2 → 整张表挪到下一页（首片含足 2 行）----
+  // 版心 100：段落占 60 → 剩 40，只放得下 1 行；而标题块 = 前 2 行 = 50px 放不下。
+  // 旧算法就这么起表 → 首片只有第 0 行 → 续页片带 headerTo=2 把第 1 行渲两遍（验收 ⑩）。
+  const repeat2 = { repeatRows: 2, headerHeight: 50 }
+  const keptHeader = paginate(
+    [
+      block('p', { rows: 1, length: 10, lineHeight: 60 }),
+      ...[0, 1, 2, 3].map((r) => row('tb1', r, 25, repeat2)),
+    ],
+    { contentHeight: 100 },
+  )
+  eq('起表：整张表挪到下一页（第1页只剩那段文字）', keptHeader.length, 2)
+  eq('起表：第1页只有 1 片，是段落不是表格', keptHeader[0].fragments.length, 1)
+  ok('起表：第1页那片是段落片段', keptHeader[0].fragments[0].rowFrom === undefined)
+  eq(
+    '起表：第2页首片从第 0 行起、4 行整整齐齐都在这一页',
+    `${keptHeader[1].fragments[0].rowFrom}/${keptHeader[1].fragments[0].rowTo}`,
+    '0/4',
+  )
+  ok(
+    '起表：首片含足整个标题块（>= headerRows = 2 行）',
+    keptHeader[1].fragments[0].rowTo - keptHeader[1].fragments[0].rowFrom >= 2,
+  )
+  ok('起表：首片是「第一片」，不带重复行', keptHeader[1].fragments[0].headerTo === undefined)
+  ok('起表：第1页不再有表格碎片（没有「只有标题行第 0 行」那种首片）', keptHeader[0].fragments.every((f) => f.rowFrom === undefined))
+  noRepeatOverlap('起表保住标题块', keptHeader)
+
+  // ---- W11b-2 退化情形：headerRows=2 但标题块高过整页 → 起表那次换页救不了，
+  //      「不许重叠」是唯一的安全网（旧算法这里会把第 1 行渲两遍）----
+  // 版心 100、行高 80/80/20/20 → 标题块 = 160 > 100
+  const tallHeader = { repeatRows: 2, headerHeight: 160 }
+  const degenerate = paginate([0, 1, 2, 3].map((r) => row('tb1', r, r < 2 ? 80 : 20, tallHeader)), {
+    contentHeight: 100,
+  })
+  noRepeatOverlap('退化（标题块高过整页）', degenerate)
+  eq(
+    '退化：整篇渲出的行去重后 = 模型 4 行（不多不少、没有幻影行）',
+    renderedRowCount(degenerate),
+    4,
+  )
+  eq(
+    '退化：正文区间合起来正好覆盖模型每一行（一行都不丢）',
+    degenerate.reduce(
+      (n, p) => n + p.fragments.filter((f) => f.rowFrom !== undefined).reduce((m, f) => m + (f.rowTo - f.rowFrom), 0),
+      0,
+    ),
+    4,
+  )
+  eq(
+    '退化：续页片的重复行也不越过「本片正文起点」（第 1 行只重复第 0 行）',
+    degenerate[1].fragments[0].headerTo,
+    1,
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

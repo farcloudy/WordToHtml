@@ -65,8 +65,19 @@
 - **「列标题行」不独立表达**：`role` 只有 `unit` / `body` / `note`，要加粗居中就自己套格式
   （逐格对齐已能解决居中）。
   ⚠️ 上一段里「因此 Word 那种『跨页自动重复标题行』不做」**已被 issues/20260916-1 第 4 条推翻**：
-  用户 2026-09-16 明确要这个功能，方案 A（表格级 `headerRows`）已过审，见
-  `issues/20260916-1-design.md` §4；在那一波落地之前，模型里还没有这个字段。
+  用户 2026-09-16 明确要这个功能，方案 A（表格级 `headerRows`）已过审并落地（W11）——
+  模型是 `TableBlock.headerRows?: number`（前 N 行 = 标题行，缺省 0 不落字段，归一化夹到
+  `[0, rows.length]`，读侧统一走 `types.ts` 的 `headerRowCount()`），docx 落成前 N 行的
+  `w:tblHeader`，续页顶端由分页与渲染重复这几行（`PageFragment.headerTo`）。
+- **重复标题行是「只读装饰」**：续页片段里重复渲出的那几行 `<tr>` 带 `wtp-tr-repeat`、
+  `<tr>` 上带 `contenteditable="false"`、格内**不挂 `data-block-id` / `data-cell-id`**
+  （同一格在版面里出现两份可寻址元素会让
+  `retagFragments` / `syncPlain` 读重、整格刷选认错格）。
+  `contenteditable="false"` 挡的是**改内容**，**不是**「插入符不会落进去」——实测选区仍可能落进
+  重复行（落进去敲的字只存在于 DOM、进不了模型）。
+  另有一条结构性不变式：续页片的重复区间恒取 `min(headerRows, rowFrom)`，
+  **一片绝不重复它自己已经含有的行**（见 `paginate()` 主循环那条注释）——否则同一行被正本与
+  重复行渲两遍，「DOM 行数 = 模型行数」当场不成立，而 docx 只写 `w:tblHeader`，预览与 Word 就分家了。
 - **节**：`blocks` 保持扁平 + `DocModel.sections?: SectionSettings[]`（**下标 = 节号**，长度 = 分节符数 + 1）；
   `SectionBreakBlock` 只剩 `{ t, id }`。首节 `linkPrevious` 在解析时强制 `false`；
   `resolveSections()` 必须对 `sections` 缺失/偏短兜底（手搓模型、旧 md、旧 docx 读回）。
@@ -75,7 +86,8 @@
 - **修订/导航开关存 md 用文档首行 `::editor`**，**不用 front matter**（`---` 在本项目已经是分节符语法）。
 - **组件边界** = 顶栏 + 功能区 + 纸张（含批注侧栏、查找替换面板、插入表格面板、导航窗格、提示条），
   **不含**「类 md 源码」pane 与模式切换（demo 靠两个插槽挂回同一副外壳）。
-- **F4 只重复「格式类」操作**（加粗/下划线/颜色/段落样式/格内样式/两组对齐/行高/表头附注行开关），
+- **F4 只重复「格式类」操作**（加粗/下划线/颜色/段落样式/格内样式/两组对齐/行高/表头附注行开关/
+  重复标题行开关），
   不重复删除、并段、插表、插入空格、分节分页符、接受拒绝修订（会把撤销栈搞乱或本身不是格式操作）。
 - **快捷键表的默认值**放在可手改的 `src/lib/edit/shortcuts.json`，它同时是 `shortcuts` prop 的默认值；
   `SHORTCUT_ACTIONS` 的顺序**即冲突时的优先序**（先到先得）。
@@ -335,6 +347,12 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
   里面**每段**一个 `<div class="wtp-cellpara wtp-<kind>" data-block-id data-from data-to>`；
   `<td>` 恒挂 `data-cell-id`（= 第 0 段的 id）。
 - 片段渲染的 **`v-for` key 必须带 `rowFrom` / `rowTo`**（同一张表各页片段的 `from` / `to` 都是 0，会撞键）。
+- **重复标题行**（续页顶端的 `w:tblHeader` 副本）另有一套规矩：`PageFragment.headerTo` 给出要重复的
+  行区间 `[0, headerTo)`（分页侧恒有 `headerTo <= rowFrom`：一片绝不重复它自己含有的行），
+  渲染侧**只在本片 `rowFrom > 0` 时**渲，且必须在**同一个 `<table>`** 里
+  （一页一张表这条不能破）；这些 `<tr>` 带 `wtp-tr-repeat`、`contenteditable="false"`，
+  **格内不挂 `data-block-id`、`<td>` 不挂 `data-cell-id`**（见上面「只读装饰」那条），
+  唯一的例外是 `sameLayout` 必须一起比 `headerTo`（漏比会在「改 headerRows 却不重建 DOM」时留下旧版面）。
 - 段落的 `data-block-id` 是 `cellId(...)`（第 0 段）/ `cellId(...).pN`（第 N 段）。
   包装层**刻意没有任何 CSS 规则**：不给 margin / padding / min-height，段距与缩进全靠每段那条
   `wtp-<kind>`（Word 在格内也逐段算段前段后），空段靠 `renderInlinesHtml` 的占位 `<br>` 撑高。
@@ -565,13 +583,25 @@ demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演�
    但**在幻影格里打字仍然不落模型**（`findContainer` 找不到那些格）。
 7. **`columns` 只能由数据行回推**：手搓模型里 `columns` 大于所有数据行的格数时，md 往返会把它收窄
    （md 语法没有表达「总列数」的地方）。真实路径（手写 md、UI）不受影响；真要修就给围栏加个 `columns=`。
-8. **两处表格特性没进 Word 对账**（模型 / md / docx 三层都已支持，只是样本里没有、`assert-docx` 就验不到）：
+8. **三处表格特性没进 Word 对账**（模型 / md / docx 三层都已支持，只是样本里没有、`assert-docx` 就验不到）：
    ① **表格里的批注锚点** —— 为避开 `assert-docx` 里「批注 1 条」那条既有断言；
    ② **格内多段落**（`{p}`）—— 字节层已验（`verify-docx` 另造一份最小 docx），但 Word COM 那一侧读不到。
    补 ② 的做法是在样本表里加一格 `{p}`，**但那会牵动一批按样本格子文字定位的断言**：
    2026-09-16 试过给 `数控加工中心` 那格加 `{p}`，`verify:p3` 当场红 28 条（
    `caretAtEndOf('数控加工中心')` 落在新多出来的第 0 段、段数/行高/垂直对齐的期望全偏）；
    要补就得先把那些断言的定位方式换成「格子 + 段落下标」，不是加一行样本就完事。
+   ③ **跨页重复标题行**（`headerRows`）—— 字节层验了（`verify-docx` 逐行 `w:tblHeader`）、
+   预览重复渲染与分页算术都有断言（含「一片绝不重复它自己含有的行」这条不变式），
+   但 `check-docx.ps1` 报回来的行对象里**没有 `Row.HeadingFormat`** —— Word 自己认不认这一行是标题行，
+   没被读到。补它要动三处：`ps1` 的行对象加一行 `headingFormat = [bool]$row.HeadingFormat`（纯 ASCII，安全）；
+   样本表标 `headerRows`（实测样本页数会 4→5 —— 样本表本来就跨页，`> 单位：元` 那行单独落在页底）；
+   那 4~5 条按「DOM 行数 = 模型行数」写死的断言改成「= 模型行数 + 重复行数」的口径（T 节三条、V1 一条）。
+   **用户 2026-09-16 明确选择本轮不动样本**（怕牵动一批按样本定位的断言、也不想改样本页数），先记在这里。
+   当前 `assert-docx.mjs` 已写成「模型里没有 `headerRows` 就不判失败」，运行时另打一行
+   「dump 里没有 HeadingFormat —— 这一项没验」。
+   ⚠️ 要真验「Word 也把重复行画在续页顶端」，光读 `HeadingFormat` 还不够，得读每行落在第几页
+   （ps1 里加 `Row.Range.Information(3)` 之类），成本更高；不过一旦样本标上 `headerRows`，
+   `verify:pages` 的「预览页数与 Word 逐套对得上」本身就是这条功能的硬证据 —— 重复行高算错就对不上。
 9. **半截 `[[`（未闭合的批注括号）**会把其后的 `| b |` 一起吞进同一格 —— 内容不丢、往返稳定，
     只是格数比旧算法少一个，记录备查。
 10. **`formatAmount` 的分组校验偏松**：正则首段是不限长的 `\d+`，`1234,567`、`12345,678` 这类非规范分组

@@ -24,7 +24,7 @@ import type {
   TableCellModel,
   TableRowModel,
 } from '../types'
-import { parseCellId, sliceStrict } from '../types'
+import { headerRowCount, parseCellId, sliceStrict } from '../types'
 
 /** 按 id 找表格块。id 既可以是表格自己的 id，也可以是格子的 cellId（tableId.rNcM） */
 export function findTable(doc: DocModel, id: string): TableBlock | undefined {
@@ -304,6 +304,10 @@ export function removeColumn(table: TableBlock, at: number): boolean {
 /**
  * columns = body 行最大格数（至少 1）；unit/note 行只保留第 0 格（渲染与导出都只用 cells[0]）；
  * 每个格子恒有至少一段（`paragraphs.length >= 1`，缺字段 / 空数组都补一段空段）。
+ *
+ * 顺带把 `headerRows` 收口：夹到 `[0, rows.length]`，归零就删字段（默认值不落模型）。
+ * 「前 N 行是标题行」这个 N 在增删行之后必须跟着新行数走，不收口会留下「N > 行数」的
+ * 死状态（渲染侧虽然还会再夹一次，但模型自己就该是合规的）。
  */
 export function normalizeTable(table: TableBlock): void {
   let columns = 1
@@ -312,6 +316,9 @@ export function normalizeTable(table: TableBlock): void {
     columns = Math.max(columns, row.cells.length)
   }
   table.columns = columns
+  const header = headerRowCount(table)
+  if (header > 0) table.headerRows = header
+  else delete table.headerRows
   for (const row of table.rows) {
     if (row.role !== 'body') {
       row.cells = row.cells.slice(0, 1)

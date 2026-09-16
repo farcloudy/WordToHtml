@@ -21,6 +21,7 @@ import JSZip from 'jszip'
 import {
   DOC_TEMPLATES,
   allInlineHolders,
+  headerRowCount,
   lengthToPx,
   normalizeBlocks,
   parseMd,
@@ -74,7 +75,7 @@ const SAMPLE = [
   // 若干数据行、note 行（左对齐 + 顶端对齐、整行合并、无框），以及带 `|` 与 `\`
   // 的格（验转义往返）。表格里刻意不放修订与批注：assert-docx 的「修订 2 条 /
   // 批注 1 条」是写死的，没必要为了表格去扩大战线。
-  ':::table minLines=2',
+  ':::table minLines=2 headerRows=1',
   '> 单位：元',
   '| **项目** | **金额** |',
   '| 甲资产 | 1,234.00 |',
@@ -287,6 +288,10 @@ writeFileSync(outPath, buffer)
    * 行距的最大值），不从 Word 读回来的数推。
    */
   const tables = model.blocks.filter((b) => b.t === 'table')
+  /*
+   * 有效的前导标题行数（`rows[0..N)`）走 lib 导出的 `headerRowCount` —— 与渲染/量测/分页/导出
+   * 同一个夹取口径（缺省 / 非数字 / <= 0 视为 0，越界夹到行数），这里不再自己抄一份。
+   */
   if (usedBuiltinSample && tables.length === 0) {
     problems.push('内置样本里没有表格 —— 这一项等于没验')
   }
@@ -314,6 +319,14 @@ writeFileSync(outPath, buffer)
     }
     if (!tables.some((t) => cellsOf(t).some((c) => c.align?.v !== undefined))) {
       problems.push('内置样本里没有逐格垂直对齐覆盖 —— 等于没验')
+    }
+    // 重复标题行（w:tblHeader）这一项也要有真东西可验：至少一张标了、还要有一张没标
+    //（「没标的表一个都没有」这句断言只有在同一份样本里两种表都在时才验得动）
+    if (!tables.some((t) => headerRowCount(t) > 0)) {
+      problems.push('内置样本里没有标「重复标题行」（headerRows）的表 —— w:tblHeader 这一项等于没验')
+    }
+    if (!tables.some((t) => headerRowCount(t) === 0)) {
+      problems.push('内置样本里每张表都标了重复标题行 —— 「没标的表一个都没有」无从验起')
     }
   }
   if (tables.length > 0) {
@@ -394,6 +407,30 @@ writeFileSync(outPath, buffer)
         problems.push(
           `表${ti}的整行合并不符：期望 ${mergedRows} 处 gridSpan=${t.columns}，实际 ${JSON.stringify(spans)}`,
         )
+      }
+
+      /*
+       * 重复标题行：`w:tblHeader` 必须**逐行**落在 rows[0..headerRows) 上。
+       * 只数总数不够 —— 「2 处 tblHeader 落在第 1、2 行」与「落在第 3、4 行」总数一样，
+       * 后者在 Word 里等于没标（OOXML 的语义是「这一行之上每一行也都是标题行时才重复」）。
+       * 反向也要查：没标的表一个 tblHeader 都不许有（不能靠显式 w:val="false" 蒙混）。
+       */
+      const wantHeader = headerRowCount(t)
+      const trXmls = [...xml.matchAll(/<w:tr\b[\s\S]*?<\/w:tr>/g)].map((m) => m[0])
+      if (trXmls.length !== rows) {
+        problems.push(`表${ti}的 <w:tr> 数不符：期望 ${rows}，实际 ${trXmls.length}`)
+      } else {
+        trXmls.forEach((trXml, r) => {
+          const got = trXml.includes('<w:tblHeader/>')
+          if (got !== r < wantHeader) {
+            problems.push(
+              `表${ti}第${r}行的 w:tblHeader 与模型不符（期望${r < wantHeader ? '有' : '无'}，实际${got ? '有' : '无'}；模型 headerRows=${wantHeader}）`,
+            )
+          }
+        })
+      }
+      if (/<w:tblHeader[^>]*w:val=/.test(xml)) {
+        problems.push(`表${ti}把 w:tblHeader 写成了带 w:val 的形态（不重复就不该写这个元素）`)
       }
 
       // 逐格 pStyle / w:jc / w:vAlign 的处数对账（整张表摊平计数；能读就断言，读不到就是缺元素）
@@ -607,7 +644,7 @@ writeFileSync(outPath, buffer)
   console.log(`[ok] 软换行：${softBreakTags} 处 <w:br/>（模型里 ${modelSoftBreaks} 枚）`)
   if (tables.length > 0) {
     console.log(
-      `[ok] 表格：${tables.length} 张，总宽/固定布局/禁断行/整行合并/逐行行高/逐格样式/逐格两组对齐均在字节层核对`,
+      `[ok] 表格：${tables.length} 张，总宽/固定布局/禁断行/整行合并/逐行行高/逐行 w:tblHeader/逐格样式/逐格两组对齐均在字节层核对`,
     )
   }
 }

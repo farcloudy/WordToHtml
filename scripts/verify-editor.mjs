@@ -3966,6 +3966,266 @@ try {
 
   /* ------------------------------------------------------------------ */
   console.log(
+    '\n=== AI. 跨页重复标题行（W11）：radio 写模型、续页片渲重复行且重复行不可编辑 ===',
+  )
+  {
+    /*
+     * 先造一张**真的跨页**的表：不写死页数、也不改样本，只用现成的「下方插入行」按钮
+     * 一行一行加到它自己翻页为止（光标停在表头行，插入点会被夹进 body 区间，每一步都合法）。
+     * 表头行那一行当落点，「重复标题行=有」的语义「第一行到光标行都算标题行」正好给出 headerRows=1。
+     */
+    await openApp('表格')
+    await page.evaluate(() => window.__wtpTest.caretAtEndOf('单位：元'))
+    await page.waitForTimeout(200)
+
+    /** 每个页面上那张表的片段概况（重复行的一切都从 DOM 现数，期望值由模型现推） */
+    const tableFragStats = () =>
+      page.evaluate(() => {
+        const pages = Array.from(document.querySelectorAll('.wtp-page'))
+        return pages.map((el, i) => {
+          const frag = el.querySelector('.wtp-tableFrag')
+          const repeats = frag ? Array.from(frag.querySelectorAll('tr.wtp-tr-repeat')) : []
+          return {
+            page: i + 1,
+            hasTable: frag !== null,
+            tables: frag ? frag.querySelectorAll('table').length : 0,
+            rowFrom: frag ? Number(frag.dataset.rowFrom) : null,
+            rowTo: frag ? Number(frag.dataset.rowTo) : null,
+            rows: frag ? frag.querySelectorAll(':scope > table > tbody > tr').length : 0,
+            repeats: repeats.length,
+            repeatText: repeats.map((tr) => (tr.textContent ?? '').trim()).join('|'),
+            // 重复行是只读装饰：格内不许有可寻址元素 —— data-block-id 会让 syncPlain 读重，
+            // data-cell-id 会让整格刷选认错格
+            repeatBlockIds: repeats.reduce(
+              (n, tr) => n + tr.querySelectorAll('[data-block-id]').length,
+              0,
+            ),
+            repeatCellIds: repeats.reduce(
+              (n, tr) => n + tr.querySelectorAll('td[data-cell-id]').length,
+              0,
+            ),
+            repeatEditable: repeats.every((tr) => tr.getAttribute('contenteditable') === 'false'),
+          }
+        })
+      })
+
+    let added = 0
+    let stats = await tableFragStats()
+    while (stats.filter((s) => s.hasTable).length < 2 && added < 40) {
+      await subButton('下方插入行').click()
+      await page.waitForTimeout(250)
+      added += 1
+      stats = await tableFragStats()
+    }
+    const headerRadio = (name) => subRadio('重复标题行', name)
+    /*
+     * 先把这张表**归一成「没标」**再开始。样本将来若自己带上 `headerRows=1`（任务书里
+     * 那一行宁可撤回也没撤成的情形），这一节不该跟着红 —— 在已经是「无」的表上再点一次
+     * 「无」是幂等空转（applyTableRepeatHeader 返回 false，不记撤销、不改模型）。
+     */
+    await headerRadio('无').click()
+    await page.waitForTimeout(300)
+    stats = await tableFragStats()
+    ok(
+      `加 ${added} 行之后这张表跨了页（页数由分页器算出来，不写死）`,
+      stats.filter((s) => s.hasTable).length >= 2,
+      JSON.stringify(stats.map((s) => ({ page: s.page, hasTable: s.hasTable, rowFrom: s.rowFrom }))),
+    )
+    const beforeMark = await modelTable()
+    eq('（前置）从一张「没标」的表开始', beforeMark?.headerRows, undefined)
+    ok('（前置）没标的时候一个重复行都没有', stats.every((s) => s.repeats === 0))
+    ok('（前置）重复标题行 radio 回显「无」', await headerRadio('无').isChecked())
+
+    // ---- 点「有」：写进模型 + 续页顶端渲出重复行 ----
+    await headerRadio('有').click()
+    await page.waitForTimeout(400)
+    const marked = await modelTable()
+    eq('radio=有：模型写出 headerRows=1（落点在表头行那一行）', marked?.headerRows, 1)
+    const markedStats = await tableFragStats()
+    const tablePages = markedStats.filter((s) => s.hasTable)
+    const firstPage = tablePages[0]
+    const restPages = tablePages.slice(1)
+    eq('第一片仍从第 0 行开始（它本来就是从表头行起排的）', firstPage?.rowFrom, 0)
+    eq('第一片不带重复行', firstPage?.repeats, 0)
+    ok('续页片每一片都带重复行', restPages.length > 0 && restPages.every((s) => s.repeats === marked?.headerRows))
+    ok(
+      '续页片渲出的重复行就是模型里的表头行（文字对得上）',
+      restPages.every((s) => s.repeatText.includes('单位：元')),
+      JSON.stringify(restPages.map((s) => s.repeatText)),
+    )
+    eq(
+      '重复行里一个 data-block-id 都没有（读回不会把同一格读成两份）',
+      restPages.reduce((n, s) => n + s.repeatBlockIds, 0),
+      0,
+    )
+    eq(
+      '重复行里的 <td> 一个 data-cell-id 都没有（整格刷选不会认错格）',
+      restPages.reduce((n, s) => n + s.repeatCellIds, 0),
+      0,
+    )
+    ok('重复行不可编辑（contenteditable=false）', restPages.every((s) => s.repeatEditable))
+    ok(
+      '一页一张 <table> 这条没破：每个表格片段里只有一个 <table>',
+      tablePages.every((s) => s.tables === 1),
+      JSON.stringify(tablePages.map((s) => s.tables)),
+    )
+    eq(
+      '各片行区间之和仍等于模型行数（重复行不占行号）',
+      tablePages.reduce((n, s) => n + (s.rowTo - s.rowFrom), 0),
+      marked?.rows.length,
+    )
+    ok('radio「有」的回显与模型一致', await headerRadio('有').isChecked())
+    ok('radio「无」不带选中态', (await headerRadio('无').isChecked()) === false)
+    await checkNoOverflow('AI 标上重复标题行之后')
+
+    // ---- 点「无」：字段删掉、重复行消失 ----
+    await headerRadio('无').click()
+    await page.waitForTimeout(400)
+    const unmarked = await modelTable()
+    eq('radio=无：模型里连字段都不剩（默认值不落模型）', unmarked?.headerRows, undefined)
+    const offStats = await tableFragStats()
+    eq('radio=无：页面上一个重复行都没有', offStats.reduce((n, s) => n + s.repeats, 0), 0)
+    eq(
+      'radio=无：行区间之和仍等于模型行数',
+      offStats
+        .filter((s) => s.hasTable)
+        .reduce((n, s) => n + (s.rowTo - s.rowFrom), 0),
+      unmarked?.rows.length,
+    )
+    ok('radio「无」的回显与模型一致', await headerRadio('无').isChecked())
+    await checkNoOverflow('AI 关掉重复标题行之后')
+  }
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== AH. 样本表标 2 行标题行（W11b）：表整体挪到下一页、没有一行被渲两遍 ===',
+  )
+  {
+    /*
+     * 验收 ⑩ 的复现步骤（不改样本，只点 radio）：光标停在样本表「设备名称」那一行
+     * （第 1 行）点「有」→ headerRows = 2。样本表的 unit 行单占页底（第一片只放得下第 0 行），
+     * 旧算法让续页片「重复 [0,2)」→ 第 1 行既当重复行又当正文行渲两遍（片段 1/6 却渲 7 条 tr）。
+     * 修法一让整张表挪到下一页（首片含足 2 行标题块），修法二保证续页片只重复
+     * `min(headerRows, rowFrom)` 行。这里两段都验：先按验收步骤复现，再用「下方插入行」
+     * 把这张表加到真的跨页，看续页片是不是正好重复 2 行。做完点回「无」还原。
+     */
+    await openApp('表格')
+    await page.evaluate(() => window.__wtpTest.caretAtEndOf('设备名称'))
+    await page.waitForTimeout(250)
+    await subRadio('重复标题行', '有').click()
+    await page.waitForTimeout(450)
+    const ahTable = await modelTable()
+    eq('AH：光标在「设备名称」行点「有」→ 模型写出 headerRows=2', ahTable?.headerRows, 2)
+
+    /** 现数一遍整篇版面：每个表格片段的行区间、渲出的 tr 条数、重复行条数与文字（全部从 DOM 现数） */
+    const readFragRows = () =>
+      page.evaluate(() =>
+        Array.from(document.querySelectorAll('.wtp-page')).flatMap((pageEl, pi) =>
+          Array.from(pageEl.querySelectorAll('.wtp-tableFrag')).map((frag) => {
+            const trs = Array.from(frag.querySelectorAll(':scope > table > tbody > tr'))
+            const isRepeat = (tr) => tr.classList.contains('wtp-tr-repeat')
+            const bare = (tr) => (tr.textContent ?? '').replace(/\s+/g, '')
+            return {
+              page: pi + 1,
+              rowFrom: Number(frag.dataset.rowFrom),
+              rowTo: Number(frag.dataset.rowTo),
+              trs: trs.length,
+              repeats: trs.filter(isRepeat).length,
+              repeatTexts: trs.filter(isRepeat).map(bare),
+              contentTexts: trs.filter((tr) => !isRepeat(tr)).map(bare),
+              cellIds: trs.map((tr) => tr.querySelector('td[data-cell-id]')?.dataset.cellId ?? ''),
+            }
+          }),
+        ),
+      )
+    /** 片段的概况串（断言失败时把真实版面印出来） */
+    const fragBrief = (frags) =>
+      JSON.stringify(frags.map((f) => ({ p: f.page, from: f.rowFrom, to: f.rowTo, trs: f.trs, rep: f.repeats })))
+    const contentIds = (frags) => frags.flatMap((f) => f.cellIds.filter((x) => x !== ''))
+
+    // ---- 第一段：按验收步骤复现。旧算法在这里就把第 1 行渲两遍 ----
+    const fragRows = await readFragRows()
+    let ahRowTotal = ahTable?.rows?.length ?? 0
+    ok('AH：样本表的片段都在版面上现数出来了', fragRows.length > 0, fragBrief(fragRows))
+    ok(
+      'AH：没有一行被渲两遍（每一片：重复行数 <= 正文起始行，且 DOM 行数 = 行区间 + 重复行数）',
+      fragRows.every((f) => f.repeats <= f.rowFrom && f.trs === f.repeats + (f.rowTo - f.rowFrom)),
+      fragBrief(fragRows),
+    )
+    ok(
+      'AH：可寻址的正本行不多不少（去重后正好覆盖模型每一行一次）',
+      contentIds(fragRows).length === ahRowTotal && new Set(contentIds(fragRows)).size === ahRowTotal,
+      `${contentIds(fragRows).length} 条 / 模型 ${ahRowTotal} 行，去重后 ${new Set(contentIds(fragRows)).size} 条`,
+    )
+    ok(
+      'AH：按 tr 里的文字去重后也与模型对得上（正本行的文字互不相同、条数 = 模型行数）',
+      (() => {
+        const texts = fragRows.flatMap((f) => f.contentTexts)
+        return texts.length === ahRowTotal && new Set(texts).size === texts.length
+      })(),
+      fragBrief(fragRows),
+    )
+    ok(
+      'AH：起表时保住整个标题块（首片含足 headerRows = 2 行，表整体挪到下一页）',
+      (fragRows.find((f) => f.rowFrom === 0)?.rowTo ?? 0) >= 2,
+      fragBrief(fragRows),
+    )
+    await checkNoOverflow('AH 样本表标 2 行标题行之后')
+
+    // ---- 第二段：用「下方插入行」把这张表加到真的跨页，续页片的重复行数才验得动 ----
+    let ahAdded = 0
+    let ahFrags = fragRows
+    while (ahFrags.length < 2 && ahAdded < 40) {
+      await page.evaluate(() => window.__wtpTest.caretAtEndOf('设备名称'))
+      await page.waitForTimeout(120)
+      await subButton('下方插入行').click()
+      await page.waitForTimeout(250)
+      ahAdded += 1
+      ahFrags = await readFragRows()
+    }
+    const ahGrown = await modelTable()
+    ahRowTotal = ahGrown?.rows?.length ?? 0
+    eq('AH：加行之后模型仍是 headerRows=2', ahGrown?.headerRows, 2)
+    ok(`AH：加 ${ahAdded} 行之后这张表真的跨页了`, ahFrags.length >= 2, fragBrief(ahFrags))
+    const ahFirst = ahFrags.find((f) => f.rowFrom === 0)
+    const ahRest = ahFrags.filter((f) => f.rowFrom > 0)
+    ok(
+      'AH：续页片每一片都重复 headerRows = 2 行，首片 0 行（重复行不与本片正文重叠）',
+      ahFirst?.repeats === 0 &&
+        ahRest.length > 0 &&
+        ahRest.every((f) => f.repeats === 2 && f.repeats <= f.rowFrom),
+      fragBrief(ahFrags),
+    )
+    const ahWantRepeat = (ahFirst?.contentTexts ?? []).slice(0, 2).join('|')
+    ok(
+      'AH：续页片重复出来的就是模型前 2 行（文字与首片的第 0、1 行逐字相同）',
+      ahWantRepeat !== '' && ahRest.every((f) => f.repeatTexts.join('|') === ahWantRepeat),
+      `期望「${ahWantRepeat}」，实际 ${JSON.stringify(ahRest.map((f) => f.repeatTexts.join('|')))}`,
+    )
+    ok(
+      'AH：跨页之后仍没有一行被渲两遍，正本行仍一行一份',
+      ahFrags.every((f) => f.repeats <= f.rowFrom && f.trs === f.repeats + (f.rowTo - f.rowFrom)) &&
+        contentIds(ahFrags).length === ahRowTotal &&
+        new Set(contentIds(ahFrags)).size === ahRowTotal,
+      fragBrief(ahFrags),
+    )
+    await checkNoOverflow('AH 加行跨页之后')
+
+    // ---- 还原：点回「无」，样本表不留「已标」状态（后面几节依赖它没标） ----
+    await subRadio('重复标题行', '无').click()
+    await page.waitForTimeout(450)
+    const ahRestored = await modelTable()
+    eq('AH：点回「无」→ 模型里连字段都不剩（样本表还原）', ahRestored?.headerRows, undefined)
+    eq(
+      'AH：点回「无」→ 版面上一个重复行都不剩',
+      (await readFragRows()).reduce((n, f) => n + f.repeats, 0),
+      0,
+    )
+    await checkNoOverflow('AH 还原样本表之后')
+  }
+
+  /* ------------------------------------------------------------------ */
+  console.log(
     '\n=== AG. 组件打包（W8）：props 生效、受控回写、save_md / save_docx、content 留空 ===',
   )
   /*
