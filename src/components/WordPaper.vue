@@ -1283,9 +1283,14 @@ let repeatAction: (() => boolean) | null = null
  * 记下并执行一次可重复的操作。只有**真的改了模型**（返回 true）才记 —— 否则
  * 「没选中文字时点一下加粗」也会占住 F4，之后按 F4 只会静默空转，
  * 连「没有可重复的操作」这句提示都出不来。
+ *
+ * 返回值就是「这一步真的改了模型没有」：工具条那条路不看它（按钮该置灰的自己置灰），
+ * 键盘那条路（`onKeydown`）拿它决定要不要提示。
  */
-function repeatable(run: () => boolean): void {
-  if (run()) repeatAction = run
+function repeatable(run: () => boolean): boolean {
+  if (!run()) return false
+  repeatAction = run
+  return true
 }
 
 /** F4 的处理：没有可重复的操作就空转 + 一句提示（与金额格式化失败同一套提示条） */
@@ -1332,6 +1337,87 @@ function onKeydown(event: KeyboardEvent): void {
         break
       case 'repeat':
         repeatLast()
+        break
+      /*
+       * 下面这 20 条是 W9 追加的（键位全在 Ctrl+Alt+… 一档，理由见 README「快捷键」）。
+       * 两条需要反馈的路子：
+       *   · 接受 / 拒绝修订：没有覆盖到的修订时一步都不许动，弹一句；
+       *   · 格里对齐：判据与「表格」页那六枚按钮的置灰条件同源 —— 光标（或整格复选）
+       *     落到某个格子上才动手。这里除了看 setter 的返回值，还要求「真的没有目标格」：
+       *     返回值同时覆盖「本来就是这个值、又没有覆盖可清」的空转（按钮那条路是静默的），
+       *     单看返回值会在格内弹一句位置判断错误的提示。
+       */
+      case 'colorRed':
+        setColor('FF0000')
+        break
+      case 'colorClear':
+        setColor(null)
+        break
+      case 'acceptRevision':
+        if (!resolveRevisionsOf('accept')) emit('toast', '这里没有可以接受的修订')
+        break
+      case 'rejectRevision':
+        if (!resolveRevisionsOf('reject')) emit('toast', '这里没有可以拒绝的修订')
+        break
+      case 'styleTitle':
+        setBlockKind('title')
+        break
+      case 'styleH1':
+        setBlockKind('h1')
+        break
+      case 'styleH2':
+        setBlockKind('h1')
+        break
+      case 'styleH3':
+        setBlockKind('h3')
+        break
+      case 'styleBody':
+        setBlockKind('body')
+        break
+      case 'spaceEm':
+        insertSpecialSpace('em')
+        break
+      case 'spaceEn':
+        insertSpecialSpace('en')
+        break
+      case 'spaceQuarterEm':
+        insertSpecialSpace('quarterEm')
+        break
+      case 'breakSection':
+        insertSectionBreak()
+        break
+      case 'breakPage':
+        insertPageBreak()
+        break
+      case 'cellAlignLeft':
+        if (!setTableCellAlignH('left') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
+        break
+      case 'cellAlignCenter':
+        if (!setTableCellAlignH('center') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
+        break
+      case 'cellAlignRight':
+        if (!setTableCellAlignH('right') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
+        break
+      case 'cellAlignTop':
+        if (!setTableCellAlignV('top') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
+        break
+      case 'cellAlignMiddle':
+        if (!setTableCellAlignV('middle') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
+        break
+      case 'cellAlignBottom':
+        if (!setTableCellAlignV('bottom') && !cellTargets()) {
+          emit('toast', '请先把光标放进表格的格子里')
+        }
         break
     }
     return
@@ -1865,11 +1951,13 @@ function setColor(hex: string | null): void {
  *
  * 锚点按改之前的选区还回去：接受/拒绝插入修订时坐标不动，处理删除修订时后面会左移，
  * placeCaret 自己会找最近的落点。
+ *
+ * 返回「真的改了模型没有」—— 键盘那条路（`Ctrl+Alt+A` / `D`）拿它决定要不要弹提示。
  */
-function resolveRevisionsOf(action: 'accept' | 'reject'): void {
-  if (!props.editable) return
+function resolveRevisionsOf(action: 'accept' | 'reject'): boolean {
+  if (!props.editable) return false
   const rootEl = root.value
-  if (!rootEl) return
+  if (!rootEl) return false
 
   /*
    * 要处理哪儿：**实时**选区优先 —— 有真选区就跨块全给上；只有插入符（折叠）时，
@@ -1900,7 +1988,7 @@ function resolveRevisionsOf(action: 'accept' | 'reject'): void {
     const container = findContainer(doc.value, target.blockId)
     return container ? hasRevisions(container, target.from, target.to) : false
   })
-  if (hits.length === 0) return
+  if (hits.length === 0) return false
 
   const before = selectionRange()
   pushHistory()
@@ -1914,6 +2002,7 @@ function resolveRevisionsOf(action: 'accept' | 'reject'): void {
   })
   // 修订没了，按钮得跟着变灰 —— 焦点没离开正文，不会自己来一次 selectionchange
   void nextTick(emitSelection)
+  return true
 }
 
 /**
@@ -2433,8 +2522,9 @@ function applyTableCellAlignH(value: Align): boolean {
   return applyCellsAlign('h', value)
 }
 
-function setTableCellAlignH(value: Align): void {
-  repeatable(() => applyTableCellAlignH(value))
+/** 水平对齐三档的键盘 / 按钮入口。返回值 = 这一步真的改了模型没有（键盘那条路据此提示） */
+function setTableCellAlignH(value: Align): boolean {
+  return repeatable(() => applyTableCellAlignH(value))
 }
 
 /** 垂直对齐三档；同样「点当前值 = 回默认 top」，同样作用于目标格列表 */
@@ -2442,8 +2532,8 @@ function applyTableCellAlignV(value: CellVerticalAlign): boolean {
   return applyCellsAlign('v', value)
 }
 
-function setTableCellAlignV(value: CellVerticalAlign): void {
-  repeatable(() => applyTableCellAlignV(value))
+function setTableCellAlignV(value: CellVerticalAlign): boolean {
+  return repeatable(() => applyTableCellAlignV(value))
 }
 
 /* -------------------------------------------------------------------------- */

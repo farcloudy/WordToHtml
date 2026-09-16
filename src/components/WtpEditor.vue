@@ -89,6 +89,21 @@ const KIND_LABEL: Record<BlockKind, string> = {
 }
 
 /**
+ * 样式库按钮的默认键位（与 `lib/edit/shortcuts.json` 对齐的只是文案，不是接线 ——
+ * 真正认键的是 WordPaper 的 onKeydown）。只有这五档有键位，其余样式没有。
+ */
+const KIND_SHORTCUT: Partial<Record<BlockKind, string>> = {
+  title: 'Ctrl+Alt+0',
+  h1: 'Ctrl+Alt+1',
+  h2: 'Ctrl+Alt+2',
+  h3: 'Ctrl+Alt+3',
+  body: 'Ctrl+Alt+8',
+}
+
+const kindTitle = (kind: BlockKind): string =>
+  KIND_SHORTCUT[kind] ? `${KIND_LABEL[kind]}（${KIND_SHORTCUT[kind]}）` : KIND_LABEL[kind]
+
+/**
  * 可插入的特殊空格。三个码点的宽度是排版意义上的（全宽/半宽/四分之一），
  * 与字体无关；普通空格会被 HTML 折叠，这三个不会。
  *
@@ -96,9 +111,13 @@ const KIND_LABEL: Record<BlockKind, string> = {
  * 而且下拉选完必须复位回占位项才认第二次 change，想连插两个同宽空格都做不到。
  */
 const SPACES = [
-  { kind: 'em', label: '全宽空格', title: '在插入符处插入全宽空格（U+2003）' },
-  { kind: 'en', label: '半宽空格', title: '在插入符处插入半宽空格（U+2002）' },
-  { kind: 'quarterEm', label: '1/4 宽空格', title: '在插入符处插入四分之一宽空格（U+2005）' },
+  { kind: 'em', label: '全宽空格', title: '在插入符处插入全宽空格（U+2003，Ctrl+Alt+X）' },
+  { kind: 'en', label: '半宽空格', title: '在插入符处插入半宽空格（U+2002，Ctrl+Alt+C）' },
+  {
+    kind: 'quarterEm',
+    label: '1/4 宽空格',
+    title: '在插入符处插入四分之一宽空格（U+2005，Ctrl+Alt+V）',
+  },
 ] as const
 
 /**
@@ -118,14 +137,14 @@ const RIBBON_TABS = [
  * 垂直三档，缺省是顶端 —— 按钮的 active 态吃 selection.table 里已解析默认值的 alignH / alignV。
  */
 const TABLE_H_ALIGNS: { value: Align; label: string; title: string }[] = [
-  { value: 'left', label: '左', title: '格内水平左对齐' },
-  { value: 'center', label: '居中', title: '格内水平居中' },
-  { value: 'right', label: '右', title: '格内水平右对齐' },
+  { value: 'left', label: '左', title: '格内水平左对齐（Ctrl+Alt+H）' },
+  { value: 'center', label: '居中', title: '格内水平居中（Ctrl+Alt+J）' },
+  { value: 'right', label: '右', title: '格内水平右对齐（Ctrl+Alt+K）' },
 ]
 const TABLE_V_ALIGNS: { value: CellVerticalAlign; label: string; title: string }[] = [
-  { value: 'top', label: '顶端', title: '格内顶端对齐' },
-  { value: 'middle', label: '居中', title: '格内垂直居中' },
-  { value: 'bottom', label: '底端', title: '格内底端对齐' },
+  { value: 'top', label: '顶端', title: '格内顶端对齐（Ctrl+Alt+←）' },
+  { value: 'middle', label: '居中', title: '格内垂直居中（Ctrl+Alt+Home）' },
+  { value: 'bottom', label: '底端', title: '格内底端对齐（Ctrl+Alt+→）' },
 ]
 
 /** 「节」工具条上的纸张方向两档（值直接对应 PageOrientation） */
@@ -801,14 +820,14 @@ defineExpose({
             class="swatch"
             :class="{ 'is-on': selection?.color === RED }"
             :style="{ background: `#${RED}` }"
-            title="标红"
+            title="标红（Ctrl+Alt+R）"
             @mousedown.prevent
             @click="paper?.setColor(RED)"
           />
           <button
             type="button"
             class="swatch clear"
-            title="取消颜色"
+            title="取消颜色（Ctrl+Alt+E）"
             @mousedown.prevent
             @click="paper?.setColor(null)"
           >
@@ -828,7 +847,7 @@ defineExpose({
           type="button"
           class="tool"
           :disabled="!hasRevisions"
-          title="接受选中的修订（插入的文字留下、删除的文字真的删掉）"
+          title="接受选中的修订（Ctrl+Alt+A；插入的文字留下、删除的文字真的删掉）"
           @mousedown.prevent
           @click="paper?.resolveRevisions('accept')"
         >
@@ -838,7 +857,7 @@ defineExpose({
           type="button"
           class="tool"
           :disabled="!hasRevisions"
-          title="拒绝选中的修订（插入的文字删掉、删除的文字留在原处）"
+          title="拒绝选中的修订（Ctrl+Alt+D；插入的文字删掉、删除的文字留在原处）"
           @mousedown.prevent
           @click="paper?.resolveRevisions('reject')"
         >
@@ -858,7 +877,7 @@ defineExpose({
             class="style-chip"
             :class="{ 'is-on': k === kind }"
             :style="chipStyle(k)"
-            :title="KIND_LABEL[k]"
+            :title="kindTitle(k)"
             @mousedown.prevent
             @click="paper?.setBlockKind(k)"
           >
@@ -903,7 +922,7 @@ defineExpose({
         <button
           type="button"
           class="tool"
-          title="在光标所在段落后插入分节符（新起一页；页码默认关联前一节、不重排）"
+          title="在光标所在段落后插入分节符（Ctrl+Alt+B；新起一页，页码默认关联前一节、不重排）"
           @mousedown.prevent
           @click="paper?.insertSectionBreak()"
         >
@@ -912,7 +931,7 @@ defineExpose({
         <button
           type="button"
           class="tool"
-          title="在光标所在段落后插入分页符（只换页，页码连续）"
+          title="在光标所在段落后插入分页符（Ctrl+Alt+N；只换页，页码连续）"
           @mousedown.prevent
           @click="paper?.insertPageBreak()"
         >

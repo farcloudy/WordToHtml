@@ -3,18 +3,25 @@
  *
  * 全是与界面无关的纯函数（能在 node 里单测）：把「动作名 → 组合键字符串」解析成结构化的
  * 组合键，再拿键盘事件去比对。动作集就是编辑器 onKeydown 里那批可配置的键 ——
- * **Tab 与方向键不在内**：它们是编辑器手感（行 / 列跨格移动），改了会和浏览器行为打架。
+ * **Tab 与裸方向键不在内**：它们是编辑器手感（行 / 列跨格移动），改了会和浏览器行为打架
+ * （加了修饰键的 `Ctrl+Alt+←` 是另一回事，见下面 NAMED_KEYS）。
  *
  * 组合键的写法刻意宽容：
  *   · 大小写不敏感（`ctrl+b` / `Ctrl+B` 同一个）；
  *   · `Cmd` / `Command` / `Meta` / `⌘` / `Win` / `Super` 一律归一到「mod」（= `ctrlKey || metaKey`）；
  *   · 数字键比对时同时看 `event.key` 与 `event.code`（沿用 alt+4 那处的写法）——
- *     中文输入法或非美式布局下，按数字键的 `event.key` 可能不是数字字符。
+ *     中文输入法或非美式布局下，按数字键的 `event.key` 可能不是数字字符；
+ *   · 方向键与 Home 用名字或箭头写都行（`Left` / `arrowleft` / `←` 同一个）—— 格里对齐用它。
  */
 
 import defaultsFile from './shortcuts.json'
 
-/** 动作名。**顺序即冲突时的优先序**（先到先得），所以不要随手调整 */
+/**
+ * 动作名。**顺序即冲突时的优先序**（先到先得），所以不要随手调整。
+ *
+ * 前九个是 W6 落地的那批（硬编码时代的键位），后面二十个是 W9 追加的 ——
+ * 追加时**排在最后**，前面九条的顺序一动不许动（优先序就是这张表的顺序）。
+ */
 export const SHORTCUT_ACTIONS = [
   'bold',
   'underline',
@@ -25,6 +32,29 @@ export const SHORTCUT_ACTIONS = [
   'redo',
   'formatAmount',
   'repeat',
+  // 开始页：颜色 / 修订 / 段落样式
+  'colorRed',
+  'colorClear',
+  'acceptRevision',
+  'rejectRevision',
+  'styleTitle',
+  'styleH1',
+  'styleH2',
+  'styleH3',
+  'styleBody',
+  // 插入页：特殊空格 / 分节符 / 分页符
+  'spaceEm',
+  'spaceEn',
+  'spaceQuarterEm',
+  'breakSection',
+  'breakPage',
+  // 表格页：格内两组对齐
+  'cellAlignLeft',
+  'cellAlignCenter',
+  'cellAlignRight',
+  'cellAlignTop',
+  'cellAlignMiddle',
+  'cellAlignBottom',
 ] as const
 
 export type ShortcutAction = (typeof SHORTCUT_ACTIONS)[number]
@@ -49,6 +79,26 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, string> = {
   redo: defaultsFile.redo,
   formatAmount: defaultsFile.formatAmount,
   repeat: defaultsFile.repeat,
+  colorRed: defaultsFile.colorRed,
+  colorClear: defaultsFile.colorClear,
+  acceptRevision: defaultsFile.acceptRevision,
+  rejectRevision: defaultsFile.rejectRevision,
+  styleTitle: defaultsFile.styleTitle,
+  styleH1: defaultsFile.styleH1,
+  styleH2: defaultsFile.styleH2,
+  styleH3: defaultsFile.styleH3,
+  styleBody: defaultsFile.styleBody,
+  spaceEm: defaultsFile.spaceEm,
+  spaceEn: defaultsFile.spaceEn,
+  spaceQuarterEm: defaultsFile.spaceQuarterEm,
+  breakSection: defaultsFile.breakSection,
+  breakPage: defaultsFile.breakPage,
+  cellAlignLeft: defaultsFile.cellAlignLeft,
+  cellAlignCenter: defaultsFile.cellAlignCenter,
+  cellAlignRight: defaultsFile.cellAlignRight,
+  cellAlignTop: defaultsFile.cellAlignTop,
+  cellAlignMiddle: defaultsFile.cellAlignMiddle,
+  cellAlignBottom: defaultsFile.cellAlignBottom,
 }
 
 /*
@@ -82,7 +132,7 @@ export interface Combo {
   mod: boolean
   shift: boolean
   alt: boolean
-  /** 主键：小写。单字符（'b' / '4'）或功能键（'f4'） */
+  /** 主键：小写。单字符（'b' / '4'）、功能键（'f4'），或下面 NAMED_KEYS 归一出来的名字（'arrowleft' / 'home'） */
   key: string
 }
 
@@ -95,8 +145,32 @@ export type ShortcutOverrides = Partial<Record<ShortcutAction, string>>
 const MOD_NAMES = new Set(['ctrl', 'control', 'cmd', 'command', 'meta', '⌘', 'win', 'super'])
 const SHIFT_NAMES = new Set(['shift', '⇧'])
 const ALT_NAMES = new Set(['alt', 'option', '⌥'])
-/** 允许的主键：单个字母/数字，或 F1–F24。其余（多字符、标点串）一律不认，宁可报出来 */
+/** 允许的主键：单个字母/数字，或 F1–F24。其余（多字符、标点串）一律走下面的 NAMED_KEYS，认不出就不认 */
 const KEY_RE = /^(?:[a-z0-9]|f(?:[1-9]|1[0-9]|2[0-4]))$/
+
+/**
+ * 单字符键与 F 键之外的一小撮命名主键 → 规范名。
+ *
+ * 只有格里对齐用得到（`Ctrl+Alt+←` / `Home` / `→`）：方向键与 Home 的 `event.key`
+ * 是 `ArrowLeft` / `Home` 这种词，单字符正则收不下。**只收这几个**，且**不收 Tab /
+ * Enter / Escape** —— 那些是编辑器手感（跨格移动、分段、收起复选），不属于可配置动作。
+ */
+const NAMED_KEYS: Record<string, string> = {
+  left: 'arrowleft',
+  arrowleft: 'arrowleft',
+  '←': 'arrowleft',
+  right: 'arrowright',
+  arrowright: 'arrowright',
+  '→': 'arrowright',
+  home: 'home',
+}
+
+/** 判重与提示文案里这几个键的写法（`comboLabel` 用）—— 方向键画箭头，Home 照键盘上的写法 */
+const KEY_LABELS: Record<string, string> = {
+  arrowleft: '←',
+  arrowright: '→',
+  home: 'Home',
+}
 
 /**
  * 组合键字符串 → 结构。认不出来返回 `null`（调用方据此保留默认值 / 提示）。
@@ -108,8 +182,10 @@ export function parseCombo(text: string): Combo | null {
     .split('+')
     .map((part) => part.trim().toLowerCase())
     .filter((part) => part !== '')
-  const key = parts[parts.length - 1]
-  if (parts.length === 0 || key === undefined || !KEY_RE.test(key)) return null
+  const raw = parts[parts.length - 1]
+  if (parts.length === 0 || raw === undefined) return null
+  const key = KEY_RE.test(raw) ? raw : NAMED_KEYS[raw]
+  if (key === undefined) return null
   const combo: Combo = { mod: false, shift: false, alt: false, key }
   for (const part of parts.slice(0, -1)) {
     if (MOD_NAMES.has(part)) combo.mod = true
@@ -129,7 +205,7 @@ export function comboLabel(combo: Combo): string {
   if (combo.mod) parts.push('Ctrl')
   if (combo.shift) parts.push('Shift')
   if (combo.alt) parts.push('Alt')
-  parts.push(combo.key.toUpperCase())
+  parts.push(KEY_LABELS[combo.key] ?? combo.key.toUpperCase())
   return parts.join('+')
 }
 

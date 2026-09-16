@@ -13,6 +13,8 @@
  *   6. 切文件模板：页数变了、插入符与选区都按坐标找回、文字没丢；
  *   7. W6：功能区四页高度一致、自定义快捷键表（改绑 / 旧键失效 / 未知动作名）、F4 重复上一步、
  *      顶栏文件名（导出名 = 文件名 + .docx）、`::editor` 与顶栏两个开关的双向同步。
+ *   8. W9：追加的 20 个 `Ctrl+Alt+…` 组合键（颜色 / 修订 / 段落样式 / 特殊空格 / 分节分页 /
+ *      格内两组对齐），含两条失败反馈（光标不在格内、没有修订）。
  *
  * 每一步都同时看两边：DOM 上看到了什么，模型里记下了什么。只看 DOM 会漏掉
  * 「界面改了、导出没改」，只看模型会漏掉「模型改了、界面没跟上」。
@@ -531,7 +533,7 @@ try {
 
   await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
   await page.waitForTimeout(60)
-  await page.click('.swatch[title="标红"]')
+  await page.click('.swatch[title^="标红"]')
   await page.waitForTimeout(150)
   const colored = await getModel()
   const colorBlock = heroBlocks(colored).find((b) => textOfBlock(b).startsWith('我方'))
@@ -2797,7 +2799,7 @@ try {
   eq('颜色只剩「红」与「取消颜色」两枚', await page.locator('.panel-start .swatch').count(), 2)
   eq(
     '红色色块就是 FF0000',
-    await page.locator('.panel-start .swatch[title="标红"]').evaluate((el) => el.style.background),
+    await page.locator('.panel-start .swatch[title^="标红"]').evaluate((el) => el.style.background),
     'rgb(255, 0, 0)',
   )
   eq(
@@ -3775,6 +3777,189 @@ try {
   await fileNameBox.fill('空文档探针')
   await page.waitForTimeout(150)
   eq('content 留空时顶栏文件名仍可编辑（回传拿到新值）', (await probe())?.fileName, '空文档探针')
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== AH. 新增 20 个组合键（W9）：颜色 / 修订 / 样式 / 特殊空格 / 分节分页 / 格内对齐 ===',
+  )
+  /*
+   * 键位全在 Ctrl+Alt+… 一档（理由见 README「快捷键」的三条注意事项）。两条纪律：
+   *   · 一律按「模型里真的变了」验收 —— 只看 DOM 会漏掉「界面动了、模型没动」；
+   *   · 模型里的码点 / 块类型 / align 字段都直接读，不从界面反推。
+   * 发键用 `Control+Alt+KeyX` 这种写法（字母走 Key*、数字走 Digit*、方向键走名字），
+   * 事件真的到没到组件由断言自己证明：没到的话模型与提示条都不会变。
+   */
+  await openApp()
+  const blockWith = (model, needle) => heroBlocks(model).find((b) => textOfBlock(b).includes(needle))
+  const kindOf = async (needle) => (blockWith(await getModel(), needle) ?? {}).kind ?? null
+  const breakCounts = async () => {
+    const model = await getModel()
+    return {
+      page: model.blocks.filter((b) => b.t === 'pageBreak').length,
+      section: model.blocks.filter((b) => b.t === 'sectionBreak').length,
+    }
+  }
+  const indexOfBlockWith = async (needle) => {
+    const model = await getModel()
+    return model.blocks.findIndex((b) => b.t === 'textBlock' && textOfBlock(b).includes(needle))
+  }
+  const toastText = () =>
+    page.evaluate(() => document.querySelector('.toast')?.textContent.trim() ?? null)
+
+  // ---- AH1. 段落样式：Ctrl+Alt+1 / 8 / 0 ----
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+Digit1')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+1 → 插入符所在段落变成 h1', await kindOf('苏州市公安局'), 'h1')
+  await page.keyboard.press('Control+Alt+Digit8')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+8 → 回正文（body）', await kindOf('苏州市公安局'), 'body')
+  await page.keyboard.press('Control+Alt+Digit0')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+0 → 标题（title）', await kindOf('苏州市公安局'), 'title')
+  /*
+   * 2 / 3 这两档必须单独立断言：验收方用「把 styleH2 的参数改写成 'h1'」那条变异试过 ——
+   * 当时这一节只验了 1 / 8 / 0，那次变异**没有被抓住**（h2 / h3 只被「键位能命中」间接覆盖，
+   * 参数对不对没人看）。参数写错正是这一节最容易犯的错，所以五档全部逐档落到 kind 上。
+   */
+  await page.keyboard.press('Control+Alt+Digit2')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+2 → 二级标题（h2）', await kindOf('苏州市公安局'), 'h2')
+  await page.keyboard.press('Control+Alt+Digit3')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+3 → 三级标题（h3）', await kindOf('苏州市公安局'), 'h3')
+  // 收尾：改回样本原本的样式，别把后面的断言建在改过的模型上
+  await page.evaluate(() => window.__wtpPaper.setBlockKind('salutation'))
+  await page.waitForTimeout(200)
+  eq('（AH1 收尾）改回样本原本的 salutation', await kindOf('苏州市公安局'), 'salutation')
+
+  // ---- AH2. 颜色：Ctrl+Alt+R 标红、Ctrl+Alt+E 取消颜色 ----
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+KeyR')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+R → 选中的两个字标红 FF0000', (await inlineWithText('我方'))?.color, 'FF0000')
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 2))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+KeyE')
+  await page.waitForTimeout(250)
+  const clearedColor = await inlineWithText('我方')
+  ok(
+    'Ctrl+Alt+E → 颜色清掉（回默认色，color 字段没了）',
+    clearedColor !== undefined && clearedColor.color === undefined,
+    JSON.stringify(clearedColor),
+  )
+
+  /*
+   * AH3 / AH4 换一张干净的页面再验：`insertSpecialSpace` 在「只有插入符」时会回退到
+   * stickyRanges（最近一次真选区，见它自己的注释）—— AH2 刚留下过一份真选区，不换页的话
+   * 空格会插到那份旧选区上，而不是插入符处。这条回退是**既有**行为（工具栏下拉那条路的兜底），
+   * W9 没有改它，所以这里按「干净页面 + 插入符」这条路来验。
+   */
+  await openApp()
+
+  // ---- AH3. 特殊空格：Ctrl+Alt+X / C / V → 码点 2003 / 2002 / 2005（模型里读）----
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+KeyX')
+  await page.waitForTimeout(200)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Alt+KeyC')
+  await page.waitForTimeout(200)
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Alt+KeyV')
+  await page.waitForTimeout(200)
+  eq(
+    'Ctrl+Alt+X / C / V 依次插进模型的码点是 2003 / 2002 / 2005',
+    Array.from(textOfBlock(blockWith(await getModel(), '苏州市公安局')))
+      .slice(-3)
+      .map((ch) => ch.codePointAt(0).toString(16))
+      .join(','),
+    '2003,2002,2005',
+  )
+
+  // ---- AH4. 分节符 / 分页符：Ctrl+Alt+B / N（落在插入符所在段落之后）----
+  const breaksBeforeAH4 = await breakCounts()
+  const anchorIndexAH4 = await indexOfBlockWith('苏州市公安局')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+KeyN')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+N → 模型里多一个分页符', (await breakCounts()).page, breaksBeforeAH4.page + 1)
+  eq('分页符就插在插入符所在段落之后', (await getModel()).blocks[anchorIndexAH4 + 1]?.t, 'pageBreak')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  await page.keyboard.press('Control+Alt+KeyB')
+  await page.waitForTimeout(250)
+  const afterBreaksAH4 = await getModel()
+  eq('Ctrl+Alt+B → 模型里多一个分节符', (await breakCounts()).section, breaksBeforeAH4.section + 1)
+  eq('分节符也插在插入符所在段落之后', afterBreaksAH4.blocks[anchorIndexAH4 + 1]?.t, 'sectionBreak')
+  eq('先插的分页符被挤到它后面（两枚都在）', afterBreaksAH4.blocks[anchorIndexAH4 + 2]?.t, 'pageBreak')
+
+  // ---- AH5. 格内两组对齐：Ctrl+Alt+H / J / K 与 Ctrl+Alt+← / Home / → ----
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  eq(
+    '（前置）光标在 body 格里、水平还没有覆盖（跟样式的两端对齐）',
+    cellAlign(await modelTable(), 2, 0)?.h,
+    undefined,
+  )
+  await page.keyboard.press('Control+Alt+KeyH')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+H → 光标那一格 align.h = left', cellAlign(await modelTable(), 2, 0)?.h, 'left')
+  await page.keyboard.press('Control+Alt+KeyJ')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+J → align.h = center', cellAlign(await modelTable(), 2, 0)?.h, 'center')
+  await page.keyboard.press('Control+Alt+KeyK')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+K → align.h = right', cellAlign(await modelTable(), 2, 0)?.h, 'right')
+  // 垂直那三档：先按 →（格底）把覆盖写上去，再按 ← / Home —— 这样每一按都真的改到模型
+  // （格内垂直缺省就是 top，一上来按 ← 属于「再按同一个生效值且没有覆盖可清」的空转）
+  await page.keyboard.press('Control+Alt+ArrowRight')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+→ → align.v = bottom', cellAlign(await modelTable(), 2, 0)?.v, 'bottom')
+  await page.keyboard.press('Control+Alt+ArrowLeft')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+← → align.v = top', cellAlign(await modelTable(), 2, 0)?.v, 'top')
+  await page.keyboard.press('Control+Alt+Home')
+  await page.waitForTimeout(250)
+  eq('Ctrl+Alt+Home → align.v = middle', cellAlign(await modelTable(), 2, 0)?.v, 'middle')
+  await checkNoOverflow('AH5 格里对齐后')
+
+  // ---- AH6. 失败反馈：光标不在格内 / 没有修订，都只提示、不动模型 ----
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  const outsideCellBefore = JSON.stringify(await getModel())
+  await page.keyboard.press('Control+Alt+KeyH')
+  await page.waitForTimeout(250)
+  eq('光标不在格内时 Ctrl+Alt+H 一字不改模型', JSON.stringify(await getModel()), outsideCellBefore)
+  eq('光标不在格内时弹「请先把光标放进表格的格子里」', await toastText(), '请先把光标放进表格的格子里')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Alt+ArrowLeft')
+  await page.waitForTimeout(250)
+  eq('光标不在格内时 Ctrl+Alt+← 一字不改模型', JSON.stringify(await getModel()), outsideCellBefore)
+  eq(
+    '光标不在格内时 Ctrl+Alt+← 也弹那句话（新键没抢既有手感）',
+    await toastText(),
+    '请先把光标放进表格的格子里',
+  )
+
+  await openApp()
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.waitForTimeout(80)
+  const noRevisionBefore = JSON.stringify(await getModel())
+  await page.keyboard.press('Control+Alt+KeyA')
+  await page.waitForTimeout(250)
+  eq('没有修订时 Ctrl+Alt+A 一字不改模型', JSON.stringify(await getModel()), noRevisionBefore)
+  eq('没有修订时 Ctrl+Alt+A 弹「这里没有可以接受的修订」', await toastText(), '这里没有可以接受的修订')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
+  await page.keyboard.press('Control+Alt+KeyD')
+  await page.waitForTimeout(250)
+  eq('没有修订时 Ctrl+Alt+D 一字不改模型', JSON.stringify(await getModel()), noRevisionBefore)
+  eq('没有修订时 Ctrl+Alt+D 弹「这里没有可以拒绝的修订」', await toastText(), '这里没有可以拒绝的修订')
 } finally {
   await browser?.close()
   await server.close()
@@ -3806,5 +3991,8 @@ console.log(
     '批量对齐与批量样式只改选中的格且一步撤销退整批、对齐不改页数、表头与附注行恒一行高）；' +
     'W8：组件打包（template prop 决定版心几何与量测行数、fileName prop 决定顶栏与导出名、author prop ' +
     '决定批注作者、update:fileName / update:author / update:template 回传、save_md 与 ctrl+S 一致且 ' +
-    'preventDefault、save_docx 事件发出、content 留空不报错）。',
+    'preventDefault、save_docx 事件发出、content 留空不报错）；' +
+    'W9：追加的 20 个 Ctrl+Alt+… 组合键（段落样式 1/8/0、标红与取消颜色、三种特殊空格的码点 ' +
+    '2003/2002/2005、分节符与分页符落在插入符所在段落之后、格内两组对齐 H/J/K 与 ←/Home/→ 写进模型 ' +
+    'align 字段、光标不在格内与没有修订时都只弹提示条且一字不改模型）。',
 )

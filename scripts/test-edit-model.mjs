@@ -40,6 +40,7 @@ import {
   cellsInRect,
   cellsInRects,
   cloneDoc,
+  comboLabel,
   commentScopes,
   containerLength,
   contentBoxPx,
@@ -2006,8 +2007,33 @@ console.log('\n=== 27. 快捷键表：解析 / 匹配 / 覆盖 / 冲突（W6）=
   const f4 = parseCombo(DEFAULT_SHORTCUTS.repeat)
   eq('F4 命中', matchShortcut(ev('F4', { code: 'F4' }), f4), true)
 
-  // ---- 默认表：九个动作都在，且与既有硬编码逐条对齐 ----
-  eq('动作集有九个', SHORTCUT_ACTIONS.length, 9)
+  // ---- 命名主键（W9）：方向键与 Home 用名字或箭头写都认，标签显示成箭头 ----
+  const altLeft = parseCombo(DEFAULT_SHORTCUTS.cellAlignTop)
+  eq(
+    'Ctrl+Alt+← / Left / arrowleft 是同一个',
+    [
+      parseCombo('Ctrl+Alt+←'),
+      parseCombo('Ctrl+Alt+Left'),
+      parseCombo('Ctrl+Alt+arrowleft'),
+    ]
+      .map((combo) => JSON.stringify(combo))
+      .join('|'),
+    `${JSON.stringify(parseCombo('Ctrl+Alt+Left'))}|${JSON.stringify(parseCombo('Ctrl+Alt+Left'))}|${JSON.stringify(parseCombo('Ctrl+Alt+Left'))}`,
+  )
+  eq(
+    'Ctrl+Alt+← 命中 ArrowLeft 事件',
+    matchShortcut(ev('ArrowLeft', { code: 'ArrowLeft', ctrl: true, alt: true }), altLeft),
+    true,
+  )
+  eq('裸 ArrowLeft 不命中（修饰键逐项严格比对）', matchShortcut(ev('ArrowLeft'), altLeft), false)
+  eq(
+    '标签里方向键显示成箭头',
+    comboLabel(parseCombo(DEFAULT_SHORTCUTS.cellAlignMiddle)),
+    'Ctrl+Alt+Home',
+  )
+
+  // ---- 默认表：29 个动作（W6 的九个 + W9 追加的二十个）都在，且与默认表逐条对齐 ----
+  eq('动作集有 29 个', SHORTCUT_ACTIONS.length, 29)
   const table = resolveShortcuts()
   eq(
     '默认表逐条对齐',
@@ -2247,9 +2273,23 @@ console.log('\n=== 30. 默认快捷键表落在一个可直接手改的 json 上
     JSON.stringify(resolveShortcuts()),
   )
   ok(
-    '默认表里九个动作都绑上了键',
+    '默认表里 29 个动作都绑上了键',
     SHORTCUT_ACTIONS.every((action) => resolveShortcuts()[action] !== null),
     SHORTCUT_ACTIONS.filter((action) => resolveShortcuts()[action] === null).join(','),
+  )
+  /*
+   * W9 的护栏：手动往 json 里排 29 个键位，最容易犯的错就是两个动作写成同一个组合键 ——
+   * resolveShortcuts 会按「先到先得」把后到的解绑（默认表就静默少一个键），所以这里
+   * 把两件事一起钉住：每个动作都绑上了键，且 29 个组合键的标签两两不同。
+   */
+  const defaultLabels = SHORTCUT_ACTIONS.map((action) => {
+    const combo = resolveShortcuts()[action]
+    return combo ? comboLabel(combo) : `未绑定:${action}`
+  })
+  eq(
+    '默认表 29 个动作两两不冲突（都有键、标签互不相同）',
+    `${defaultLabels.filter((label) => !label.startsWith('未绑定')).length} 个有键 / ${new Set(defaultLabels).size} 个不同标签`,
+    '29 个有键 / 29 个不同标签',
   )
 }
 
