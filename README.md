@@ -39,7 +39,7 @@ props：
 | `fileName` | `string`（必填） | 顶栏那一行的文件名。导出 docx 的名字 = 它 + `.docx`（空名兜底「未命名」，已带 `.docx` 不叠） |
 | `author` | `string`（必填） | 修订与批注的作者名 |
 | `template` | `string` | 文件模板 key（`DOC_TEMPLATES` 里的一项）；留空 = 第一套 |
-| `shortcuts` | `ShortcutOverrides` | 偏好快捷键表，只写要改的动作（见「快捷键」）；留空 = 默认表 |
+| `shortcuts` | `ShortcutOverrides` | 偏好快捷键表，只写要改的动作（见「快捷键」）；留空 = `src/lib/edit/shortcuts.json` 那份默认表 |
 | `editable` | `boolean` | 打开编辑层，默认 `true`。**这一项是 W8 加的**（issue 的清单里没有）：组件总得有个办法表达「只读预览」，demo 的源码视图靠它 |
 
 emits：
@@ -261,7 +261,14 @@ demo 的样本文档长度是刻意留够的：两套模板的版心高差 22mm�
 `Enter`（回车分段，格内 `Shift+Enter` 插软换行）、`Tab` 与方向键（格内跨格移动）以及 `ctrl+P`
 （交给浏览器打印）**不是可配置动作**，行为见下文各节。
 
-**这张表可以整表覆盖**：给组件传 `shortcuts`（`{ bold: 'Ctrl+Shift+B', … }`），只写要改的动作，其余留空即用默认。
+**默认表落在一个可以直接手改的 json 文件上**：`src/lib/edit/shortcuts.json`。它就是上面那张表的原样映射
+（`{ "bold": "Ctrl+B", … }`），是默认值的**唯一真相源** —— 改这个文件，组件「不传 `shortcuts`」时的行为就跟着变；
+`npm run dev` 里改完会自动重载。上面那张表是**这份 json 当前内容的镜像**（改 json 时顺手同步这一节）。
+
+它同时就是 `shortcuts` prop 的默认值：**这张表可以整表覆盖** —— 给组件传 `shortcuts`
+（`{ bold: 'Ctrl+Shift+B', … }`），只写要改的动作，其余留空即用 json 里的默认。
+使用方想换一整套键，把 `src/lib/edit/shortcuts.json` 复制过去改好、整份传给 prop 即可
+（`resolveJsonModule` 已开，`import myShortcuts from './my-shortcuts.json'` 直接可传）。
 宽容解析：大小写不敏感，`Cmd` / `Meta` / `⌘` / `Win` 一律归一到「修饰键」（= `ctrlKey || metaKey`），
 数字键同时比 `event.key` 与 `event.code`（中文输入法或非美式布局下 `alt+4` 的 `key` 可能不是数字）。
 两条边界：**未知动作名忽略 + 一句 `console.warn`，绝不悄悄改默认表**（写错成 `bolld` 时 `ctrl+B` 仍要加粗）；

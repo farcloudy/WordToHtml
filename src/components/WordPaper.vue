@@ -38,6 +38,7 @@ import type { OutlineEntry } from '../lib/edit/outline'
 import { findMatches, replaceMatches, validateQuery } from '../lib/edit/search'
 import type { Match, SearchOptions, SearchScope } from '../lib/edit/search'
 import {
+  DEFAULT_SHORTCUTS,
   SHORTCUT_ACTIONS,
   matchShortcut,
   resolveShortcuts,
@@ -163,10 +164,20 @@ const props = withDefaults(
     editable?: boolean
     /** 修订模式：新增标 w:ins，删除不真删、标成 w:del 留在原处 */
     trackChanges?: boolean
-    /** 自定义快捷键表：只写要改的动作（见 lib/edit/shortcuts.ts），留空即用默认表 */
+    /**
+     * 自定义快捷键表：只写要改的动作，留空即用默认表 ——
+     * 默认值就是 `lib/edit/shortcuts.json` 那份文件（见 lib/edit/shortcuts.ts）。
+     * 写成工厂：对象型默认值在 Vue 里本来就该按实例现造，免得把同一个对象发给所有实例。
+     */
     shortcuts?: ShortcutOverrides
   }>(),
-  { source: '', author: '管理员', editable: false, trackChanges: false, shortcuts: undefined },
+  {
+    source: '',
+    author: '管理员',
+    editable: false,
+    trackChanges: false,
+    shortcuts: () => ({ ...DEFAULT_SHORTCUTS }),
+  },
 )
 
 const emit = defineEmits<{

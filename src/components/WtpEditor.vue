@@ -26,6 +26,7 @@ import type { EditorSelection } from '../lib/edit/model'
 import type { OutlineEntry } from '../lib/edit/outline'
 import type { SearchOptions, SearchScope } from '../lib/edit/search'
 import type { ShortcutOverrides } from '../lib/edit/shortcuts'
+import { DEFAULT_SHORTCUTS } from '../lib/edit/shortcuts'
 
 const props = withDefaults(
   defineProps<{
@@ -37,7 +38,7 @@ const props = withDefaults(
     author: string
     /** 文件模板 key（DOC_TEMPLATES 里的一项），留空即第一套 */
     template?: string
-    /** 偏好快捷键表：只写要改的动作（见 lib/edit/shortcuts.ts），留空即默认表 */
+    /** 偏好快捷键表：只写要改的动作，留空即默认表（默认值 = `lib/edit/shortcuts.json` 那份文件） */
     shortcuts?: ShortcutOverrides
     /**
      * 打开编辑层。留空即打开。
@@ -46,7 +47,7 @@ const props = withDefaults(
      */
     editable?: boolean
   }>(),
-  { content: '', template: undefined, shortcuts: undefined, editable: true },
+  { content: '', template: undefined, shortcuts: () => ({ ...DEFAULT_SHORTCUTS }), editable: true },
 )
 
 const emit = defineEmits<{

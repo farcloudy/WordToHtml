@@ -9,9 +9,12 @@
  *   · 金额格式化（千分位 + 两位小数）的取舍；
  *   · 修订模式下删除不真删，而是标成 del；接受 / 拒绝修订（ins 与 del 的四种组合）；
  *   · 特殊空格（U+2003/2002/2005）能原样写进 docx 的 document.xml。
+ *   · 默认快捷键表与 lib/edit/shortcuts.json 的一致性（那份 json 是 `shortcuts` prop 的默认值）。
  *
  * 用法：node scripts/test-edit-model.mjs   （需先 npm run build:lib）
  */
+
+import { readFileSync } from 'node:fs'
 
 import JSZip from 'jszip'
 
@@ -2215,6 +2218,42 @@ console.log('\n=== 29. 表头 / 附注行恒「最小一行」：CSS 侧的规�
   )
 }
 
+console.log('\n=== 30. 默认快捷键表落在一个可直接手改的 json 上 ===')
+{
+  // 默认表的唯一真相源是 src/lib/edit/shortcuts.json（它是 `shortcuts` prop 的默认值）。
+  // 这里盯四件事：json 与代码里的常量一致、json 里每个值都解析得出来、
+  // 键集合与动作集严丝合缝，以及「整份 json 当 prop 传」与「不传」完全等价 ——
+  // 否则「json 就是 prop 的默认值」这句话在语义上就是不成立的。
+  const jsonUrl = new URL('../src/lib/edit/shortcuts.json', import.meta.url)
+  const raw = JSON.parse(readFileSync(jsonUrl, 'utf8'))
+  eq(
+    'json 的键集合 = 动作集（无遗漏、无多余）',
+    Object.keys(raw).sort().join(','),
+    [...SHORTCUT_ACTIONS].sort().join(','),
+  )
+  ok(
+    'DEFAULT_SHORTCUTS 逐键等于 json 里的值',
+    SHORTCUT_ACTIONS.every((action) => DEFAULT_SHORTCUTS[action] === raw[action]),
+    JSON.stringify(raw),
+  )
+  ok(
+    'json 里的每个组合键都解析得出来（手改出坏值不会静默失效）',
+    SHORTCUT_ACTIONS.every((action) => parseCombo(raw[action]) !== null),
+    JSON.stringify(raw),
+  )
+  eq(
+    '整份 json 当 prop 传 = 不传（默认表就是它）',
+    JSON.stringify(resolveShortcuts(raw)),
+    JSON.stringify(resolveShortcuts()),
+  )
+  ok(
+    '默认表里九个动作都绑上了键',
+    SHORTCUT_ACTIONS.every((action) => resolveShortcuts()[action] !== null),
+    SHORTCUT_ACTIONS.filter((action) => resolveShortcuts()[action] === null).join(','),
+  )
+}
+
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
 process.exit(failed === 0 ? 0 : 1)
+
 

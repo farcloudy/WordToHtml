@@ -12,6 +12,8 @@
  *     中文输入法或非美式布局下，按数字键的 `event.key` 可能不是数字字符。
  */
 
+import defaultsFile from './shortcuts.json'
+
 /** 动作名。**顺序即冲突时的优先序**（先到先得），所以不要随手调整 */
 export const SHORTCUT_ACTIONS = [
   'bold',
@@ -27,17 +29,52 @@ export const SHORTCUT_ACTIONS = [
 
 export type ShortcutAction = (typeof SHORTCUT_ACTIONS)[number]
 
-/** 默认表：与「这批键硬编码在 onKeydown 里」时逐条对齐 */
+/**
+ * 默认表。**唯一真相源是旁边的 `shortcuts.json`** —— 那是「动作名 → 组合键字符串」的纯映射，
+ * 可以直接手改（`npm run dev` 里改完会自己重载）；使用方想换一套键，把那个文件复制过去改好、
+ * 当 `shortcuts` prop 传进来即可 —— 下面这个常量**本身就是那个 prop 的默认值**。
+ *
+ * 这里刻意逐个键写出、而不是整表展开：
+ *   · json 里**拼错动作名**（写成 `bolld`）时，`vue-tsc` 会直接报「该属性不存在」——
+ *     不会让一个错键悄悄变成「少绑一个动作」；
+ *   · 漏了动作同理（`Record<ShortcutAction, string>` 会要求补齐）。
+ */
 export const DEFAULT_SHORTCUTS: Record<ShortcutAction, string> = {
-  bold: 'Ctrl+B',
-  underline: 'Ctrl+U',
-  trackChanges: 'Ctrl+Shift+E',
-  find: 'Ctrl+F',
-  replace: 'Ctrl+G',
-  undo: 'Ctrl+Z',
-  redo: 'Ctrl+Y',
-  formatAmount: 'Alt+4',
-  repeat: 'F4',
+  bold: defaultsFile.bold,
+  underline: defaultsFile.underline,
+  trackChanges: defaultsFile.trackChanges,
+  find: defaultsFile.find,
+  replace: defaultsFile.replace,
+  undo: defaultsFile.undo,
+  redo: defaultsFile.redo,
+  formatAmount: defaultsFile.formatAmount,
+  repeat: defaultsFile.repeat,
+}
+
+/*
+ * 手改 json 的两道护栏，模块加载时各跑一次（都在控制台留一句话，不抛异常、不阻断启动）：
+ *   · json 里有认不出的动作名 → 报出来（上面那种写法只挡得住「拼错」这一半，
+ *     多写一个 `_comment` 之类的键另一半就漏过去了）；
+ *   · 组合键字符串认不出来 → 报出来，否则那个动作会静默变成「按什么都没反应」。
+ * 两道都不改默认表本身：坏值就是坏值，报出来比悄悄兜底好查。
+ *
+ * ⚠️ 位置有讲究：**必须落在 `parseCombo` 与它那批 `const`（KEY_RE / MOD_NAMES…）之后**。
+ * 放到文件开头会踩 const 的暂时性死区 —— 打包后首屏 import 就抛
+ * `Cannot read properties of undefined (reading 'test')`（这条实测踩过）。
+ */
+function warnAboutDefaultsFile(): void {
+  for (const name of Object.keys(defaultsFile)) {
+    if (!(SHORTCUT_ACTIONS as readonly string[]).includes(name)) {
+      console.warn(`[WordToHtml] shortcuts.json 里有未知动作名「${name}」，已忽略`)
+    }
+  }
+  for (const action of SHORTCUT_ACTIONS) {
+    if (!parseCombo(DEFAULT_SHORTCUTS[action])) {
+      console.warn(
+        `[WordToHtml] shortcuts.json 里「${action}」的组合键「${DEFAULT_SHORTCUTS[action]}」认不出来，该动作不会绑定任何键`,
+      )
+    }
+  }
 }
 
 export interface Combo {
@@ -82,6 +119,9 @@ export function parseCombo(text: string): Combo | null {
   }
   return combo
 }
+
+/** 两道护栏在这里落地 —— 位置的理由见函数自己的注释 */
+warnAboutDefaultsFile()
 
 /** 组合键的规范签名（修饰键顺序固定）。既用于判重，也用于提示文案 */
 export function comboLabel(combo: Combo): string {

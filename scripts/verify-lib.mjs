@@ -7,6 +7,7 @@
  *   2. 导出了对外组件 `WtpEditor`（还有内部的 `WordPaper`）；
  *   3. 样式产物存在且非空 —— 组件的 `<style scoped>` 得跟着库一起发出去，
  *      否则使用方拿到的是一堆没有样式的 DOM。
+ *   4. 默认快捷键表仍等于仓库里的 `src/lib/edit/shortcuts.json`（它同时是 `shortcuts` prop 的默认值）。
  * 另按外部依赖再确认一条：`vue` 是 external（产物里 import 它，而不是打进一份自己的运行时）。
  *
  * 用法：npm run verify:lib（先 build:lib；package.json 里就是这么串的）
@@ -74,6 +75,42 @@ if (mod) {
     '原有的纯函数导出仍在（parseMd / toMd）',
     typeof mod.parseMd === 'function' && typeof mod.toMd === 'function',
     `${typeof mod.parseMd}/${typeof mod.toMd}`,
+  )
+
+  /*
+   * 默认快捷键表：唯一真相源是仓库里的 `src/lib/edit/shortcuts.json`，而且它**就是
+   * `shortcuts` prop 的默认值**。两件事在打包后都得还成立 —— 否则使用方手里的默认表
+   * 与仓库里那份「可以直接手改」的文件会悄悄脱钩。
+   * 比对时按键名排序，免得因为 json 里换个书写顺序就白红一条。
+   */
+  const shortcutsJsonPath = join(root, 'src', 'lib', 'edit', 'shortcuts.json')
+  const shortcutsJson = existsSync(shortcutsJsonPath)
+    ? JSON.parse(readFileSync(shortcutsJsonPath, 'utf8'))
+    : {}
+  const sameTable = (a, b) =>
+    a !== undefined &&
+    b !== undefined &&
+    JSON.stringify(Object.keys(a).sort().map((k) => [k, a[k]])) ===
+      JSON.stringify(Object.keys(b).sort().map((k) => [k, b[k]]))
+  ok(
+    'DEFAULT_SHORTCUTS 逐键等于 src/lib/edit/shortcuts.json',
+    sameTable(mod.DEFAULT_SHORTCUTS, shortcutsJson),
+    `${JSON.stringify(mod.DEFAULT_SHORTCUTS)}`,
+  )
+  const propDefaultOf = (component) => {
+    const def = component?.props?.shortcuts?.default
+    if (def === undefined) return undefined
+    return typeof def === 'function' ? def() : def
+  }
+  ok(
+    'WordPaper 的 shortcuts prop 默认值 = 那份 json',
+    sameTable(propDefaultOf(mod.WordPaper), shortcutsJson),
+    JSON.stringify(propDefaultOf(mod.WordPaper)),
+  )
+  ok(
+    'WtpEditor 的 shortcuts prop 默认值 = 那份 json',
+    sameTable(propDefaultOf(mod.WtpEditor), shortcutsJson),
+    JSON.stringify(propDefaultOf(mod.WtpEditor)),
   )
 }
 

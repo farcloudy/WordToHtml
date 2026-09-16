@@ -1,0 +1,11 @@
+{
+  "bold": "Ctrl+B",
+  "underline": "Ctrl+U",
+  "trackChanges": "Ctrl+Shift+E",
+  "find": "Ctrl+F",
+  "replace": "Ctrl+G",
+  "undo": "Ctrl+Z",
+  "redo": "Ctrl+Y",
+  "formatAmount": "Alt+4",
+  "repeat": "F4"
+}
