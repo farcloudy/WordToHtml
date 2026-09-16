@@ -9,10 +9,15 @@
  *
  * 这里同时演示「props 进 / emits 出」这条回路怎么接，以及 `content` 留空的用法。
  */
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { nextTick, onMounted, ref, shallowRef, watch } from 'vue'
 
 import WtpEditor from './components/WtpEditor.vue'
+import { replyComment } from './lib/edit/model'
+import { parseMd } from './lib/md/parse'
+import { toMd } from './lib/md/serialize'
 import { DOC_TEMPLATES } from './lib/spec'
+import { emptyDoc } from './lib/types'
+import type { DocModel } from './lib/types'
 import type { ShortcutOverrides } from './lib/edit/shortcuts'
 
 const SAMPLE = [
@@ -110,6 +115,51 @@ function shortcutsFromUrl(search: string): ShortcutOverrides | undefined {
 const emptyDemo = window.location.search.includes('empty=1')
 
 /**
+ * `?model=empty|rich|rich-md`：演示「直接给一份现成的模型」这条入口
+ * （`model` 与 `content` 二选一，`model` 优先）。
+ *
+ *   · `empty`   —— `emptyDoc()`：零块文档（载入时应被补成一个空白正文段落）；
+ *   · `rich`    —— 现造一份模型：修订带作者与时间戳、批注带作者与回复线程；
+ *   · `rich-md` —— 上面那份内容的 **md 形态**改走 `content` 通路，当 `rich` 的对照：
+ *                 md 语法里没有「修订的作者/时间戳」与「批注的回复线程」的位置，走它会被抹平。
+ *
+ * 前两个都**同时**递一份非空 `content`：模型被采纳时版面上是模型的内容，不是 SAMPLE ——
+ * 「model 优先于 content」因此在版面上看得见。
+ */
+const modelKey = (() => {
+  const hit = /(?:^|&)model=([^&]*)/.exec(window.location.search.replace(/^\?/, '&'))
+  const key = hit ? decodeURIComponent(hit[1] ?? '') : ''
+  return key === 'empty' || key === 'rich' || key === 'rich-md' ? key : ''
+})()
+
+/** 造一份「md 装不下」的模型（构造一律走 lib 既有导出，字段名不另编） */
+function richModel(): DocModel {
+  const doc = parseMd(
+    [
+      '# 模型通路演示',
+      '',
+      '这是{+新增的一句}，另有一处[[批注锚定的文字|批注内容]]。',
+    ].join('\n'),
+    { author: '李四', now: () => new Date('2026-01-02T03:04:05.000Z') },
+  )
+  // 回复线程只有模型（与 docx）有：md 里没有「回复某人」这个语法
+  const first = doc.comments[0]
+  if (first) replyComment(doc, first.id, '已核对，同意这条。', '王五', '2026-01-03T04:05:06.000Z')
+  return doc
+}
+
+const presetDoc = modelKey === 'rich' || modelKey === 'rich-md' ? richModel() : null
+
+/**
+ * 走 `model` prop 递进组件的那份模型（`?model=` 之外一律 undefined，交给 `content` 通路）。
+ * 必须 shallowRef：ref 会把整份模型深度转成响应式代理，而它是要交给编辑层直接改的
+ * 「导出的真相」—— 代理会把 `id` 之类的内部约定搅乱，也会白白拖慢每次读写。
+ */
+const modelProp = shallowRef<DocModel | undefined>(
+  modelKey === 'empty' ? emptyDoc() : modelKey === 'rich' ? (presetDoc ?? undefined) : undefined,
+)
+
+/**
  * `?template=govDoc`：把某个文件模板 key 当 **prop** 递进去（下拉那一路是受控回写，
  * 这一路验的是「初始 prop 就决定了版心几何」）。认不出的 key 交回第一套模板。
  */
@@ -123,7 +173,9 @@ const shortcutsProp = shortcutsFromUrl(window.location.search)
 
 /** edit = 直接在 A4 版面上写；source = 类 md 源码（demo 专属，不属于组件） */
 const mode = ref<'edit' | 'source'>('edit')
-const source = ref(emptyDemo ? '' : SAMPLE)
+const source = ref(
+  modelKey === 'rich-md' && presetDoc ? toMd(presetDoc) : emptyDemo ? '' : SAMPLE,
+)
 const author = ref('张三')
 const templateKey = ref(templateFromUrl)
 
@@ -146,6 +198,13 @@ const probe = {
   template: templateKey.value,
   lastSaveMd: '',
   docxCount: 0,
+  /**
+   * 验收脚本专用：把一份现造的模型整体换进版面（验「换 model 时插入符按块 id 落回来」）。
+   * 真实使用方直接改自己递给 `model` 的那份状态即可，不必这么写。
+   */
+  setModel(next: DocModel | undefined): void {
+    modelProp.value = next
+  },
 }
 
 function onUpdateFileName(value: string): void {
@@ -210,6 +269,7 @@ onMounted(() => {
   <WtpEditor
     ref="editor"
     :content="source"
+    :model="modelProp"
     :file-name="fileName"
     :author="author"
     :template="templateKey"

@@ -171,6 +171,7 @@ props：
 | prop | 类型 | 说明 |
 | --- | --- | --- |
 | `content` | `string` | 类 md 内容。**它是初始内容**：编辑过程中组件不回写（免得一个字回调一次）。留空 = 空字符串 |
+| `model` | `DocModel` | 直接给一份现成的模型。与 `content` **二选一、`model` 优先**（优先级只在 `WordPaper` 那一处 `props.model ?? parseMd(...)` 判）；md 语法表达不了的**修订作者/时间戳**与**批注的作者、回复线程**只有走它才保得住（md → 模型那一步会按 `author` prop 与当前时间重造一份） |
 | `fileName` | `string`（必填） | 顶栏那一行的文件名。导出 docx 的名字 = 它 + `.docx`（空名兜底「未命名」，已带 `.docx` 不叠） |
 | `author` | `string`（必填） | 修订与批注的作者名 |
 | `template` | `string` | 文件模板 key（`DOC_TEMPLATES` 里的一项）；留空 = 第一套 |
@@ -234,7 +235,9 @@ function onSaveMd(md: string) {
 
 demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演示这几个入口（验收脚本也走它们）：
 `?shortcuts=bold:ctrl+shift+b,formatAmount:ctrl+alt+4` 覆盖快捷键表、`?template=govDoc` 直接把模板当 prop
-递进去、`?empty=1` 演示 `content` 留空。demo 把组件回传的值（`update:*`、`save_md` 收到的 md）与
+递进去、`?empty=1` 演示 `content` 留空、`?model=empty|rich|rich-md` 演示 `model` 通路
+（`empty` = 零块模型；`rich` = 带修订作者/时间戳与批注回复线程的现造模型；`rich-md` = 同一份内容改走
+`content` 通路，当 `rich` 的对照）。demo 把组件回传的值（`update:*`、`save_md` 收到的 md）与
 `save_docx` 的次数攒在 `window.__wtpDemo` 上（`{ fileName, author, template, lastSaveMd, docxCount }`）——
 浏览器脚本/控制台可以从那里读；真实使用方直接绑自己的状态即可，不必这么写。
 

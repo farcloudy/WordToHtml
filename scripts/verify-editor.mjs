@@ -4454,6 +4454,7 @@ try {
   }
 
   await checkZeroBlockEntry('?empty=1', 'content 留空')
+  await checkZeroBlockEntry('?model=empty', 'model 给零块')
   /*
    * 版面不报错：AG5 原有的 pageerror 探针（错误输出不受任何截断保护，也是 issue 里
    * 「静默」的反面 —— 真有异常必须在这儿现形）。
@@ -4475,6 +4476,60 @@ try {
   await fileNameBox.fill('空文档探针')
   await page.waitForTimeout(150)
   eq('content 留空时顶栏文件名仍可编辑（回传拿到新值）', (await probe())?.fileName, '空文档探针')
+
+  // ---- AG6. `model` prop：与 `content` 二选一、model 优先；md 装不下的东西只有它保得住 ----
+  /*
+   * demo 的 `?model=rich` 同时递了一份**非空**的 `content`（SAMPLE），所以「版面上是模型的内容」
+   * 本身就是「model 优先于 content」的证据；`?model=rich-md` 是同一份内容改走 md，当对照 ——
+   * md 语法里没有「修订的作者/时间戳」与「批注的回复线程」的位置，走它这两样会被抹平。
+   */
+  const firstRevOf = (model) => {
+    for (const block of model.blocks) {
+      if (block.t !== 'textBlock') continue
+      const hit = block.inlines.find((inline) => inline.t === 'text' && inline.rev)
+      if (hit) return hit.rev
+    }
+    return null
+  }
+  const modelTexts = (model) =>
+    model.blocks.map((b) => (b.t === 'textBlock' ? textOfBlock(b).slice(0, 14) : `<${b.t}>`))
+
+  await openDemo('?model=rich')
+  const richModel = await getModel()
+  ok(
+    'model 优先于 content：版面上是模型的内容，demo 同时递的那份 SAMPLE 一点都没露',
+    richModel.blocks.some((b) => b.t === 'textBlock' && textOfBlock(b).includes('这是新增的一句')) &&
+      !richModel.blocks.some((b) => b.t === 'textBlock' && textOfBlock(b).includes('爱康光电')),
+    JSON.stringify(modelTexts(richModel)),
+  )
+  const richRev = firstRevOf(richModel)
+  ok(
+    'model 通路：修订带的作者与时间戳原样在（不是 author prop 与当前时间）',
+    richRev?.author === '李四' && richRev?.date === '2026-01-02T03:04:05.000Z',
+    JSON.stringify(richRev),
+  )
+  ok(
+    'model 通路：批注的作者与回复线程都在（两条，第二条挂在第一条下）',
+    richModel.comments.length === 2 &&
+      richModel.comments[0].author === '李四' &&
+      richModel.comments[1].author === '王五' &&
+      richModel.comments[1].parentId === richModel.comments[0].id,
+    JSON.stringify(richModel.comments),
+  )
+
+  await openDemo('?model=rich-md')
+  const mdModel = await getModel()
+  const mdRev = firstRevOf(mdModel)
+  ok(
+    '（对照）同一份内容走 content（md）通路：修订作者/时间戳被换成 author prop 与当前时间',
+    mdRev !== null && mdRev.author !== '李四' && mdRev.date !== '2026-01-02T03:04:05.000Z',
+    JSON.stringify(mdRev),
+  )
+  ok(
+    '（对照）走 md 通路：批注的回复线程没了（只剩一条、没有 parentId）',
+    mdModel.comments.length === 1 && mdModel.comments[0]?.parentId === undefined,
+    JSON.stringify(mdModel.comments),
+  )
 
   /* ------------------------------------------------------------------ */
   console.log(

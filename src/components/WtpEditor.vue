@@ -32,6 +32,13 @@ const props = withDefaults(
   defineProps<{
     /** 类 md 内容。它是**初始内容**：编辑过程中组件不回写，要最新内容用组件暴露的 toMd() / getModel() */
     content?: string
+    /**
+     * 直接给一份现成的文档模型。与 `content` 二选一，**`model` 优先**
+     *（优先级判断只在 `WordPaper` 那一处 `props.model ?? parseMd(...)`，这里不重复判）。
+     * md 语法装不下的东西 —— 修订的作者/时间戳、批注的作者与回复线程 —— 只有走这条路才保得住
+     *（md → 模型的那一步会把它们按 `author` prop 与当前时间重造一份）。
+     */
+    model?: DocModel
     /** 文件名（顶栏那一行）。导出 docx 用的名字 = 它 + `.docx` */
     fileName: string
     /** 修订与批注的作者名 */
@@ -47,7 +54,13 @@ const props = withDefaults(
      */
     editable?: boolean
   }>(),
-  { content: '', template: undefined, shortcuts: () => ({ ...DEFAULT_SHORTCUTS }), editable: true },
+  {
+    content: '',
+    model: undefined,
+    template: undefined,
+    shortcuts: () => ({ ...DEFAULT_SHORTCUTS }),
+    editable: true,
+  },
 )
 
 const emit = defineEmits<{
@@ -1345,6 +1358,7 @@ defineExpose({
           <WordPaper
             ref="paper"
             :source="content"
+            :model="model"
             :spec="specOverride"
             :author="authorValue"
             :editable="editable"
