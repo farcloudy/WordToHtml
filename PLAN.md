@@ -1425,4 +1425,17 @@ props / emits / `update:*`；**另建一张独立 html 单独挂载组件**（�
 把 `save_md` 载荷换成 JSON）都被抓住并已还原；另跑 `npm run build`（demo 站）退出码 0。
 **两处非阻断项**已记入第 8 节第 12 条。
 
+**补记（2026-09-16，提交 `ed18fc3`，用户要求）**：默认快捷键表落成一个**可以直接手改的 json**
+`src/lib/edit/shortcuts.json`（默认值的唯一真相源），并**成为 `shortcuts` prop 的默认值**
+（`withDefaults` 里写成工厂 `() => ({ ...DEFAULT_SHORTCUTS })` —— 对象型默认值 Vue 要求按实例现造，
+裸对象过不了 `vue-tsc` 的 `InferDefault`）。`shortcuts.ts` 刻意**逐个键**从 json 取值：
+拼错动作名或漏键都会在 `vue-tsc` 阶段报错，不会退化成「少绑一个动作」。
+⚠️ **坑（记下来别再踩）**：手改 json 的加载期护栏（未知动作名 / 坏组合键各 warn 一句）**不能写在文件顶层** ——
+它跑在 `const KEY_RE` 初始化之前，踩 const 的暂时性死区，**打包后一 import 就抛
+`Cannot read properties of undefined (reading 'test')`**；`build:lib` 成功并不代表产物能用，
+只有真 import 一次（`verify:lib` 就是干这个的）才发现。断言：
+`test-edit-model` 666 → 671（第 30 节：json 键集合 = 动作集、逐键等于常量、每个值可解析、
+**整份 json 当 prop 传 = 不传**、九个动作都有绑定）；`verify:lib` 新增 3 条（产物常量 = 磁盘 json、
+两个组件的 prop 默认值 = 那份 json，按名排序比对）。
+
 **至此 `issues/20260915-2.md` 的 4 组 10 条全部落地**（W6 样式 + 操作 1–4；W7 表格 1–2；W8 组件打包）。
