@@ -3852,12 +3852,11 @@ try {
   )
 
   /*
-   * AH3 / AH4 换一张干净的页面再验：`insertSpecialSpace` 在「只有插入符」时会回退到
-   * stickyRanges（最近一次真选区，见它自己的注释）—— AH2 刚留下过一份真选区，不换页的话
-   * 空格会插到那份旧选区上，而不是插入符处。这条回退是**既有**行为（工具栏下拉那条路的兜底），
-   * W9 没有改它，所以这里按「干净页面 + 插入符」这条路来验。
+   * AH3 刻意**不换页**：AH2 刚留下过一份真选区（'我方'），正好当一份「过期选区」来用 ——
+   * `insertSpecialSpace` 现在只认实时插入符，空格必须落在插入符那一处，而不是那份旧选区上
+   * （issues/20260916-1 第 3 条）。旧写法把 stickyRanges 排在插入符之前，这一节因此必须
+   * 换一张干净的页面才验得成 —— 换页那一步去掉，这一节本身就成了回归断言。
    */
-  await openApp()
 
   // ---- AH3. 特殊空格：Ctrl+Alt+X / C / V → 码点 2003 / 2002 / 2005（模型里读）----
   await page.evaluate(() => window.__wtpTest.caretAtEndOf('苏州市公安局'))
@@ -3877,6 +3876,33 @@ try {
       .map((ch) => ch.codePointAt(0).toString(16))
       .join(','),
     '2003,2002,2005',
+  )
+
+  /*
+   * AH3b. 用户报的原始场景（issues/20260916-1 第 3 条）：先在样表右上角那一格里留下真选区，
+   * 再把插入符点到正文段落末尾按空格键 —— 空格必须落在**插入符**处，那一格一个字都不许动。
+   */
+  await openApp('表格')
+  const staleSelected = await page.evaluate(() => window.__wtpTest.selectIn('账面原值', 0, 2))
+  await page.waitForTimeout(150)
+  const staleBefore = await modelTable()
+  const staleRow = staleBefore?.rows.findIndex((_r, i) => cellText(staleBefore, i, 2) === '账面原值') ?? -1
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(150)
+  await page.keyboard.press('Control+Alt+KeyX')
+  await page.waitForTimeout(250)
+  const staleAfter = await modelTable()
+  const staleParagraph = textOfBlock(blockWith(await getModel(), '我方于2026年9月1日'))
+  ok('（AH3b 前置）选中的是那一格里的两个字', staleSelected === '账面', JSON.stringify(staleSelected))
+  ok(
+    '过期选区不抢落点：空格进的是正文插入符处',
+    staleParagraph.endsWith('\u2003'),
+    JSON.stringify(staleParagraph.slice(-8)),
+  )
+  eq(
+    '过期选区不抢落点：表格那一格一字未动',
+    staleRow >= 0 ? cellText(staleAfter, staleRow, 2) : null,
+    '账面原值',
   )
 
   // ---- AH4. 分节符 / 分页符：Ctrl+Alt+B / N（落在插入符所在段落之后）----

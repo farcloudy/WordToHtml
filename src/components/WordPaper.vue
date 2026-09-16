@@ -2058,23 +2058,43 @@ function insertSpecialSpace(kind: 'em' | 'en' | 'quarterEm'): boolean {
   const rootEl = root.value
   if (!rootEl) return false
 
-  // 焦点被工具栏下拉拿走时实时选区可能已经收起来了，回退到最近记录的选区／落点
+  /*
+   * 落点的优先序：**实时选区 → 实时插入符 → 最近一次记录的选区 → 最近一次记录落点**。
+   * 键盘路径（ctrl+alt+X/C/V）与「插入」页那三枚按钮（都是 @mousedown.prevent，焦点不离正文）
+   * 永远落在前两项上；后两项只服务「焦点真的离开正文」的入口。
+   *
+   * 旧写法把 stickyRanges 排在插入符**之前**，于是「先在表格某格里选过字、再把插入符点到
+   * 正文别处按这三枚键」时，空格全插进那个格子里（2026-09-16 用户实测，issues/20260916-1 第 3 条）。
+   */
   const live = selectedRanges(rootEl)
-  const target = live.length > 0 ? live[0] : stickyRanges[0]
-  const caret = caretPoint()
-  const blockId = target?.blockId ?? caret?.blockId
-  if (blockId === undefined) return false
-  const container = findContainer(doc.value, blockId)
+  const caret = selectionRange()?.start ?? null
+  const sticky = stickyRanges[0]
+  const previous = lastCaret
+  const target =
+    live[0] !== undefined
+      ? { blockId: live[0].blockId, from: live[0].from, to: live[0].to }
+      : caret !== null
+        ? { blockId: caret.blockId, from: caret.offset, to: caret.offset }
+        : sticky !== undefined
+          ? { blockId: sticky.blockId, from: sticky.from, to: sticky.to }
+          : previous !== null
+            ? { blockId: previous.blockId, from: previous.offset, to: previous.offset }
+            : null
+  if (target === null) return false
+  const container = findContainer(doc.value, target.blockId)
   if (!container) return false
 
-  const p = prefixLength(blockId)
-  const from = target ? Math.max(0, target.from - p) : Math.max(0, (caret?.offset ?? 0) - p)
-  const to = target ? Math.max(from, target.to - p) : from
+  const p = prefixLength(target.blockId)
+  const from = Math.max(0, target.from - p)
+  const to = Math.max(from, target.to - p)
   const char = SPECIAL_SPACES[kind]
 
-  pushHistory(caret)
+  pushHistory(caret ?? previous)
   replaceRange(container, from, to, [{ t: 'text', text: char }])
-  refreshLayout({ anchor: { blockId, offset: p + from + char.length }, force: true })
+  refreshLayout({
+    anchor: { blockId: target.blockId, offset: p + from + char.length },
+    force: true,
+  })
   return true
 }
 
