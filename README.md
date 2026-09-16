@@ -21,33 +21,112 @@
 ```bash
 npm install
 npm run dev        # 打开 demo：左侧写源码，右侧即时出 A4 版面，右上角导出 docx
-npm run verify     # 跑完整验收（类型检查 + Word 对账 + 分页单测 + 浏览器实测 + 页数比对）
+npm run verify     # 跑完整验收（类型检查 + 库产物 + Word 对账 + 分页单测 + 浏览器实测 + 页数比对）
 ```
 
 ## 组件用法
 
+对外就一个组件：`WtpEditor`（`src/components/WtpEditor.vue`，库里以 named export 导出）。
+**顶栏 + 功能区 + 纸张**整副外壳都在它里面 —— 批注侧栏、查找替换面板、插入表格面板、导航窗格、提示条
+也归它管。「类 md 源码」pane 与「所见即所得 / 源码」模式切换**不在**组件里（那是 demo 的事，
+见下面「插槽」）。
+
+props：
+
+| prop | 类型 | 说明 |
+| --- | --- | --- |
+| `content` | `string` | 类 md 内容。**它是初始内容**：编辑过程中组件不回写（免得一个字回调一次）。留空 = 空字符串 |
+| `fileName` | `string`（必填） | 顶栏那一行的文件名。导出 docx 的名字 = 它 + `.docx`（空名兜底「未命名」，已带 `.docx` 不叠） |
+| `author` | `string`（必填） | 修订与批注的作者名 |
+| `template` | `string` | 文件模板 key（`DOC_TEMPLATES` 里的一项）；留空 = 第一套 |
+| `shortcuts` | `ShortcutOverrides` | 偏好快捷键表，只写要改的动作（见「快捷键」）；留空 = 默认表 |
+| `editable` | `boolean` | 打开编辑层，默认 `true`。**这一项是 W8 加的**（issue 的清单里没有）：组件总得有个办法表达「只读预览」，demo 的源码视图靠它 |
+
+emits：
+
+| 事件 | 载荷 | 说明 |
+| --- | --- | --- |
+| `save_md` | `string` | 顶栏「保存」按钮或 `ctrl+S`：回传 `toMd(getModel())`。`ctrl+S` 会 `preventDefault`，不弹浏览器自己的保存对话框 |
+| `save_docx` | — | 「导出 docx」**真的触发了浏览器下载**之后发出（下载名按上面 `fileName` 的规则算） |
+| `update:fileName` / `update:author` / `update:template` | `string` | 受控回写：顶栏文件名、修订作者、文件模板改动时回传。**不接也能用**，只是使用方拿不到新值 |
+| `paginated` | `number` | 分页完成后的页数 |
+| `toast` | `string` | 一句话提示（组件自己也画提示条，这个事件只是把它报出去） |
+| `editor-flags` | `EditorFlags` | 模型里 `::editor` 解析出来的两个开关（载入 / 重建后发一次） |
+
+两个插槽（demo 就靠它们把源码 pane 与模式切换挂回同一副外壳）：
+
+- `#bar-extra`：顶栏里、文件名之后；
+- 默认插槽：纸张左侧、导航窗格之后。
+
+最小示例：
+
 ```vue
 <script setup lang="ts">
 import { ref } from 'vue'
-import WordPaper from './components/WordPaper.vue'
-import { mm } from './lib/spec'
-import type { DeepPartial, Spec } from './lib/spec'
+import { WtpEditor } from 'wordtohtml'
+import 'wordtohtml/dist-lib/wordtohtml.css'
 
-const source = ref('# 关于××的情况说明\n\n@ 苏州市公安局：\n\n……')
-const paper = ref<InstanceType<typeof WordPaper> | null>(null)
+const editor = ref<InstanceType<typeof WtpEditor> | null>(null)
+const fileName = ref('关于××的情况说明')
+const author = ref('张三')
 
-// 任何一项都能覆盖，页边距只是举例
-const spec = ref<DeepPartial<Spec>>({
-  page: { margin: { top: mm(30), right: mm(25), bottom: mm(30), left: mm(25) } },
-})
+function onSaveMd(md: string) {
+  // 存盘或交给后端；要「随时拿最新 md」也可以直接调 editor.value?.toMd()
+  console.log(md)
+}
 </script>
 
 <template>
-  <WordPaper ref="paper" :source="source" :spec="spec" author="张三" editable @paginated="n => console.log(n)" />
-  <button @click="paper?.downloadDocx('情况说明.docx')">导出 docx</button>
-  <button @click="paper?.toggleBold()">加粗</button>
+  <WtpEditor
+    ref="editor"
+    content="# 关于××的情况说明&#10;&#10;正文……"
+    :file-name="fileName"
+    :author="author"
+    @save_md="onSaveMd"
+    @save_docx="() => console.log('docx 已开始下载')"
+    @update:file-name="fileName = $event"
+    @update:author="author = $event"
+  />
 </template>
 ```
+
+三个必知的点：
+
+- **`content` 是初始内容**，编辑过程中不回写；要拿最新 md 调组件暴露的 `toMd()`（或 `getModel()`），
+  `save_md` 交出去的就是同一个字符串；
+- **`ctrl+S` 归组件管**：按它就等于点「保存」，并且拦住浏览器默认的「保存网页」；
+- 组件自带整屏高度（`height: 100vh`）与内部滚动；要嵌在别处就在外面覆盖 `height`。
+
+demo（`src/App.vue`）本身就是一份接法示例，另外用 URL 开关演示这几个入口（验收脚本也走它们）：
+`?shortcuts=bold:ctrl+shift+b,formatAmount:ctrl+alt+4` 覆盖快捷键表、`?template=govDoc` 直接把模板当 prop
+递进去、`?empty=1` 演示 `content` 留空。demo 把组件回传的值（`update:*`、`save_md` 收到的 md）与
+`save_docx` 的次数攒在 `window.__wtpDemo` 上（`{ fileName, author, template, lastSaveMd, docxCount }`）——
+浏览器脚本/控制台可以从那里读；真实使用方直接绑自己的状态即可，不必这么写。
+
+组件暴露的方法（`defineExpose`）—— 前六个是「够用」的那一层，后面是把纸张组件的既有能力转发出来：
+
+| 方法 | 说明 |
+| --- | --- |
+| `getModel()` / `toMd()` | 取当前模型 / 当前 md（`toMd()` = `save_md` 交出去的那个字符串） |
+| `pageCount()` | 当前页数 |
+| `exportDocx(): Promise<Blob>` / `downloadDocx(name?)` | 取 docx 二进制 / 直接触发浏览器下载（`name` 省略时走 `fileName` 的规则） |
+| `getPaper()` | 底层的 `WordPaper` 实例 —— 开发期钩子（demo 的 `window.__wtpPaper`）与「还没转发到的能力」都走它 |
+| `repaginate()` / `getSpec()` / `getMeasurements()` | 重量测分页 / 取生效规格 / 取最近一次量测值（排错用） |
+| `focusBlock(blockId)` | 把某块滚到可视区中间（导航窗格点击用它） |
+| `undo()` / `redo()` / `canUndo()` / `canRedo()` | 撤销重做 |
+| `setEditorFlags({ trackChanges, nav })` | 把编辑器开关写回模型（见 `editor-flags`） |
+| `setBlockKind(kind)` / `toggleBold()` / `toggleUnderline()` / `setColor(hex\|null)` / `formatSelectionAsAmount()` | 段落样式与行内格式（金额格式化同 `alt+4`） |
+| `insertSpecialSpace(kind)` / `insertPageBreak()` / `insertSectionBreak()` / `insertTable(rows?, cols?)` | 插入类操作 |
+| `getSelectionScope()` / `setSearch(q, opts?)` / `nextMatch()` / `prevMatch()` / `replaceCurrent(t)` / `replaceAll(t)` / `clearSearch()` | 查找替换 |
+| `addCommentOnSelection(text)` / `addCommentAt(...)` / `replyComment(id, text)` / `removeComment(id)` / `focusComment(id)` | 批注 |
+| `getCellSelection()` / `clearCellSelection()` | 整格复选的只读镜像与收起 |
+
+#### 内部组件 `WordPaper`（高级用法）
+
+`WtpEditor` 内部用的是 `WordPaper`（`src/components/WordPaper.vue`，库里也一起导出）：
+它只管**纸张**（分页预览 + 编辑层 + 批注侧栏），没有顶栏、功能区与那些浮层。
+要把纸张嵌进自己的界面、自己画工具栏时才直接用它 —— 下面这套接口**属于内部组件**，
+正常用法不必碰。
 
 `defineExpose` 暴露：
 
@@ -82,18 +161,18 @@ const spec = ref<DeepPartial<Spec>>({
 | `focusBlock(blockId)` | 把某块滚到可视区中间；可编辑时再把插入符放到该块自动编号之后（导航窗格点击用它） |
 | `setEditorFlags({ trackChanges, nav })` | 把编辑器开关写回模型（缺省值删字段），见下面 `editor-flags` 事件那一节 |
 
-props：`source`（类 md 源码）、`model`（直接给模型，优先于 source）、`spec`（规格覆盖）、`author`（修订与批注作者名）、
+`WordPaper` 自己的 props：`source`（类 md 源码）、`model`（直接给模型，优先于 source）、`spec`（规格覆盖）、`author`（修订与批注作者名）、
 `editable`（打开编辑层）、`trackChanges`（修订模式）、`shortcuts`（自定义快捷键表，见「快捷键」一节）。
 事件：`paginated`（分页完成后给出页数）、`selection-change`（选区变化时给出当前段落样式、加粗／下划线／颜色，
 以及「选区里有没有修订」—— 工具栏用它回显）、
 `toggle-track-changes`（按了 `ctrl+shift+E`，请调用方翻转自己持有的 `trackChanges`）、
-`toast`（一句无效输入提示，组件不做提示 UI，由调用方决定怎么显示）、
+`toast`（一句无效输入提示，它自己不做提示 UI，由调用方决定怎么显示）、
 `editor-flags`（**模型载入 / 重建之后**给出 md 里 `::editor` 解析出来的两个开关，已补齐默认值；调用方据此设自己的状态）。
 `editor-flags` 是单向的：用户在调用方那侧改开关时，要调 `setEditorFlags({ trackChanges, nav })` 把值**写回模型**
-（否则切源码视图 / `save_md` 序列化出来的 md 带不上这一行）。组件不会因为 `setEditorFlags` 反过来再发一次事件
-—— 那会形成回环，把用户刚改的值覆盖回旧的。
+（否则切源码视图 / 序列化出来的 md 带不上这一行）。它不会因为 `setEditorFlags` 反过来再发一次事件
+—— 那会形成回环，把用户刚改的值覆盖回旧的。`WtpEditor` 就是照这套接线把顶栏那两个开关管起来的。
 
-文档含批注时，组件右侧自动出现审阅侧栏（锚定文字 + 作者 + 时间 + 内容 + 回复），点条目会在正文里
+文档含批注时，纸张右侧自动出现审阅侧栏（锚定文字 + 作者 + 时间 + 内容 + 回复），点条目会在正文里
 高亮对应锚点并滚动过去；没有批注时侧栏不占位。
 
 ## 文件模板与双页并排
@@ -240,8 +319,11 @@ demo 页可以用 URL 参数把表递进来（验收脚本用它，真实使用�
 分页靠每张纸自己的 `break-before: page`（第一张除外），所以打印预览里页数、断页位置与版面一致，
 既不会被裁掉后面几页，也不会多出空白页。
 
-打印样式分两处：组件自己的 `.wtp-*` 规则在 `lib/render/css.ts` 注入的那份 CSS 里（要带 `!important`，
-SFC 的 scoped 样式加了 `data-v` 属性，特异性更高）；App 外壳的规则在 `src/App.vue` 的 `@media print` 里。
+打印样式分三处：纸自己（含批注侧栏、页间换页标记）的 `.wtp-*` 规则在 `lib/render/css.ts` 注入的那份 CSS 里
+（要带 `!important`，SFC 的 scoped 样式加了 `data-v` 属性，特异性更高）；编辑器外壳（顶栏、功能区、导航窗格、
+浮动面板、提示条）的规则在 `src/components/WtpEditor.vue` 的 `@media print` 里；demo 那侧（源码 pane 的
+`.pane-head` / `.legend` / `textarea`）在 `src/App.vue` 的 `@media print` 里 —— 插槽里的节点带的是使用方的 scope，
+组件管不到它们。
 
 ### 查找替换与导航窗格
 
@@ -519,7 +601,9 @@ src/lib/
   render/html.ts     行内标记 → HTML（预览、量测、编辑读回共用同一套结构）
   render/measure.ts  DOM 实测：行数、行高、每行起始字符偏移（带增量缓存）
   render/paginate.ts 纯函数分页：装箱 + 跨页按行切开 + 分节重编号
-src/components/WordPaper.vue   预览 + 编辑组件 + 批注审阅侧栏
+src/components/WtpEditor.vue   对外组件：顶栏 + 功能区 + 纸张（含浮动面板、导航窗格、提示条）+ props/emits
+src/components/WordPaper.vue   纸张（预览 + 编辑 + 批注审阅侧栏），内部组件／高级用法
+src/App.vue                    demo：WtpEditor + 类 md 源码 pane + 模式切换
 scripts/                       验收脚本（见下）
 ```
 
@@ -533,7 +617,8 @@ scripts/                       验收脚本（见下）
 | --- | --- |
 | `npm run verify:p1` | 生成 docx → **Word COM 打开** → 逐项读回 Word 实际生效的字体／字号／行距规则／段距／首行缩进字符数／样式归属（含 Word 是否把它认成内置样式）／页码域／修订／批注／**逐段下划线**（`w:u` 是否真的生效）／**表格**（行数、每行格数与整行合并、`cantSplit`、行高规则与**逐行磅值**、格内边框线型、**逐格样式与两组对齐**、表格总宽 ≈ 版心宽），与规格表对账；另在 OOXML 层面核对 `<w:u w:val="single"/>` 的处数、**软换行 `<w:br/>` 的处数**（Word 读回来的格文字里应是 chr(11)）与 `<w:tblW w:type="dxa">`／`w:tblLayout`／`w:trHeight`（逐行 = (**正文行** ? `minLines` : 1) × 该行各格样式行高的最大值 —— 表头行 / 附注行恒一行）／`w:gridSpan`／`w:pStyle`／`w:jc`／`w:vAlign` 与模型一致；**逐节**（W5）：Word 读回每节的纸张方向与页脚文本、`<w:pgSz>` 里 `w:orient` 与横排时宽高的互换、`<w:pgNumType w:start="1">` 只在声明「从 1 开始」的节出现、`<w:footerReference>` 只在独立设页脚的节出现（关联前节**不写**才继承），期望值一律由 `resolveSections()` 现推 |
 | `npm run verify:p2` | 分页器单测（含**表格行按行装箱、原子项不吃孤行控制、同页同表行合并、跨页断开**）+ 真实浏览器（Chrome，可用 `WTP_BROWSER` 覆盖）实测：**两套文件模板各自**的样式与版心宽（`contentBoxPx`）对账、每页不得溢出、页首与续排的间距豁免、**量测值与渲染值逐块对账（含表格：各行量测高合计 = 渲染出来的表格高）**、切模板后**版心几何必须换一套**（页数可以巧合地相同，不作判据）、宽视口（2200px）下**真的有两页同处一行**（同 `top`、间距 18px、纸宽未被压缩、页带不横向溢出）、窄视口（1000px）回落成一页一排、批注侧栏与正文锚点同源（含点击高亮）、**逐节几何（W5）**：页码 1 的出现次数 = 首节 + 声明了「从 1 开始」的节数、**命名 `@page` 只挂在横排纸上**（纵排走默认 `@page`，尺寸等价；挂上 `wtp-portrait` 会让每份纵排文档多打一张空白纸）且打印媒体下页数与 `break-before` 不被改坏、用「节」工具条把末节改成横排后**只有那一节的纸宽高对调**且纸数不变、横排纸不被压窄、还原 |
-| `npm run verify:p3` | 编辑操作纯函数单测（含**软换行的切片／往返、容器泛化（格内读改）、跨格查找替换**，以及 **`stepCell`/`verticalCell` 的跨格步进（含幻影格跳过）、`removeTable`、`removeBreak` 收紧、`setCellKind`/`setCellAlign` 与格首指令 `{@…}` 的 md 往返**）+ 真实浏览器实测：**敲字后片段仍是同一个 DOM 节点**（证明正常输入没有重排）、插入符落在刚敲完的字后面、行数变了要重排时插入符按坐标找回、回车分段／退格合并、加粗／下划线／改色、下划线的 md 往返、修订模式的增删标记、**接受／拒绝修订**（按钮只在选区含修订时亮、光标贴在修订串末尾也算、拒绝删除修订、接受插入修订、别处修订一个都没动、撤销能还原）、加批注（模型／侧栏／正文锚点三者对得上）、撤销重做、`ctrl+U`／`ctrl+shift+E`／`alt+4`（含无效输入的提示条）、三种特殊空格的码点（单测另外确认它们原样写进 docx 的 `document.xml`）、**切文件模板**（版心几何与量测行数都跟着换、插入符与选区按坐标找回、文字没丢）、打印（隐藏外壳**含查找面板、插入表格面板、表格上下文工具条与导航窗格**、真打一份 PDF 数页数并与版面页数对齐）、以及编辑后每页仍不溢出；**查找替换**（ctrl+F 开面板并聚焦查找框、匹配有高亮且当前那一处单独一层、查找不重建版面 DOM、上一个／下一个移动当前匹配、非法正则只弹提示且不高亮也不改模型、范围「当前选中的文本」只命中选区内、ctrl+G 聚焦替换框与替换一处、全部替换后模型与版面逐块一致）；**导航窗格**（条目数/编号前缀/文字/层级与模型算出的逐条一致、窗格 200px、点击跳转后插入符落在被点块的自动编号之后、正文打字不重建左栏、折叠按钮与顶栏开关）；**表格**（渲成 `.wtp-tableFrag`、外层不挂 `data-block-id`、各片渲染行数 = 行区间、格内打字同步到模型且不重排、**插入表格面板**：默认 2 行 3 列、`Esc` 只关面板不插表、选 4 行 2 列后新表按规格生成且插入符落在第一格、越界值两侧边界各测一次（999 行 / 0 列 → 30 行 / 1 列，0 行 / 999 列 → 1 行 / 12 列）；**表格编辑交互**：表格页常驻（光标不在格内时给提示、按钮全灰；进格后提示收起且按钮可用）、落点提示「第 N 行第 M 列」、点「下方插入行」后模型行数 +1 且 DOM 多一 `<tr>`、插入符仍在原格内容里、删列到最后一列时按钮禁用、行高与表头／附注 radio 各开关一次并把 `-min1`/`-min2` 反映到 DOM 类名、格内 Shift+Enter 后敲字进入新行（模型里排在 `break` 之后）、格首 Backspace 与格尾 Delete 后模型与 `<td>` 数都不变；**表格收尾（W4b-2）**：Tab 行优先跨格且**最后一格按 Tab 后选区与模型都不变**、Shift+Tab 回上一格末尾、格首 ← / 格尾 → 跨格而格内中间不跨、点「删除表格」后模型少一个 `table` 块且 DOM 里不再有 `.wtp-tableFrag`、插入符落在上一块末尾、格内点样式 chip 后**只有那一格**的类名从 `wtp-listItem` 变成 `wtp-h2`、两组对齐按钮的 active 态与写进 DOM 的行内 `text-align` / `vertical-align`（含「再点同一个值 = 清覆盖」与「只作用于光标那一格」）；打印隐藏里也逐个验了新增的「水平 / 垂直 / 删除表格」按钮确实不显示）；**「节」工具条（W5）**：编辑模式常驻、节号回显「第 N 节 / 共 M 节」、首节「关联前节」与「从 1 开始」整组置灰、样本第 2 节（`--- link=off restart=on`）回显「否 / 是」、点「横向」后只有那一节的纸宽高对调且纸数不变、点「页码=关」后该节不再有页码元素而别的节照旧、来回切完还原且**默认值不落模型字段**、文末插分节符的空白页页码接着前一节往下数（新分节符默认不重排）、两档命名 `@page` 的 `size` 恰好互换且外边距归 0）；**删除的边界（issues/20260915）**：跨页段落**页尾连按 5 次 Backspace** 后模型长度恰好 −5、断点窗口不出现重复，且每一步都逐块核对「版面文字 = 模型文字」（坐标与 DOM 文字不能再差一个字符）；**页尾 Delete** 删掉的是下一页片段的首字（模型 −1，不是空操作）、**页首 Backspace** 删掉的是上一页片段的末字；**段尾 Delete** 把下一段接上来（块数 −1、文字拼接正确）、**段首 Backspace** 合并前一段；**跨段选区删除**后首块 = 「首块切点之前 + 末块切点之后」且中间各块消失；**全选整页删除**后该页的块合成一段（文字清空）且后面的文字前移；**粘贴替换跨块选区**后原选区被粘贴内容取代（不再只是插在选区开头）；上述每个动作再各 `ctrl+Z` 一步，验模型能原样退回（撤销快照必须记在改模型之前 —— 并段类操作一进去就动模型，记晚了撤销就是空操作）；**功能区标签页**（四枚标签「开始／插入／布局／表格」、默认停「开始」、四页常驻且同一时刻只有一页在 DOM 里、各页各管一摊、光标进出表格时版面不上移也不下移、打印时四页外壳逐页切过去验真的都不显示）；**格内垂直对齐**（最小两行 + 单行文字时三档对齐的文字顶端偏移各自落在 0 /（格高−文字高）/ 2 / 格高−文字高 上，且三档格高一致 —— 旧写法三档偏移完全相同）；**W6**：功能区四页（开始／插入／布局／表格）逐页量 `offsetHeight` **相等**（±1px）且都没被挤成两行、自定义快捷键表（URL 参数把表递进 demo；改绑后新组合生效、旧组合失效、未知动作名不改默认表）、`F4` 重复上一步（无可重复操作时空转 + 提示条且模型一字不改、换一处选中后重放也加粗、`ctrl+Z` 只退掉这次重放）、顶栏文件名（不再有 slogan、名字可编辑、导出名 = 名字 + `.docx`、空名兜底 `未命名.docx`、写了后缀不叠）、`::editor` 与顶栏两个开关的双向同步（源码里 `trackChanges=on` → 顶栏勾上且模型里为 true；取消勾选后序列化里那一行消失；`nav=off` → 导航窗格收起 + 序列化里出现 `nav=off`）；**W7 表格复选多格**：从格内拖到对角格**刷出 2×2**（模型坐标下恰好 4 格、DOM 上恰好 4 个 `<td>` 带高亮类、两者按 `data-cell-id` 对得上）、拖出格边界后**没有残留的原生选区**、刷选前后**每一页的 `offsetHeight` 与逐块量测值都不变**且版面片段仍是原来那些 DOM 节点（= 刷选不重排、不重建 DOM）、**在同格里拖动仍是普通的选文字**（原生选区真的选中了字、选中格数为 0）、`Ctrl+点击`追加「锚格↔点击格」的矩形（9 格）与**再点已选中的格 = 去掉那一块**、`Esc` 与点正文别处都能清空（高亮同时清干净）、**批量「居中」只改那 4 格**（隔壁格一个都没动、DOM 行内 `text-align` 逐格对得上、按钮 active 态跟上、复选保留、页数不变、`ctrl+Z` 一步退回整批）、**批量换样式只改那 4 格**（类名恰好 4 个、一步撤销退回）、**跨页表**（同一张表两片上都画到高亮）、**表头行 / 附注行在 `minLines=2` 时格高仍是一行**（正文行才是两行；切成最小一行后三种行都一样高，期望值由 `ptToPx(linePt)` 现推） |
+| `npm run verify:p3` | 编辑操作纯函数单测（含**软换行的切片／往返、容器泛化（格内读改）、跨格查找替换**，以及 **`stepCell`/`verticalCell` 的跨格步进（含幻影格跳过）、`removeTable`、`removeBreak` 收紧、`setCellKind`/`setCellAlign` 与格首指令 `{@…}` 的 md 往返**）+ 真实浏览器实测：**敲字后片段仍是同一个 DOM 节点**（证明正常输入没有重排）、插入符落在刚敲完的字后面、行数变了要重排时插入符按坐标找回、回车分段／退格合并、加粗／下划线／改色、下划线的 md 往返、修订模式的增删标记、**接受／拒绝修订**（按钮只在选区含修订时亮、光标贴在修订串末尾也算、拒绝删除修订、接受插入修订、别处修订一个都没动、撤销能还原）、加批注（模型／侧栏／正文锚点三者对得上）、撤销重做、`ctrl+U`／`ctrl+shift+E`／`alt+4`（含无效输入的提示条）、三种特殊空格的码点（单测另外确认它们原样写进 docx 的 `document.xml`）、**切文件模板**（版心几何与量测行数都跟着换、插入符与选区按坐标找回、文字没丢）、打印（隐藏外壳**含查找面板、插入表格面板、表格上下文工具条与导航窗格**、真打一份 PDF 数页数并与版面页数对齐）、以及编辑后每页仍不溢出；**查找替换**（ctrl+F 开面板并聚焦查找框、匹配有高亮且当前那一处单独一层、查找不重建版面 DOM、上一个／下一个移动当前匹配、非法正则只弹提示且不高亮也不改模型、范围「当前选中的文本」只命中选区内、ctrl+G 聚焦替换框与替换一处、全部替换后模型与版面逐块一致）；**导航窗格**（条目数/编号前缀/文字/层级与模型算出的逐条一致、窗格 200px、点击跳转后插入符落在被点块的自动编号之后、正文打字不重建左栏、折叠按钮与顶栏开关）；**表格**（渲成 `.wtp-tableFrag`、外层不挂 `data-block-id`、各片渲染行数 = 行区间、格内打字同步到模型且不重排、**插入表格面板**：默认 2 行 3 列、`Esc` 只关面板不插表、选 4 行 2 列后新表按规格生成且插入符落在第一格、越界值两侧边界各测一次（999 行 / 0 列 → 30 行 / 1 列，0 行 / 999 列 → 1 行 / 12 列）；**表格编辑交互**：表格页常驻（光标不在格内时给提示、按钮全灰；进格后提示收起且按钮可用）、落点提示「第 N 行第 M 列」、点「下方插入行」后模型行数 +1 且 DOM 多一 `<tr>`、插入符仍在原格内容里、删列到最后一列时按钮禁用、行高与表头／附注 radio 各开关一次并把 `-min1`/`-min2` 反映到 DOM 类名、格内 Shift+Enter 后敲字进入新行（模型里排在 `break` 之后）、格首 Backspace 与格尾 Delete 后模型与 `<td>` 数都不变；**表格收尾（W4b-2）**：Tab 行优先跨格且**最后一格按 Tab 后选区与模型都不变**、Shift+Tab 回上一格末尾、格首 ← / 格尾 → 跨格而格内中间不跨、点「删除表格」后模型少一个 `table` 块且 DOM 里不再有 `.wtp-tableFrag`、插入符落在上一块末尾、格内点样式 chip 后**只有那一格**的类名从 `wtp-listItem` 变成 `wtp-h2`、两组对齐按钮的 active 态与写进 DOM 的行内 `text-align` / `vertical-align`（含「再点同一个值 = 清覆盖」与「只作用于光标那一格」）；打印隐藏里也逐个验了新增的「水平 / 垂直 / 删除表格」按钮确实不显示）；**「节」工具条（W5）**：编辑模式常驻、节号回显「第 N 节 / 共 M 节」、首节「关联前节」与「从 1 开始」整组置灰、样本第 2 节（`--- link=off restart=on`）回显「否 / 是」、点「横向」后只有那一节的纸宽高对调且纸数不变、点「页码=关」后该节不再有页码元素而别的节照旧、来回切完还原且**默认值不落模型字段**、文末插分节符的空白页页码接着前一节往下数（新分节符默认不重排）、两档命名 `@page` 的 `size` 恰好互换且外边距归 0）；**删除的边界（issues/20260915）**：跨页段落**页尾连按 5 次 Backspace** 后模型长度恰好 −5、断点窗口不出现重复，且每一步都逐块核对「版面文字 = 模型文字」（坐标与 DOM 文字不能再差一个字符）；**页尾 Delete** 删掉的是下一页片段的首字（模型 −1，不是空操作）、**页首 Backspace** 删掉的是上一页片段的末字；**段尾 Delete** 把下一段接上来（块数 −1、文字拼接正确）、**段首 Backspace** 合并前一段；**跨段选区删除**后首块 = 「首块切点之前 + 末块切点之后」且中间各块消失；**全选整页删除**后该页的块合成一段（文字清空）且后面的文字前移；**粘贴替换跨块选区**后原选区被粘贴内容取代（不再只是插在选区开头）；上述每个动作再各 `ctrl+Z` 一步，验模型能原样退回（撤销快照必须记在改模型之前 —— 并段类操作一进去就动模型，记晚了撤销就是空操作）；**功能区标签页**（四枚标签「开始／插入／布局／表格」、默认停「开始」、四页常驻且同一时刻只有一页在 DOM 里、各页各管一摊、光标进出表格时版面不上移也不下移、打印时四页外壳逐页切过去验真的都不显示）；**格内垂直对齐**（最小两行 + 单行文字时三档对齐的文字顶端偏移各自落在 0 /（格高−文字高）/ 2 / 格高−文字高 上，且三档格高一致 —— 旧写法三档偏移完全相同）；**W6**：功能区四页（开始／插入／布局／表格）逐页量 `offsetHeight` **相等**（±1px）且都没被挤成两行、自定义快捷键表（URL 参数把表递进 demo；改绑后新组合生效、旧组合失效、未知动作名不改默认表）、`F4` 重复上一步（无可重复操作时空转 + 提示条且模型一字不改、换一处选中后重放也加粗、`ctrl+Z` 只退掉这次重放）、顶栏文件名（不再有 slogan、名字可编辑、导出名 = 名字 + `.docx`、空名兜底 `未命名.docx`、写了后缀不叠）、`::editor` 与顶栏两个开关的双向同步（源码里 `trackChanges=on` → 顶栏勾上且模型里为 true；取消勾选后序列化里那一行消失；`nav=off` → 导航窗格收起 + 序列化里出现 `nav=off`）；**W7 表格复选多格**：从格内拖到对角格**刷出 2×2**（模型坐标下恰好 4 格、DOM 上恰好 4 个 `<td>` 带高亮类、两者按 `data-cell-id` 对得上）、拖出格边界后**没有残留的原生选区**、刷选前后**每一页的 `offsetHeight` 与逐块量测值都不变**且版面片段仍是原来那些 DOM 节点（= 刷选不重排、不重建 DOM）、**在同格里拖动仍是普通的选文字**（原生选区真的选中了字、选中格数为 0）、`Ctrl+点击`追加「锚格↔点击格」的矩形（9 格）与**再点已选中的格 = 去掉那一块**、`Esc` 与点正文别处都能清空（高亮同时清干净）、**批量「居中」只改那 4 格**（隔壁格一个都没动、DOM 行内 `text-align` 逐格对得上、按钮 active 态跟上、复选保留、页数不变、`ctrl+Z` 一步退回整批）、**批量换样式只改那 4 格**（类名恰好 4 个、一步撤销退回）、**跨页表**（同一张表两片上都画到高亮）、**表头行 / 附注行在 `minLines=2` 时格高仍是一行**（正文行才是两行；切成最小一行后三种行都一样高，期望值由 `ptToPx(linePt)` 现推）；**W8 组件打包**：`template` prop 决定版心几何（与规格表现推的 `contentBoxPx` 对齐）与量测行数、`fileName` prop 决定顶栏与导出名、`author` prop 决定新加批注的作者名、`update:fileName` / `update:author` / `update:template` 把改动回传给使用方、`save_md` 收到的字符串 = `toMd(getModel())`（开修订模式时带 `::editor trackChanges=on`）、`ctrl+S` 与「保存」按钮一致且 `preventDefault` 被探针读到、`save_docx` 事件发出、`content` 留空（`?empty=1`）不报错且版面出得来 |
+| `npm run verify:lib` | 库产物（`dist-lib/`）：在 node 里真 `import` 一次不抛异常、`WtpEditor`（与内部组件 `WordPaper`）确实导出、原有纯函数导出还在、**样式产物存在且非空**（`wordtohtml.css`，里面有外壳与 `.wtp-*` 规则）、`vue` 保持 external（产物里 `import "vue"` 而不是内联一份运行时） |
 | `npm run verify:pages` | 同一份源码**逐套模板**各生成一份 docx 与 Word 比页数、节数与页码重排次数（期望值由模型推：页码 1 恰好出现「首节 1 次 + 声明了从 1 开始的节数」次；预览页数与 Word 逐套对齐），并确认两套模板的**版心几何**确实不同（切模板换整套版心的证据 —— 页数可以巧合地相同，不能拿它当判据）；默认模板之外的模板再用内置样本过一次 Word 逐项对账（`assert-docx --template`） |
 | `npm run verify` | 以上全部 + 类型检查 |
 

@@ -6,8 +6,13 @@
  *   2. 文档模型 → docx（docx/export.ts）
  *   3. 文档模型 → 分页预览 DOM（预览侧组件用）
  *
- * 组件本体在 src/components/WordPaper.vue，演示页在 src/App.vue。
+ * 组件：`WtpEditor` 是**对外的那个组件**（顶栏 + 功能区 + 纸张，见 components/WtpEditor.vue）；
+ * `WordPaper` 是它内部的纸张组件（预览 + 编辑层），只做高级用法时才需要直接用。
+ * 演示页在 src/App.vue（demo 专属的「类 md 源码」pane 与模式切换不会进这个入口）。
  */
+
+export { default as WtpEditor } from '../components/WtpEditor.vue'
+export { default as WordPaper } from '../components/WordPaper.vue'
 
 export {
   BLOCK_KINDS,

@@ -30,11 +30,14 @@ import { createServer } from 'vite'
 import {
   SEARCH_CURRENT_HIGHLIGHT,
   SEARCH_HIGHLIGHT,
+  DOC_TEMPLATES,
   cellRectBetween,
   cellsInRects,
   computeNumbering,
+  contentBoxPx,
   ptToPx,
   resolveSpec,
+  toMd,
 } from '../dist-lib/wordtohtml.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -3587,6 +3590,191 @@ try {
   await subRadio('行高', '最小两行').click()
   await page.waitForTimeout(350)
   await checkNoOverflow('AF7 行高切换之后')
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== AG. 组件打包（W8）：props 生效、受控回写、save_md / save_docx、content 留空 ===',
+  )
+  /*
+   * 组件（`WtpEditor`）把「顶栏 + 功能区 + 纸张」收成一个 props / emits 契约：
+   * 内容与身份从 props 进，动作与受控回写从 emits 出。demo 只做两件事 ——
+   * 把值递进去、把回传值露出来（`window.__wtpDemo`，见 App.vue）。
+   * 这一节验的就是这条回路，期望值一律从规格表 / 模型现推，不从界面反推。
+   */
+  const probe = () => page.evaluate(() => window.__wtpDemo ?? null)
+  /** 打开带 URL 参数的 demo（等待逻辑与 openApp 一致） */
+  async function openDemo(search) {
+    await page.goto(`${url}${search}`, { waitUntil: 'load' })
+    await page.waitForSelector('.wtp-page', { timeout: 30000 })
+    await page.evaluate(async () => {
+      await document.fonts.ready
+    })
+    await page.waitForTimeout(600)
+    await page.evaluate(TEST_HELPERS, {
+      normal: SEARCH_HIGHLIGHT,
+      current: SEARCH_CURRENT_HIGHLIGHT,
+    })
+  }
+  /** 版心几何 + 量测行数：与 N 节同一套 oracle（「切模板必须整篇按新版心重量」） */
+  const geometry = () =>
+    page.evaluate(() => {
+      const content = document.querySelector('.wtp-content')
+      const blocks = window.__wtpPaper.getMeasurements().filter((it) => it.t === 'block')
+      return {
+        width: content ? content.clientWidth : -1,
+        rowSum: blocks.reduce((n, b) => n + b.rows, 0),
+      }
+    })
+  const saveButton = page.locator('.bar button.tool', { hasText: '保存' })
+  const authorBox = page.locator('.bar .author-name')
+  const templateSelect = page.locator('.bar select')
+  const fileNameBox = page.locator('.bar .file-name')
+  /** 模型里最后一条批注 */
+  const lastComment = async () => {
+    const list = (await getModel()).comments
+    return list[list.length - 1] ?? null
+  }
+
+  // ---- AG1. template prop 决定版心几何 ----
+  const otherTemplate = DOC_TEMPLATES.find((t) => t.key !== DOC_TEMPLATES[0].key)
+  ok('（前置）规格表里有第二套文件模板可切', otherTemplate !== undefined)
+  const managerWidth = contentBoxPx(resolveSpec(DOC_TEMPLATES[0].spec)).width
+  const otherWidth = contentBoxPx(resolveSpec(otherTemplate ? otherTemplate.spec : {})).width
+  ok(
+    '（前置）两套模板的版心宽不同（否则下面两条是空转断言）',
+    Math.abs(managerWidth - otherWidth) > 1,
+    `${managerWidth} / ${otherWidth}`,
+  )
+  await openApp()
+  eq('不传 template 时用第一套模板', await templateSelect.inputValue(), DOC_TEMPLATES[0].key)
+  const managerGeo = await geometry()
+  ok(
+    '第一套模板的版心宽 = 该模板规格表现推的宽度',
+    Math.abs(managerGeo.width - managerWidth) <= 1,
+    `实测 ${managerGeo.width}，规格表 ${managerWidth}`,
+  )
+  await openDemo(`?template=${otherTemplate ? otherTemplate.key : ''}`)
+  eq('template prop 决定下拉的初值', await templateSelect.inputValue(), otherTemplate?.key ?? '')
+  const otherGeo = await geometry()
+  ok(
+    'template prop 决定版心几何（= 那一套模板的规格表）',
+    Math.abs(otherGeo.width - otherWidth) <= 1,
+    `实测 ${otherGeo.width}，规格表 ${otherWidth}`,
+  )
+  ok(
+    'template prop 也决定了量测行数（整篇是按这套版心量的）',
+    otherGeo.rowSum !== managerGeo.rowSum,
+    `${managerGeo.rowSum} → ${otherGeo.rowSum}`,
+  )
+  await checkNoOverflow('AG1 换模板 prop 后')
+
+  // ---- AG2. fileName prop：顶栏显示、导出名跟着走、update:fileName 回传 ----
+  await openApp()
+  eq('fileName prop 显示在顶栏', await fileNameBox.inputValue(), '关于爱康光电资产核查情况的说明')
+  await fileNameBox.fill('W8 组件导出探针')
+  await page.waitForTimeout(150)
+  eq('改顶栏文件名 → update:fileName 把新值交给使用方', (await probe())?.fileName, 'W8 组件导出探针')
+  const docxCountBefore = (await probe())?.docxCount ?? -1
+  let w8Suggested = null
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 8000 }),
+      page.locator('.bar button.primary').click(),
+    ])
+    w8Suggested = download.suggestedFilename()
+  } catch {
+    w8Suggested = null
+  }
+  eq('点「导出 docx」后 save_docx 事件发出', (await probe())?.docxCount, docxCountBefore + 1)
+  if (w8Suggested !== null) {
+    eq('下载名 = fileName + .docx', w8Suggested, 'W8 组件导出探针.docx')
+  } else {
+    ok('（下载事件拦不到）退而验 save_docx 事件已发出', (await probe())?.docxCount === docxCountBefore + 1)
+  }
+
+  // ---- AG3. author prop：批注作者用它；update:author 回传 ----
+  await openApp('插入')
+  eq('author prop 显示在顶栏「修订作者」', await authorBox.inputValue(), '张三')
+  await page.evaluate(() => window.__wtpTest.selectIn('债务人爱康光电科技有限公司', 0, 6))
+  await page.waitForTimeout(80)
+  await page.click('.comment-field input')
+  await page.fill('.comment-field input', 'W8 批注作者探针（旧作者）')
+  await page.click('.comment-field button')
+  await page.waitForTimeout(250)
+  eq('新加的批注用的是 author prop 的作者名', (await lastComment())?.author, '张三')
+  await authorBox.fill('李四')
+  await page.waitForTimeout(150)
+  eq('改「修订作者」→ update:author 把新值交给使用方', (await probe())?.author, '李四')
+  await page.evaluate(() => window.__wtpTest.selectIn('我方于2026年9月1日', 0, 4))
+  await page.waitForTimeout(80)
+  await page.click('.comment-field input')
+  await page.fill('.comment-field input', 'W8 批注作者探针（新作者）')
+  await page.click('.comment-field button')
+  await page.waitForTimeout(250)
+  eq('改过作者之后新加的批注用的是新作者名', (await lastComment())?.author, '李四')
+
+  // ---- AG4. save_md：顶栏「保存」与 ctrl+S ----
+  await openApp()
+  const modelPlain = await getModel()
+  await saveButton.click()
+  await page.waitForTimeout(200)
+  eq('点「保存」收到的 md = toMd(getModel())', (await probe())?.lastSaveMd, toMd(modelPlain))
+  const trackBoxW8 = page.locator('label.checkbox input[type="checkbox"]')
+  await trackBoxW8.click()
+  await page.waitForTimeout(250)
+  eq('（前置）修订模式已勾上', await trackBoxW8.isChecked(), true)
+  const modelTracked = await getModel()
+  await saveButton.click()
+  await page.waitForTimeout(200)
+  const savedTracked = (await probe())?.lastSaveMd ?? ''
+  eq('开着修订模式时收到的 md = toMd(getModel())', savedTracked, toMd(modelTracked))
+  ok(
+    '开着修订模式时保存的 md 带 ::editor trackChanges=on',
+    savedTracked.includes('::editor trackChanges=on'),
+    savedTracked.slice(0, 60),
+  )
+  /*
+   * ctrl+S：探针挂在 window 的冒泡阶段 —— 组件的处理器在挂载时就注册了，
+   * 同阶段下先注册先跑，所以探针读到的是被处理之后的 defaultPrevented。
+   */
+  await page.evaluate(() => {
+    window.__wtpSaveProbe = []
+    window.addEventListener('keydown', (e) => {
+      if ((e.key || '').toLowerCase() === 's') window.__wtpSaveProbe.push(e.defaultPrevented)
+    })
+  })
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('我方于2026年9月1日'))
+  await page.waitForTimeout(100)
+  await page.keyboard.press('Control+s')
+  await page.waitForTimeout(250)
+  eq('ctrl+S 也触发 save_md（内容 = toMd(getModel())）', (await probe())?.lastSaveMd, toMd(await getModel()))
+  eq(
+    'ctrl+S 的浏览器默认行为被拦住（探针读到 defaultPrevented）',
+    (await page.evaluate(() => window.__wtpSaveProbe)).join(','),
+    'true',
+  )
+
+  // ---- AG5. content 留空（`?empty=1`）----
+  const pageErrors = []
+  const onPageError = (error) => pageErrors.push(String(error))
+  page.on('pageerror', onPageError)
+  await openDemo('?empty=1')
+  const emptyState = await page.evaluate(() => ({
+    pages: document.querySelectorAll('.wtp-page').length,
+    name: document.querySelector('.bar .file-name')?.value ?? null,
+    blocks: document.querySelectorAll('.wtp-content [data-block-id]').length,
+  }))
+  page.off('pageerror', onPageError)
+  eq('content 留空时不报错（没有未捕获的页面异常）', pageErrors.length, 0)
+  ok(
+    'content 留空也出得来版面（至少一张纸、没有块）',
+    emptyState.pages >= 1 && emptyState.blocks === 0,
+    JSON.stringify(emptyState),
+  )
+  eq('content 留空时传的确实是空字符串（demo 也没编一个标题出来）', emptyState.name, '')
+  await fileNameBox.fill('空文档探针')
+  await page.waitForTimeout(150)
+  eq('content 留空时顶栏文件名仍可编辑（回传拿到新值）', (await probe())?.fileName, '空文档探针')
 } finally {
   await browser?.close()
   await server.close()
@@ -3615,5 +3803,8 @@ console.log(
     '::editor 写进 md（源码 → 顶栏开关、顶栏开关 → 源码那一行）均落到模型；' +
     'W7：表格整格复选（拖动刷选 2×2 = 4 格且高亮 4 个 <td>、拖出格边界不留原生选区、刷选不重排不重建 DOM、' +
     '格内拖选文字不受影响（格数为 0）、Ctrl+点击追加与去掉、Esc / 点正文别处清空、' +
-    '批量对齐与批量样式只改选中的格且一步撤销退整批、对齐不改页数、表头与附注行恒一行高）。',
+    '批量对齐与批量样式只改选中的格且一步撤销退整批、对齐不改页数、表头与附注行恒一行高）；' +
+    'W8：组件打包（template prop 决定版心几何与量测行数、fileName prop 决定顶栏与导出名、author prop ' +
+    '决定批注作者、update:fileName / update:author / update:template 回传、save_md 与 ctrl+S 一致且 ' +
+    'preventDefault、save_docx 事件发出、content 留空不报错）。',
 )
