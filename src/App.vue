@@ -273,7 +273,18 @@ const specOverride = computed<DeepPartial<Spec>>(() => {
 /** 完整规格表。样式库要按每条样式自己的字体字号预览，所以这里要拿到解析后的值。 */
 const spec = computed<Spec>(() => resolveSpec(specOverride.value))
 
-const kind = computed<BlockKind>(() => selection.value?.kind ?? 'body')
+/**
+ * 样式 chip 的 active 态。
+ *
+ * 有整格复选时按**整批的一致性**回显：选中的格里样式对不齐（组件把 kind 整个省略了）
+ * 就一个都不亮 —— 不然界面会谎报「这些格的样式就是它」。
+ */
+const kind = computed<BlockKind | null>(() => {
+  const sel = selection.value
+  if (!sel) return 'body'
+  if (sel.cellSelection) return sel.cellSelection.kind ?? null
+  return sel.kind
+})
 
 /** 光标落在表格格子里时的上下文；其余时候为 null（上下文工具条据此显示/隐藏） */
 const tableCtx = computed(() => selection.value?.table ?? null)
@@ -299,6 +310,16 @@ const tablePosLabel = computed(() => {
   if (t.role === 'unit') return '表头行'
   if (t.role === 'note') return '附注行'
   return `第 ${t.row + 1} 行第 ${t.col + 1} 列`
+})
+
+/**
+ * 表格页的提示：整格复选（多选）时换成「已选 N 格」—— 复数操作只有两组对齐与格内样式
+ * 作用于整批，其余控件仍按落点那一格工作，所以单选时照旧显示行列。
+ */
+const tableHint = computed(() => {
+  const sel = selection.value?.cellSelection
+  if (sel && sel.multiple) return `已选 ${sel.count} 格`
+  return tablePosLabel.value
 })
 
 /**
@@ -970,7 +991,7 @@ onBeforeUnmount(() => {
       v-if="mode === 'edit' && tab === 'table'"
       class="toolbar sub-toolbar table-toolbar panel panel-table"
     >
-      <span class="tk-hint">{{ tableCtx ? `表格 · ${tablePosLabel}` : '表格' }}</span>
+      <span class="tk-hint">{{ tableCtx ? `表格 · ${tableHint}` : '表格' }}</span>
       <span v-if="!tableCtx" class="tk-empty">把光标放进表格的格子里后可用</span>
 
       <span class="tk-group">

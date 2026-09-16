@@ -16,17 +16,26 @@
 import JSZip from 'jszip'
 
 import {
+  CELL_SELECTION_CLASS,
   DEFAULT_SHORTCUTS,
   SHORTCUT_ACTIONS,
+  STYLE_KEYS,
   addComment,
   applyFormat,
   blockLength,
   bodyInsertIndex,
   bodyRowIndexes,
+  buildCss,
   buildOutline,
   canJoinWithNext,
   canMergeIntoPrevious,
   cellId,
+  cellRectBetween,
+  cellRectIndexOf,
+  cellsChangingAlign,
+  cellsChangingKind,
+  cellsInRect,
+  cellsInRects,
   cloneDoc,
   commentScopes,
   containerLength,
@@ -48,7 +57,9 @@ import {
   joinWithNext,
   matchShortcut,
   mergeIntoPrevious,
+  nextAlignValue,
   normalizeBlocks,
+  normalizeCellCol,
   normalizeTable,
   outlineSignature,
   parseCellId,
@@ -80,14 +91,19 @@ import {
   setBlockKind,
   setCellAlign,
   setCellKind,
+  setCellsAlign,
+  setCellsKind,
   setContainerKind,
   setMinLines,
   setRoleRow,
   setSectionSetting,
   settingsOf,
   sliceInlines,
+  sortCells,
   splitBlock,
   stepCell,
+  storedCellAlign,
+  storedCellKind,
   toBase64,
   toMd,
   updateComment,
@@ -2034,6 +2050,169 @@ console.log('\n=== 27. 快捷键表：解析 / 匹配 / 覆盖 / 冲突（W6）=
   } finally {
     console.warn = realWarn
   }
+}
+
+console.log('\n=== 28. 表格复选：矩形块 / 目标格列表 / 批量只改选中的格（W7）===')
+{
+  const makeTable = (rows, columns = 1, minLines = 1) => ({
+    t: 'table',
+    id: 'tb1',
+    rows,
+    columns,
+    minLines,
+    cantSplit: true,
+  })
+  const bodyRow = (...texts) => ({
+    role: 'body',
+    cells: texts.map((text) => ({ inlines: text === '' ? [] : [{ t: 'text', text }] })),
+  })
+  const roleRow = (role, text = '') => ({
+    role,
+    cells: [{ inlines: text === '' ? [] : [{ t: 'text', text }] }],
+  })
+  const keys = (cells) => cells.map((c) => `${c.row},${c.col}`).join('|')
+  const grid = makeTable(
+    [roleRow('unit', 'u'), bodyRow('a', 'b', 'c'), bodyRow('d', 'e', 'f'), roleRow('note', 'n')],
+    3,
+  )
+
+  // ---- 归一化：unit / note 行整行一格，列归 0 ----
+  eq('body 行的列照原样', normalizeCellCol(grid, 1, 2), 2)
+  eq('unit 行的列归 0', normalizeCellCol(grid, 0, 2), 0)
+  eq('note 行的列归 0', normalizeCellCol(grid, 3, 1), 0)
+  eq('越界行不炸（按非 body 处理）', normalizeCellCol(grid, 9, 1), 0)
+
+  // ---- 矩形：端点顺序无关 ----
+  eq(
+    '两端点上下颠倒也是同一个矩形',
+    JSON.stringify(cellRectBetween({ row: 2, col: 2 }, { row: 1, col: 0 })),
+    JSON.stringify({ r1: 1, c1: 0, r2: 2, c2: 2 }),
+  )
+
+  // ---- 2×2：刷选判据（浏览器侧那条断言的 node 侧对照） ----
+  const twoByTwo = cellsInRect(grid, cellRectBetween({ row: 1, col: 1 }, { row: 2, col: 2 }))
+  eq('2×2 矩形 = 4 格', twoByTwo.length, 4)
+  eq('2×2 矩形按行优先展开', keys(twoByTwo), '1,1|1,2|2,1|2,2')
+  eq('矩形自己怎么给顺序都一样', keys(cellsInRect(grid, { r1: 2, c1: 2, r2: 1, c2: 1 })), '1,1|1,2|2,1|2,2')
+
+  // ---- plain 行（unit / note）只有第 0 格：列区间要覆盖第 0 列才算选中它 ----
+  eq(
+    '列区间含 0 时 unit 行被算进来',
+    keys(cellsInRect(grid, { r1: 0, c1: 0, r2: 1, c2: 2 })),
+    '0,0|1,0|1,1|1,2',
+  )
+  eq(
+    '列区间不含 0 时不选中 unit 行',
+    keys(cellsInRect(grid, { r1: 0, c1: 1, r2: 1, c2: 2 })),
+    '1,1|1,2',
+  )
+  eq('note 行同理（整行算一格）', keys(cellsInRect(grid, { r1: 3, c1: 0, r2: 3, c2: 2 })), '3,0')
+
+  // ---- 参差行：只数模型里真有的格（渲染补出来的幻影格不算） ----
+  const ragged = makeTable([bodyRow('a', 'b', 'c'), bodyRow('d')], 3)
+  eq('参差行不数幻影格', keys(cellsInRect(ragged, { r1: 0, c1: 0, r2: 1, c2: 2 })), '0,0|0,1|0,2|1,0')
+  eq('整块越界 = 空集合', cellsInRect(ragged, { r1: 5, c1: 0, r2: 9, c2: 2 }).length, 0)
+
+  // ---- 多块：去重 + 行优先 ----
+  const blocks = [
+    { r1: 1, c1: 0, r2: 1, c2: 1 },
+    { r1: 2, c1: 1, r2: 2, c2: 2 },
+    { r1: 1, c1: 1, r2: 2, c2: 1 },
+  ]
+  eq('多块合成选中集合（去重 + 行优先）', keys(cellsInRects(grid, blocks)), '1,0|1,1|2,1|2,2')
+  eq(
+    '同一格出现在两块里只算一次',
+    cellsInRects(grid, [
+      { r1: 1, c1: 1, r2: 1, c2: 1 },
+      { r1: 1, c1: 1, r2: 1, c2: 1 },
+    ]).length,
+    1,
+  )
+  eq('空块列表 = 空集合', cellsInRects(grid, []).length, 0)
+  eq('sortCells 只排序去重、不改原数组', keys(sortCells([{ row: 2, col: 1 }, { row: 1, col: 2 }])), '1,2|2,1')
+
+  // ---- cellRectIndexOf：Ctrl+点击「已在选中的格」= 去掉包含它的那一块 ----
+  eq('找得到包含某格的块', cellRectIndexOf(grid, blocks, { row: 2, col: 2 }), 1)
+  eq('第一块也能找回来', cellRectIndexOf(grid, blocks, { row: 1, col: 0 }), 0)
+  eq('没被任何块包含就是 -1', cellRectIndexOf(grid, blocks, { row: 3, col: 0 }), -1)
+
+  // ---- 批量落笔：只改选中的格，隔壁一个都不许动 ----
+  const target = cellsInRect(grid, cellRectBetween({ row: 1, col: 1 }, { row: 2, col: 2 }))
+  const untouched = JSON.stringify({ unit: grid.rows[0], note: grid.rows[3], col0: [grid.rows[1].cells[0], grid.rows[2].cells[0]] })
+  setCellsKind(grid, target, 'h2')
+  eq(
+    '批量换样式只改选中的 4 格',
+    grid.rows
+      .flatMap((row, ri) => row.cells.map((cell, ci) => (cell.kind ? `${ri},${ci}` : '')))
+      .filter((s) => s !== '')
+      .join('|'),
+    '1,1|1,2|2,1|2,2',
+  )
+  eq(
+    '隔壁格（含 unit / note 行）一个都没动',
+    JSON.stringify({ unit: grid.rows[0], note: grid.rows[3], col0: [grid.rows[1].cells[0], grid.rows[2].cells[0]] }),
+    untouched,
+  )
+  eq('没改的格不落冗余字段', grid.rows[1].cells[0].kind, undefined)
+
+  setCellsAlign(grid, target, 'h', 'center')
+  eq('批量水平对齐写进选中的 4 格', target.every(({ row, col }) => grid.rows[row].cells[col].align?.h === 'center'), true)
+  eq('没选中的格没有 align 字段', grid.rows[1].cells[0].align, undefined)
+  eq('批量垂直对齐另一维', (setCellsAlign(grid, target, 'v', 'middle'), target.every(({ row, col }) => grid.rows[row].cells[col].align?.v === 'middle')), true)
+  setCellsAlign(grid, target, 'h', null)
+  setCellsAlign(grid, target, 'v', null)
+  eq(
+    '清除覆盖（null）两维都没了就连 align 字段一起删',
+    target.every(({ row, col }) => grid.rows[row].cells[col].align === undefined),
+    true,
+  )
+
+  // ---- 预判：空转就不该记撤销（组件据此返回 false） ----
+  eq('本来就没覆盖 → 没有要改的格', cellsChangingAlign(grid, target, 'h', null).length, 0)
+  eq('要写一个不同的值 → 4 格都要改', cellsChangingAlign(grid, target, 'h', 'left').length, 4)
+  eq('样式已经一致 → 没有要改的格', cellsChangingKind(grid, target, 'h2').length, 0)
+  eq('样式不一致 → 4 格都要改', cellsChangingKind(grid, target, 'body').length, 4)
+  eq('预判也按行优先', keys(cellsChangingAlign(grid, target, 'h', 'left')), '1,1|1,2|2,1|2,2')
+
+  // ---- 批量对齐的「再点同一个值 = 清除覆盖」规则 ----
+  eq('整批都等于目标值 → 清除（null）', nextAlignValue(['center', 'center'], 'center'), null)
+  eq('有一格不同 → 一律写目标值', nextAlignValue(['center', 'left'], 'center'), 'center')
+  eq('空批不算「一致」（不能误清）', nextAlignValue([], 'center'), 'center')
+
+  // ---- 存储值（预判与落笔共用同一个读法） ----
+  eq('storedCellKind 的缺省语义是 listItem', storedCellKind({ inlines: [] }), 'listItem')
+  eq('storedCellAlign 缺省 null', storedCellAlign({ inlines: [] }, 'h'), null)
+  eq('storedCellAlign 读得到覆盖', storedCellAlign({ inlines: [], align: { v: 'bottom' } }, 'v'), 'bottom')
+}
+
+console.log('\n=== 29. 表头 / 附注行恒「最小一行」：CSS 侧的规则（W7 第②条）===')
+{
+  // 这条规则的另一半在 docx/export.ts（w:trHeight），由 verify:docx / verify:p1 在字节与磅值层核对；
+  // 这里盯的是预览 CSS 的生成结果 —— 两条规则谁盖谁，是纯字符串就能定下来的事。
+  const css = buildCss(resolveSpec())
+  const lines = css.split('\n')
+  const min2Rules = lines.filter((line) => line.includes('wtp-table-min2 td.'))
+  eq('-min2 的行高规则逐条样式生成（条数 = 样式数）', min2Rules.length, STYLE_KEYS.length)
+  ok(
+    '每条 -min2 规则都排除了 plain 行（否则表头/附注行会被撑成两行）',
+    min2Rules.every((line) => line.includes(':not(.wtp-td-plain)')),
+    min2Rules.join(' / '),
+  )
+  eq(
+    'plain 行的下限仍由不带 -min2 的那条规则提供',
+    lines.filter((line) => /^\.wtp-table td\.wtp-td-\w+ \{ height: [\d.]+pt; \}$/.test(line)).length,
+    STYLE_KEYS.length,
+  )
+  ok(
+    '整格复选的高亮只给底色，不碰 padding / height / border',
+    lines.some(
+      (line) =>
+        new RegExp(`^\\.wtp-table td\\.${CELL_SELECTION_CLASS} \\{ background: [^}]+\\}$`).test(
+          line,
+        ),
+    ),
+    lines.find((line) => line.includes(CELL_SELECTION_CLASS)) ?? '(没有这条规则)',
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

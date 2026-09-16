@@ -30,7 +30,10 @@ import { createServer } from 'vite'
 import {
   SEARCH_CURRENT_HIGHLIGHT,
   SEARCH_HIGHLIGHT,
+  cellRectBetween,
+  cellsInRects,
   computeNumbering,
+  ptToPx,
   resolveSpec,
 } from '../dist-lib/wordtohtml.mjs'
 
@@ -2691,13 +2694,19 @@ try {
     sel.addRange(r)
     return Array.from(content.querySelectorAll('[data-block-id]')).map((el) => el.dataset.blockId)
   })
+  /*
+   * 页面上挂 data-block-id 的东西不止「块」：表格的每个格子也挂着（cellId 形态 `tbl.rNcM`），
+   * 而并段语义只管段落。期望值只能数**段落** —— 页首摊着表格时按元素个数算会多算一截
+   * （2026-09-16 W7：② 把表头行挪到第 1 页之后，这里就数多了一行表格的格子）。
+   */
+  const xPageBlocks = xPageIds.filter((id) => !/\.r\d+c\d+$/.test(id))
   await page.keyboard.press('Delete')
   await page.waitForTimeout(500)
   const xAfterAll = await getModel()
   eq(
     '全选整页删除：块数减少 n−1（各段并成一段）',
     heroBlocks(xAfterAll).length,
-    heroBlocks(xBeforeAll).length - (xPageIds.length - 1),
+    heroBlocks(xBeforeAll).length - (xPageBlocks.length - 1),
   )
   eq(
     '全选整页删除：留下的是该页第一块，文字清空',
@@ -3157,6 +3166,427 @@ try {
   await toSourceView()
   await page.waitForTimeout(300)
   ok('序列化里有 nav=off', (await sourceText()).includes('nav=off'), (await sourceText()).slice(0, 60))
+
+  /* ------------------------------------------------------------------ */
+  console.log(
+    '\n=== AF. 表格复选多格（W7 第①条）：拖动刷选 / Ctrl+点击 / 批量对齐与样式 / 不重排 ===',
+  )
+  const cellSel = () => page.evaluate(() => window.__wtpPaper.getCellSelection())
+  const selKeys = async () =>
+    ((await cellSel())?.cells ?? []).map((c) => `${c.row},${c.col}`).join('|')
+  /** DOM 上带高亮类的 <td>（按 data-cell-id 排序） */
+  const highlighted = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('.wtp-table td.wtp-cellsel'))
+        .map((td) => td.dataset.cellId ?? '')
+        .sort(),
+    )
+  const pageHeights = () =>
+    page.evaluate(() => Array.from(document.querySelectorAll('.wtp-page')).map((el) => el.offsetHeight))
+  /** 量测快照（每块的行数 / 行高、每行表格的高）—— 刷选绝不该让它变 */
+  const measuredSignature = () =>
+    page.evaluate(() =>
+      window.__wtpPaper
+        .getMeasurements()
+        .map((m) =>
+          m.t === 'break'
+            ? `B:${m.kind}`
+            : m.t === 'tableRow'
+              ? `T:${m.blockId}:${m.row}:${Math.round(m.height * 100)}`
+              : `${m.blockId}:${m.rows}:${Math.round(m.lineHeight * 100)}`,
+        )
+        .join('|'),
+    )
+  /**
+   * 一次读回两个格子的中心点。**必须先滚到能同时看到两端的地方**：
+   * 分两次滚会拿到过期的坐标（第一次滚完之后另一端的 rect 已经变了），
+   * 所以滚的是两端之间的中间那一行。
+   */
+  async function cellSpan(tableId, from, to) {
+    const idOf = ([r, c]) => `${tableId}.r${r}c${c}`
+    const midRow = Math.round((from[0] + to[0]) / 2)
+    await page.evaluate((id) => {
+      document.querySelector(`.wtp-table td[data-cell-id="${id}"]`)?.scrollIntoView({ block: 'center' })
+    }, `${tableId}.r${midRow}c0`)
+    await page.waitForTimeout(80)
+    return page.evaluate(
+      ({ a, b }) => {
+        const center = (id) => {
+          const td = document.querySelector(`.wtp-table td[data-cell-id="${id}"]`)
+          if (!td) return null
+          const box = td.getBoundingClientRect()
+          return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
+        }
+        return { a: center(a), b: center(b), viewportHeight: window.innerHeight }
+      },
+      { a: idOf(from), b: idOf(to) },
+    )
+  }
+  /** 从 from 格拖到 to 格（越过起点格 → 整格刷选）。返回 false = 坐标没取到 / 不在视口里 */
+  async function brush(tableId, from, to, ctrl = false) {
+    const span = await cellSpan(tableId, from, to)
+    if (!span?.a || !span?.b) return false
+    // 坐标落在视口外的话指针事件到不了版心，刷选会静默失效 —— 当成失败报出来
+    if (![span.a, span.b].every((p) => p.y > 0 && p.y < span.viewportHeight)) {
+      failures.push(`刷选坐标落在视口外：${JSON.stringify(span)}`)
+      return false
+    }
+    await page.mouse.move(span.a.x, span.a.y)
+    if (ctrl) await page.keyboard.down('Control')
+    await page.mouse.down()
+    await page.mouse.move(span.b.x, span.b.y, { steps: 8 })
+    await page.mouse.up()
+    if (ctrl) await page.keyboard.up('Control')
+    await page.waitForTimeout(180)
+    return true
+  }
+  /** Ctrl+点击某一格（不拖动） */
+  async function ctrlClick(tableId, row, col) {
+    const span = await cellSpan(tableId, [row, col], [row, col])
+    if (!span?.a) return false
+    await page.mouse.move(span.a.x, span.a.y)
+    await page.keyboard.down('Control')
+    await page.mouse.down()
+    await page.mouse.up()
+    await page.keyboard.up('Control')
+    await page.waitForTimeout(180)
+    return true
+  }
+  /** 某一格内第 i / 第 j 个字符的中心点（同一格里拖动 = 普通的选文字） */
+  async function cellCharSpan(cellIdValue, i, j) {
+    return page.evaluate(
+      ({ id, i: from, j: to }) => {
+        const cell = document.querySelector(`.wtp-cell[data-block-id="${id}"]`)
+        if (!cell) return null
+        const node = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT).nextNode()
+        if (!node) return null
+        const at = (o) => {
+          const range = document.createRange()
+          range.setStart(node, o)
+          range.setEnd(node, Math.min(o + 1, node.data.length))
+          const box = range.getBoundingClientRect()
+          return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
+        }
+        return { a: at(from), b: at(to), text: node.data }
+      },
+      { id: cellIdValue, i, j },
+    )
+  }
+  /** 点正文里的某一处（点正文别处 = 复选收起） */
+  async function clickParagraph(needle) {
+    const spot = await page.evaluate((text) => {
+      const frag = window.__wtpTest.fragmentByText(text)
+      if (!frag) return null
+      frag.scrollIntoView({ block: 'center' })
+      const box = frag.getBoundingClientRect()
+      return { x: box.left + 8, y: box.top + box.height / 2 }
+    }, needle)
+    if (!spot) return false
+    await page.waitForTimeout(80)
+    await page.mouse.click(spot.x, spot.y)
+    await page.waitForTimeout(180)
+    return true
+  }
+  const tdInlineAlign = (ids) =>
+    page.evaluate(
+      (list) =>
+        list.map(
+          (id) =>
+            document.querySelector(`.wtp-cell[data-block-id="${id}"]`)?.style.textAlign ?? 'none',
+        ),
+      ids,
+    )
+  const cellIdsOf = (tableIdValue, cells) =>
+    cells.map((c) => `${tableIdValue}.r${c.row}c${c.col}`)
+  const alignCountOf = (t) =>
+    t.rows.reduce((n, r) => n + r.cells.filter((c) => c.align !== undefined).length, 0)
+  const kindCountOf = (t) => t.rows.reduce((n, r) => n + r.cells.filter((c) => c.kind).length, 0)
+
+  // ---- AF1. 拖动刷选 2×2：模型坐标 4 格、DOM 4 个高亮 <td>、不留原生选区、不重排 ----
+  await openApp('表格')
+  const af1 = await modelTable()
+  const afId = af1.id
+  // 期望值从模型 + 纯函数现推：rows1..2 × cols1..2 恰好 4 格
+  const wantCells = cellsInRects(af1, [cellRectBetween({ row: 1, col: 1 }, { row: 2, col: 2 })])
+  eq('（前置）样本表这个 2×2 区域恰好 4 格', wantCells.length, 4)
+  // 给版面上的每个片段打一个身份标记：刷选之后它们必须还在（= 没有重建 DOM）
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('.wtp-content > *')) el.__wtpNode = 1
+  })
+  const heightsBefore = await pageHeights()
+  const measuredBefore = await measuredSignature()
+  ok('刷选动作本身做得出（两端都滚进了视口）', await brush(afId, [1, 1], [2, 2]))
+  eq('刷选后模型坐标下的选中格数 = 4', (await cellSel())?.cells.length, 4)
+  eq('选中的正是那 4 格（行优先）', await selKeys(), '1,1|1,2|2,1|2,2')
+  eq('DOM 上恰好 4 个 <td> 带高亮类', (await highlighted()).length, 4)
+  eq(
+    '带高亮的 <td> 就是那 4 格（按 data-cell-id 对）',
+    (await highlighted()).join('|'),
+    cellIdsOf(afId, wantCells).sort().join('|'),
+  )
+  const nativeSel = await page.evaluate(() => {
+    const s = document.getSelection()
+    return { ranges: s?.rangeCount ?? 0, collapsed: s?.isCollapsed ?? true, text: s?.toString() ?? '' }
+  })
+  ok(
+    '拖出格边界时没有残留原生选区（塌掉了 / 或本就没有范围）',
+    nativeSel.ranges === 0 || nativeSel.collapsed,
+    JSON.stringify(nativeSel),
+  )
+  eq('刷选不改页数', (await pageHeights()).length, heightsBefore.length)
+  eq('刷选不改每页纸的高度（底色不进几何）', JSON.stringify(await pageHeights()), JSON.stringify(heightsBefore))
+  eq('刷选不改量测（每块行数 / 行高逐条不变）', await measuredSignature(), measuredBefore)
+  eq(
+    '刷选没有重建版面 DOM（片段仍是原来那些节点）',
+    await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.wtp-content > *')).every((el) => el.__wtpNode === 1),
+    ),
+    true,
+  )
+  ok(
+    '表格页的提示换成「已选 4 格」',
+    (await subToolbar.innerText()).includes('已选 4 格'),
+    await subToolbar.innerText(),
+  )
+  eq('多选时对齐按钮按整批回显：body 格默认两端对齐 → 水平一个都不亮', (await activeLabels('水平')).join(','), '')
+  await checkNoOverflow('AF1 刷选之后')
+
+  // ---- AF2. 格内选文字不受影响（硬要求）：同一格里拖 → 原生选中文字、格数为 0 ----
+  await openApp('表格')
+  const af2Id = (await modelTable()).id
+  ok('（前置）先刷出 4 格', await brush(af2Id, [1, 1], [2, 2]) && (await cellSel()) !== null)
+  const chars = await cellCharSpan(`${af2Id}.r2c0`, 0, 5)
+  ok('取到格内文字的两个字符点', chars !== null && chars.text.includes('数控加工中心'), JSON.stringify(chars))
+  await page.mouse.move(chars.a.x, chars.a.y)
+  await page.mouse.down()
+  await page.mouse.move(chars.b.x, chars.b.y, { steps: 6 })
+  await page.mouse.up()
+  await page.waitForTimeout(180)
+  const textSel = await page.evaluate(() => {
+    const s = document.getSelection()
+    return { ranges: s?.rangeCount ?? 0, collapsed: s?.isCollapsed ?? true, text: s?.toString() ?? '' }
+  })
+  ok(
+    '在同格里拖动 = 普通的选文字（原生选区真的选中了字）',
+    textSel.ranges > 0 && !textSel.collapsed && textSel.text.length > 0,
+    JSON.stringify(textSel),
+  )
+  eq('格内选文字时选中格数 = 0（复选被清空）', JSON.stringify(await cellSel()), 'null')
+  eq('高亮一个都不剩', (await highlighted()).length, 0)
+
+  // ---- AF3. Ctrl+点击追加 / 去掉、Esc 清空、点正文别处清空 ----
+  await openApp('表格')
+  const af3 = await modelTable()
+  const af3Id = af3.id
+  ok('Ctrl+点击第一格', await ctrlClick(af3Id, 1, 0))
+  eq('此前没有复选 → Ctrl+点击 = 只选这一格', await selKeys(), '1,0')
+  ok('Ctrl+点击对角的格', await ctrlClick(af3Id, 3, 2))
+  const wantCross = cellsInRects(af3, [cellRectBetween({ row: 1, col: 0 }, { row: 3, col: 2 })])
+  eq('（前置）「锚格↔点击格」那块矩形是 3×3 = 9 格', wantCross.length, 9)
+  eq(
+    'Ctrl+点击追加：并上锚格↔点击格的矩形',
+    await selKeys(),
+    wantCross.map((c) => `${c.row},${c.col}`).join('|'),
+  )
+  eq('高亮跟着变成 9 个 <td>', (await highlighted()).length, 9)
+  ok('Ctrl+点击已选中的格', await ctrlClick(af3Id, 3, 2))
+  eq('Ctrl+点击一个已被选中的格子 = 把包含它的那一块去掉', await selKeys(), '1,0')
+  await page.waitForTimeout(120)
+  ok(
+    'Esc 之前焦点还在正文里（键盘事件才达得到组件的处理器）',
+    await page.evaluate(() => document.activeElement?.classList?.contains('wtp-content') === true),
+  )
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(180)
+  eq('Esc 清空复选', JSON.stringify(await cellSel()), 'null')
+  eq('Esc 之后高亮也没了', (await highlighted()).length, 0)
+  ok('（前置）再刷出 4 格', await brush(af3Id, [1, 1], [2, 2]) && (await cellSel()) !== null)
+  ok('点正文别处', await clickParagraph('我方于2026年9月1日'))
+  eq('点正文别处清空复选', JSON.stringify(await cellSel()), 'null')
+  eq('高亮也跟着清干净', (await highlighted()).length, 0)
+
+  // ---- AF4. 批量对齐：4 格一起写进模型、隔壁一个不动、一步撤销退回整批 ----
+  await openApp('表格')
+  const af4 = await modelTable()
+  const af4Id = af4.id
+  const af4Targets = cellIdsOf(
+    af4Id,
+    cellsInRects(af4, [cellRectBetween({ row: 1, col: 1 }, { row: 2, col: 2 })]),
+  )
+  const af4PagesBefore = (await pageHeights()).length
+  ok('（前置）刷出 4 格', await brush(af4Id, [1, 1], [2, 2]) && (await cellSel())?.cells.length === 4)
+  await alignButton('水平', '居中').click()
+  await page.waitForTimeout(300)
+  const af4Applied = await modelTable()
+  const alignHOf = (t, r, c) => t.rows[r]?.cells[c]?.align?.h
+  const af4Quads = [[1, 1], [1, 2], [2, 1], [2, 2]]
+  ok(
+    '批量「居中」：4 格都写进模型（align.h = center）',
+    af4Quads.every(([r, c]) => alignHOf(af4Applied, r, c) === 'center'),
+    JSON.stringify(af4Quads.map(([r, c]) => alignHOf(af4Applied, r, c))),
+  )
+  eq(
+    '隔壁格一个都没动（带 align 字段的格只多了这 4 个）',
+    alignCountOf(af4Applied) - alignCountOf(af4),
+    4,
+  )
+  eq(
+    'DOM：那 4 格的行内 text-align 都对，别处没有 center',
+    JSON.stringify(await tdInlineAlign(af4Targets)),
+    JSON.stringify(['center', 'center', 'center', 'center']),
+  )
+  eq('点完「居中」按钮亮着（active 态吃已解析的实际值）', (await activeLabels('水平')).join(','), '居中')
+  eq('批量操作之后复选还在（坐标没挪，选中态不该被清）', (await cellSel())?.cells.length, 4)
+  eq('批量对齐不改页数（对齐不挪行高、不改换行点）', (await pageHeights()).length, af4PagesBefore)
+  await checkNoOverflow('AF4 批量对齐之后')
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const af4Undone = await modelTable()
+  ok(
+    'ctrl+Z 一步退回整批（4 格的 align.h 都没了）',
+    af4Quads.every(([r, c]) => alignHOf(af4Undone, r, c) === undefined),
+    JSON.stringify(af4Quads.map(([r, c]) => alignHOf(af4Undone, r, c))),
+  )
+  eq('撤销没有牵连别的格', alignCountOf(af4Undone), alignCountOf(af4))
+
+  // ---- AF5. 批量样式：只有那 4 格换类名（页数允许变） ----
+  await openApp('开始')
+  const af5 = await modelTable()
+  const af5Id = af5.id
+  const af5Targets = cellIdsOf(
+    af5Id,
+    cellsInRects(af5, [cellRectBetween({ row: 1, col: 1 }, { row: 2, col: 2 })]),
+  )
+  ok('（前置）刷出 4 格', await brush(af5Id, [1, 1], [2, 2]) && (await cellSel())?.cells.length === 4)
+  await page.locator('.styles .style-chip', { hasText: '二级标题' }).click()
+  await page.waitForTimeout(350)
+  const af5Applied = await modelTable()
+  const af5Quads = [[1, 1], [1, 2], [2, 1], [2, 2]]
+  ok(
+    '批量样式：只有那 4 格换成 h2',
+    af5Quads.every(([r, c]) => af5Applied.rows[r]?.cells[c]?.kind === 'h2'),
+    JSON.stringify(af5Quads.map(([r, c]) => af5Applied.rows[r]?.cells[c]?.kind ?? null)),
+  )
+  eq('隔壁格一个都没动（带 kind 的格只多了这 4 个）', kindCountOf(af5Applied) - kindCountOf(af5), 4)
+  eq(
+    'DOM 里恰好 4 格是 wtp-h2',
+    await page.evaluate(() => document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2').length),
+    4,
+  )
+  eq(
+    '那 4 格的类名就是这 4 个 id',
+    (
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll('.wtp-table .wtp-cell.wtp-h2'))
+          .map((el) => el.dataset.blockId ?? '')
+          .sort(),
+      )
+    ).join('|'),
+    af5Targets.slice().sort().join('|'),
+  )
+  await page.keyboard.press('Control+z')
+  await page.waitForTimeout(300)
+  const af5Undone = await modelTable()
+  ok(
+    'ctrl+Z 一步退回整批（4 格的 kind 都没了）',
+    af5Quads.every(([r, c]) => af5Undone.rows[r]?.cells[c]?.kind === undefined),
+    JSON.stringify(af5Quads.map(([r, c]) => af5Undone.rows[r]?.cells[c]?.kind ?? null)),
+  )
+  await checkNoOverflow('AF5 批量样式之后')
+
+  // ---- AF6. 跨页的表：样本里没有就照实说明（不为它改样本） ----
+  const splitTables = await page.evaluate(() => {
+    const counts = new Map()
+    for (const frag of document.querySelectorAll('.wtp-tableFrag')) {
+      const id = frag.dataset.tableId ?? ''
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+    return [...counts.entries()].filter(([, n]) => n > 1).map(([id]) => id)
+  })
+  if (splitTables.length === 0) {
+    console.log('  --   样本里没有跨页的表：跨页高亮这一条**无法验证**（不为它改 demo 样本）')
+  } else {
+    // 有跨页表就验它：同一张表被分页切成几片，高亮就该在每一片上都画到
+    await openApp('表格')
+    const cross = splitTables[0]
+    const crossModel = await getModel()
+    const crossTable = crossModel.blocks.find((b) => b.t === 'table' && b.id === cross)
+    const crossId = crossTable.id
+    const lastBody = crossTable.rows.reduce((last, r, i) => (r.role === 'body' ? i : last), 0)
+    /*
+     * 两片隔着一个分页断点，视口里同时看不到两端 —— 拖动刷选做不出来（两端必须同时可见），
+     * 改用两次 Ctrl+点击凑出跨断点的那个矩形：第 0 行（在上一片）↔ 最后一个正文行（在下一片）。
+     */
+    ok('（前置）跨页表：Ctrl+点击第 0 行', await ctrlClick(crossId, 0, 0))
+    ok(
+      '（前置）跨页表：Ctrl+点击最后一个正文行',
+      await ctrlClick(crossId, lastBody, crossTable.columns - 1),
+    )
+    const painted = await page.evaluate(
+      (id) =>
+        Array.from(document.querySelectorAll('.wtp-tableFrag'))
+          .filter((frag) => (frag.dataset.tableId ?? '') === id)
+          .map((frag) => frag.querySelectorAll('td.wtp-cellsel').length),
+      crossId,
+    )
+    ok('（前置）跨页表：两片都在页面上', painted.length > 1, JSON.stringify(painted))
+    eq(
+      '跨页表：每一片上都画到了高亮（按模型坐标判，不按 DOM 元素记）',
+      painted.filter((n) => n > 0).length,
+      painted.length,
+    )
+  }
+
+  // ---- AF7. ② 表头 / 附注行恒「最小一行」（minLines=2 也不变高） ----
+  await openApp('表格')
+  await page.evaluate(() => window.__wtpTest.caretAtEndOf('数控加工中心'))
+  await page.waitForTimeout(200)
+  /** 每种行角色第一个 <td> 的实测高（plain = unit / note 行，body = 正文行） */
+  const rowTdHeights = () =>
+    page.evaluate(() => {
+      const out = { plain: [], body: [] }
+      for (const tr of document.querySelectorAll('.wtp-table tbody tr')) {
+        const td = tr.querySelector('td')
+        if (!td) continue
+        const h = Math.round(td.getBoundingClientRect().height)
+        if (tr.classList.contains('wtp-tr-plain')) out.plain.push(h)
+        else out.body.push(h)
+      }
+      return out
+    })
+  // 期望值从规格表现推：一行高 = 列表段落样式的 linePt（两边都不硬编码）
+  const oneLinePx = ptToPx(resolveSpec().styles.listItem.linePt)
+  const min2Heights = await rowTdHeights()
+  eq('样本表是 minLines=2（前置）', (await modelTable())?.minLines, 2)
+  ok(
+    'minLines=2：表头行 / 附注行的格高 = 一行（不随行高设置变）',
+    min2Heights.plain.length >= 2 && min2Heights.plain.every((h) => Math.abs(h - oneLinePx) <= 3),
+    `${JSON.stringify(min2Heights)}，一行≈${oneLinePx}px`,
+  )
+  // 只拿第一个正文行（表头那行，格内都只有一行字）比：别处有 Shift+Enter 软换行的格子，
+  // 那种格的内容本来就比下限高（height 是「最小高度」，内容更高照样撑开）
+  ok(
+    'minLines=2：正文行的格高 = 两行',
+    min2Heights.body.length > 0 && Math.abs((min2Heights.body[0] ?? 0) - oneLinePx * 2) <= 3,
+    `${JSON.stringify(min2Heights)}，两行≈${oneLinePx * 2}px`,
+  )
+  await subRadio('行高', '最小一行').click()
+  await page.waitForTimeout(350)
+  const min1Heights = await rowTdHeights()
+  eq('切成最小一行（前置）', (await modelTable())?.minLines, 1)
+  ok(
+    'minLines=1：表头行 / 附注行的格高仍是一行（跟着行高设置变就错了）',
+    min1Heights.plain.every((h) => Math.abs(h - oneLinePx) <= 3),
+    `${JSON.stringify(min1Heights)}，一行≈${oneLinePx}px`,
+  )
+  ok(
+    'minLines=1：正文行的格高也回到一行（三种行都一样）',
+    min1Heights.body.length > 0 && Math.abs((min1Heights.body[0] ?? 0) - oneLinePx) <= 3,
+    `${JSON.stringify(min1Heights)}，一行≈${oneLinePx}px`,
+  )
+  await subRadio('行高', '最小两行').click()
+  await page.waitForTimeout(350)
+  await checkNoOverflow('AF7 行高切换之后')
 } finally {
   await browser?.close()
   await server.close()
@@ -3182,5 +3612,8 @@ console.log(
     '格内垂直对齐（最小两行 + 单行文字时三档真的生效，且不改格高）、' +
     'W6：功能区四页 offsetHeight 相等、自定义快捷键表（改绑后新组合生效 / 旧组合失效 / 未知动作名不改默认表）、' +
     'F4 重复上一步（空转提示、换处重放、撤销只退这一步）、顶栏文件名（无 slogan、导出名 = 文件名 + .docx、空名兜底）、' +
-    '::editor 写进 md（源码 → 顶栏开关、顶栏开关 → 源码那一行）均落到模型。',
+    '::editor 写进 md（源码 → 顶栏开关、顶栏开关 → 源码那一行）均落到模型；' +
+    'W7：表格整格复选（拖动刷选 2×2 = 4 格且高亮 4 个 <td>、拖出格边界不留原生选区、刷选不重排不重建 DOM、' +
+    '格内拖选文字不受影响（格数为 0）、Ctrl+点击追加与去掉、Esc / 点正文别处清空、' +
+    '批量对齐与批量样式只改选中的格且一步撤销退整批、对齐不改页数、表头与附注行恒一行高）。',
 )

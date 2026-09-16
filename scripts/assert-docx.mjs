@@ -285,7 +285,8 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
    *   水平 = cell.align.h ?? 角色默认（unit 右 / note 左 / body 跟该格样式）
    *   垂直 = cell.align.v ?? top（middle 在 OOXML 里写 center，Word 报枚举 1）
    *   样式 = 该格 kind ?? listItem；kind === 'body' 时不挂样式 → Word 报 Normal 的本地名「正文」
-   *   行高 = minLines × 该行各格样式 linePt 的最大值（渲染后的 0..columns-1，缺格按 listItem）
+   *   行高 = (body 行 ? minLines : 1) × 该行各格样式 linePt 的最大值（渲染后的 0..columns-1，
+   *          缺格按 listItem；表头行 / 附注行恒一行，W7）
    */
   const renderedCells = (t, row) =>
     row.role === 'body'
@@ -344,9 +345,10 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
       eq(`${tag}·禁止跨页断行`, dr.cantSplit, t.cantSplit ? 1 : 0)
       eq(`${tag}·行高规则`, dr.heightRule, ROW_HEIGHT_AT_LEAST)
       const cells = renderedCells(t, row)
-      // 行高 = minLines × 该行各格样式 linePt 的最大值（与导出侧同一条规则）
+      // 行高 = (body 行 ? minLines : 1) × 该行各格样式 linePt 的最大值（与导出侧同一条规则）。
+      // 表头行 / 附注行恒一行（W7）
       const rowMaxLinePt = Math.max(...cells.map((c) => spec.styles[c.kind ?? 'listItem'].linePt))
-      near(`${tag}·行高(磅)`, dr.height, t.minLines * rowMaxLinePt, 0.1)
+      near(`${tag}·行高(磅)`, dr.height, (merged ? 1 : t.minLines) * rowMaxLinePt, 0.1)
 
       for (let c = 0; c < expectedCells; c += 1) {
         const cell = dr.cells?.[c]
@@ -384,7 +386,7 @@ console.log('\n=== 3c. 表格（行数 / 格数 / 整行合并 / 行高规则 / 
   if (failures.length === before) {
     console.log(
       `ok   表格对账：${modelTables.length} 张表全部与模型/规格表吻合` +
-        `（总宽≈${round2(contentWidthPt)}磅；逐行行高 = minLines × 该行各格样式 linePt 的最大值；` +
+        `（总宽≈${round2(contentWidthPt)}磅；逐行行高 = (body 行 ? minLines : 1) × 该行各格样式 linePt 的最大值；` +
         `逐格样式（${cellStyleChecks} 格）/水平对齐/垂直对齐逐项对上）`,
     )
   }

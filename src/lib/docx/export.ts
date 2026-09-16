@@ -362,8 +362,12 @@ function tableBlock(block: TableBlock, spec: Spec): Table {
   const total = contentWidthTwips(spec)
 
   const rows = block.rows.map((row) => {
-    // 行高按该行各格样式的最大 linePt（缺格按 listItem），与预览侧同一条规则
-    const rowHeight = ptToTwips(block.minLines * rowLinePt(row, block.columns, spec))
+    // 行高按该行各格样式的最大 linePt（缺格按 listItem），与预览侧同一条规则；
+    // 表头行 / 附注行恒**一行**（W7）—— `minLines` 只管正文行：这两行是整张表的装饰，
+    // 跟着行高设置一起变高只会白白把表格撑长（预览侧同一条规则，见 render/css.ts 的表格一段）。
+    const rowHeight = ptToTwips(
+      (row.role === 'body' ? block.minLines : 1) * rowLinePt(row, block.columns, spec),
+    )
     let cells: TableCell[]
     if (row.role === 'body') {
       cells = []

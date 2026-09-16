@@ -107,10 +107,14 @@ export function renderInlinesHtml(
  *   · `unit` / `note` 行天然整行一格（`colspan = columns`、无边框）。它们的角色默认对齐
  *     （unit 右、note 左）写在格内 div 的行内 style 上；逐格覆盖也走同一条路。
  *     垂直对齐只能写在 `<td>` 上（格内 div 上的 vertical-align 无效）。
- *   · `<td>` 挂 `wtp-td` + `wtp-td-<kind>`（plain 行另有 `wtp-td-plain`），
+ *   · `<td>` 挂 `wtp-td` + `wtp-td-<kind>`（plain 行另有 `wtp-td-plain`）+ 恒定的
+ *     `data-cell-id`（与格内 div 的 `data-block-id` 同一个值），
  *     行高的**最小值**由 CSS 按这个类名写在 `td` 的 `height` 上（不是格内 div 的 min-height）
  *     —— 写在内层 div 上会把 div 本身撑成两行高，`vertical-align` 就再也挪不动那一行字了
  *     （div 已经填满整个格子，对齐的是 div 而不是 div 里的字）。见 css.ts 的表格一段。
+ *     `data-cell-id` 是给**整格复选**的高亮用的：它只由模型决定（与选中态无关），
+ *     所以量测缓存签名、逐块量测对账都不受影响；选中高亮由组件在 DOM 上按它挂类名
+ *     （见 css.ts 的 CELL_SELECTION_CLASS）。
  */
 export function renderTableFragment(block: TableBlock, rowFrom: number, rowTo: number): string {
   const columns = Math.max(1, block.columns)
@@ -164,7 +168,8 @@ function tableBodyRow(
     const tdStyle = cell.align?.v ? ` style="vertical-align:${cell.align.v}"` : ''
     const tdClass = `wtp-td wtp-td-${cell.kind ?? 'listItem'}`
     cells.push(
-      `<td class="${tdClass}"${tdStyle}>${tableCellHtml(block.id, r, c, cell, divStyle)}</td>`,
+      `<td class="${tdClass}" data-cell-id="${cellId(block.id, r, c)}"${tdStyle}>` +
+        `${tableCellHtml(block.id, r, c, cell, divStyle)}</td>`,
     )
   }
   return `<tr>${cells.join('')}</tr>`
@@ -184,7 +189,8 @@ function tablePlainRow(
   const divStyle = `text-align: ${cssTextAlign(h)}`
   const tdClass = `wtp-td wtp-td-plain wtp-td-${cell.kind ?? 'listItem'}`
   return (
-    `<tr class="wtp-tr-plain"><td class="${tdClass}" colspan="${columns}" ` +
-    `style="vertical-align:${v}">${tableCellHtml(block.id, r, 0, cell, divStyle)}</td></tr>`
+    `<tr class="wtp-tr-plain"><td class="${tdClass}" data-cell-id="${cellId(block.id, r, 0)}" ` +
+    `colspan="${columns}" style="vertical-align:${v}">` +
+    `${tableCellHtml(block.id, r, 0, cell, divStyle)}</td></tr>`
   )
 }

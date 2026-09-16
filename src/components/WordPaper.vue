@@ -73,29 +73,45 @@ import {
   splitBlock,
   updateComment as updateCommentOp,
 } from '../lib/edit/model'
-import type { BlockPoint, EditorSelection, SectionSelectionContext } from '../lib/edit/model'
+import type {
+  BlockPoint,
+  CellSelectionSummary,
+  EditorSelection,
+  SectionSelectionContext,
+} from '../lib/edit/model'
 import {
   bodyInsertIndex,
   bodyRowIndexes,
+  cellRectBetween,
+  cellRectIndexOf,
+  cellsChangingAlign,
+  cellsChangingKind,
+  cellsInRects,
   findCell,
   findTable,
   insertBodyRow,
   insertColumn,
+  nextAlignValue,
+  normalizeCellCol,
   removeBodyRow,
   removeColumn,
   removeTable as removeTableOp,
-  setCellAlign,
+  setCellsAlign,
+  setCellsKind,
   setMinLines,
   setRoleRow,
+  sortCells,
   stepCell,
+  storedCellKind,
   verticalCell,
 } from '../lib/edit/table'
-import type { CellStep } from '../lib/edit/table'
+import type { CellRect, CellRef, CellStep } from '../lib/edit/table'
 import { parseMd } from '../lib/md/parse'
 import { computeNumbering } from '../lib/numbering'
 import { resolveSections } from '../lib/section'
 import type { ResolvedSection } from '../lib/section'
 import {
+  CELL_SELECTION_CLASS,
   KEEP_SELECTION_HIGHLIGHT,
   SEARCH_CURRENT_HIGHLIGHT,
   SEARCH_HIGHLIGHT,
@@ -223,6 +239,19 @@ let preEditCaret: DisplayPoint | null = null
 let stickyRanges: DisplayRange[] = []
 /** 组字结束的兜底读回（浏览器不补 input 事件时用） */
 let compSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+/*
+ * 表格整格复选（W7）。故意**不用响应式**，理由是它就是「不重排」本身：
+ * 做成 ref 会让 v-html 的片段跟着重渲，格内 DOM 被重建一次（插入符、原生选区一起丢），
+ * 而这条交互的全部要求恰恰是「刷选、Ctrl+点击、清空选中一律不许改 viewDoc / pages、
+ * 不许触发重量测与重建 DOM」。所以状态放在模块级变量里，高亮由 paintCellSelection
+ * 命令式地挂类名（只改 class，不动几何）。
+ */
+let cellSelection: CellSelection | null = null
+/** 上一次整格操作的落点（Ctrl+点击追加时的锚格） */
+let cellAnchor: CellRef | null = null
+/** 正在按下的这一次指针手势；没有越出起点格之前它只是普通的选文字 */
+let cellDrag: CellDrag | null = null
 
 /* 查找会话。故意不用响应式：面板由调用方持有，组件只需要在数字/指纹变化时 emit，
    而这些状态每敲一个字都可能变，做成 ref 反而会让 Vue 白白重渲染。 */
@@ -549,13 +578,29 @@ function refreshLayout(options: RefreshOptions = {}): void {
     const rootEl = root.value
     if (!rootEl) return
     applyFragmentRanges()
-    if (!anchor) return
-    if (anchorEnd && (anchorEnd.blockId !== anchor.blockId || anchorEnd.offset !== anchor.offset)) {
-      placeRange(rootEl, anchor, anchorEnd)
-    } else if (afterBreak) {
-      placeCaretAfterBreak(rootEl, anchor)
+    if (anchor) {
+      if (
+        anchorEnd &&
+        (anchorEnd.blockId !== anchor.blockId || anchorEnd.offset !== anchor.offset)
+      ) {
+        placeRange(rootEl, anchor, anchorEnd)
+      } else if (afterBreak) {
+        placeCaretAfterBreak(rootEl, anchor)
+      } else {
+        placeCaret(rootEl, anchor)
+      }
+    }
+    /*
+     * 重排会重建片段 DOM，整格复选的高亮得重画（类名挂在 <td> 上，跟着 DOM 一起没了）。
+     * 顺手把「重排之后那张表已经不在页面上」的复选收掉（PLAN 13.2 列的退出条件之一）——
+     * 一格都不剩（行列被删掉、撤销回到更小的表）时同理；这时还要报一次，
+     * 否则调用方的「已选 N 格」会停在旧值上。
+     */
+    if (cellSelection && cellSelectionCells().length === 0) {
+      dropCellSelection()
+      emitSelection()
     } else {
-      placeCaret(rootEl, anchor)
+      paintCellSelection()
     }
   })
 }
@@ -806,27 +851,46 @@ function emitSelection(): void {
   }
   const rootEl = root.value
   if (!rootEl) return
+  const summary = cellSelectionSummary()
   const range = currentRange(rootEl)
-  if (!range) {
+  /*
+   * 落点：原生选区在正文里就用它。取不到时（整格刷选把原生选区塌掉了、点完按钮焦点走了）
+   * 只要还有整格复选，就用复选里的第一格兜底 —— 不兜这一下，「已选 4 格」与对齐/样式按钮的
+   * active 态会跟高亮一起消失。
+   */
+  const fallback = summary && cellSelectionCells()[0]
+  const blockId =
+    range && findContainer(doc.value, range.start.blockId)
+      ? range.start.blockId
+      : summary && fallback
+        ? cellId(summary.tableId, fallback.row, fallback.col)
+        : null
+  if (!blockId) {
     emit('selection-change', null)
     return
   }
-  const container = findContainer(doc.value, range.start.blockId)
+  const container = findContainer(doc.value, blockId)
   if (!container) {
     emit('selection-change', null)
     return
   }
   // 格子的样式回真实值（缺省 listItem）；段落回它自己的 kind
-  const block = findBlock(doc.value, range.start.blockId)
-  const kind: BlockKind = block ? block.kind : (findCell(doc.value, range.start.blockId)?.kind ?? 'listItem')
-  const p = prefixLength(range.start.blockId)
-  const from = Math.max(0, range.start.offset - p)
-  const to = Math.max(from, range.end.offset - p)
+  const block = findBlock(doc.value, blockId)
+  const kind: BlockKind = block ? block.kind : (findCell(doc.value, blockId)?.kind ?? 'listItem')
+  const p = prefixLength(blockId)
+  const from = range ? Math.max(0, range.start.offset - p) : 0
+  const to = range ? Math.max(from, range.end.offset - p) : from
   // 光标在格子里时把表格上下文一并带出去：App 没有响应式的模型，上下文工具条只能靠这一次 emit
-  const cell = parseCellId(range.start.blockId)
+  const cell = parseCellId(blockId)
   const table = cell ? findTable(doc.value, cell.tableId) : undefined
+  const ctx = cell && table ? tableContextOf(table, cell.row, cell.col) : undefined
+  if (ctx && summary) {
+    // 有整格复选时，两组对齐的 active 态按**整批的一致性**回显（不一致 → 没有值 → 按钮都不亮）
+    ctx.alignH = summary.alignH
+    ctx.alignV = summary.alignV
+  }
   emit('selection-change', {
-    blockId: range.start.blockId,
+    blockId,
     kind,
     from,
     to,
@@ -836,8 +900,9 @@ function emitSelection(): void {
     color: to > from ? rangeColor(container, from, to) : undefined,
     // 插入符（没选中文字）也要报：点一下修订文字就能整串接受/拒绝
     revisions: hasRevisions(container, from, to),
-    ...(cell && table ? { table: tableContextOf(table, cell.row, cell.col) } : {}),
-    section: sectionContextOf(range.start.blockId),
+    ...(ctx ? { table: ctx } : {}),
+    ...(summary ? { cellSelection: summary } : {}),
+    section: sectionContextOf(blockId),
   })
 }
 
@@ -896,6 +961,12 @@ function onSelectionChange(): void {
   }
   const rootEl = root.value
   if (!rootEl) return
+  /*
+   * 整格刷选期间一律不当「落点变更」处理：那会儿原生选区是我们自己塌掉的，
+   * 浏览器沿着指针扩出来的区间不是用户意图 —— 它还会把「光标出了这张表」判成真，
+   * 于是刷到表格边缘时复选会自己消失。
+   */
+  if (cellDrag?.brushing) return
   const sel = document.getSelection()
   if (!sel || sel.rangeCount === 0) return
   const range = sel.getRangeAt(0)
@@ -906,6 +977,11 @@ function onSelectionChange(): void {
   if (selected.length > 0) stickyRanges = selected
   const point = displayPointOf(rootEl, range.startContainer, range.startOffset)
   if (point && range.collapsed) lastCaret = point
+  // 光标移出那张表（点正文别处、方向键走到表外、切模板重排）→ 复选收起
+  const caretCell = parseCellId(point?.blockId ?? '')
+  if (cellSelection && (!caretCell || caretCell.tableId !== cellSelection.tableId)) {
+    dropCellSelection()
+  }
   emitSelection()
 }
 
@@ -1033,9 +1109,43 @@ function deleteSelection(range: Range, always = false): DisplayPoint | null {
       rev,
     )
   } else {
-    for (const r of selectedRanges(rootEl)) {
-      const p = prefixLength(r.blockId)
-      deleteRange(doc.value, r.blockId, Math.max(0, r.from - p), Math.max(0, r.to - p), rev)
+    /*
+     * 端点落在表格格子上时（选区的一端正好是表格：全选一整页、而这一页末尾摊着一行表格，
+     * 就是这种情形），**跨段并段那条 Word 语义不该因此失效** —— 段落的两个端点改取选区里
+     * 最外侧的**段落**，格子（表达不了并格）仍旧各按容器删。不这么分一下，整页删除会退化成
+     * 「把每一段各自清空」，段落不再并成一段（2026-09-16 W7 实测：② 让样本表的表头行落到
+     * 第 1 页之后，X6 的那条断言就红在这里）。
+     */
+    const ranges = selectedRanges(rootEl)
+    const para = (r: DisplayRange): boolean => parseCellId(r.blockId) === null
+    const headPara = ranges.find(para)
+    const tailPara = [...ranges].reverse().find(para)
+    if (headPara && tailPara) {
+      const spanStart: BlockPoint = {
+        blockId: headPara.blockId,
+        offset: Math.max(0, headPara.from - prefixLength(headPara.blockId)),
+      }
+      deleteSpan(
+        doc.value,
+        spanStart,
+        {
+          blockId: tailPara.blockId,
+          offset: Math.max(0, tailPara.to - prefixLength(tailPara.blockId)),
+        },
+        rev,
+      )
+      caret.blockId = spanStart.blockId
+      caret.offset = spanStart.offset
+      for (const r of ranges) {
+        if (para(r)) continue
+        const p = prefixLength(r.blockId)
+        deleteRange(doc.value, r.blockId, Math.max(0, r.from - p), Math.max(0, r.to - p), rev)
+      }
+    } else {
+      for (const r of ranges) {
+        const p = prefixLength(r.blockId)
+        deleteRange(doc.value, r.blockId, Math.max(0, r.from - p), Math.max(0, r.to - p), rev)
+      }
     }
   }
 
@@ -1224,6 +1334,12 @@ function onKeydown(event: KeyboardEvent): void {
   if (mod && event.shiftKey && !event.altKey && (event.key === 'z' || event.key === 'Z')) {
     event.preventDefault()
     redo()
+    return
+  }
+  // 整格复选：Esc 收起（PLAN 13.2 的退出条件之一）。没有复选时不接管，Esc 照旧留给别处
+  if (event.key === 'Escape' && cellSelection) {
+    event.preventDefault()
+    clearCellSelection()
     return
   }
   if (event.key === 'Tab') {
@@ -1635,19 +1751,35 @@ function forSelection(
 }
 
 /**
- * 段落样式 / 格内样式。跨段落 + 跨格的选区都走 setContainerKind（格子设格子的 kind、
- * 段落设段落的 kind）；返回值 = 「这一下有没有落到模型上」，供 F4 决定要不要记它。
+ * 段落样式 / 格内样式。
+ *
+ * 格内样式走**目标格列表**（整格复选时是整批；没有复选时是原生选区覆盖到的格子、
+ * 或落点那一格）—— 单选时列表就一格，与多选是同一条代码。
+ * 段落仍按老路走（选区覆盖到的每一块）。返回值 = 「这一下有没有落到模型上」，供 F4 决定要不要记它。
  */
 function applyBlockKind(kind: BlockKind): boolean {
   const rootEl = root.value
   if (!rootEl) return false
   const range = currentRange(rootEl)
-  if (!range) return false
+  const group = cellTargets()
+  if (!range && !group) return false
   const ids = new Set(selectedRanges(rootEl).map((r) => r.blockId))
-  if (ids.size === 0) ids.add(range.start.blockId)
-  pushHistory()
-  for (const id of ids) setContainerKindOp(doc.value, id, kind)
-  refreshLayout({ anchor: range.start, anchorEnd: range.end, force: true })
+  if (range && ids.size === 0) ids.add(range.start.blockId)
+  const paragraphs = [...ids].filter((id) => parseCellId(id) === null)
+  const cellChanges = group ? cellsChangingKind(group.table, group.cells, kind) : []
+  if (paragraphs.length === 0 && cellChanges.length === 0) return false
+  pushHistory(caretPoint())
+  for (const id of paragraphs) setContainerKindOp(doc.value, id, kind)
+  if (group && cellChanges.length > 0) {
+    setCellsKind(group.table, group.cells, kind)
+    finishCellsOp(group)
+    return true
+  }
+  refreshLayout({
+    anchor: range?.start ?? null,
+    anchorEnd: range?.end ?? null,
+    force: true,
+  })
   void nextTick(emitSelection)
   return true
 }
@@ -2139,6 +2271,7 @@ function finishTableOp(target: TableCaretTarget, row: number, col: number, offse
 function insertTableRow(where: 'above' | 'below'): void {
   const target = tableTarget()
   if (!target) return
+  dropCellSelection()
   pushHistory(target.point)
   /*
    * 落点要夹进 body 区间：光标停在 unit 行时「上方插入行」的直觉落点是 0 号位，
@@ -2158,6 +2291,7 @@ function removeTableRow(): void {
   if (target.table.rows[target.row]?.role !== 'body') return
   if (bodyRowIndexes(target.table).length <= 1) return
   const ordinal = bodyOrdinal(target.table, target.row)
+  dropCellSelection()
   pushHistory(target.point)
   removeBodyRow(target.table, target.row)
   // 删完后的 body 行序数取 min(k, bodyRows'-1)，再换算回 rows 数组下标
@@ -2170,6 +2304,7 @@ function removeTableRow(): void {
 function insertTableColumn(where: 'left' | 'right'): void {
   const target = tableTarget()
   if (!target) return
+  dropCellSelection()
   pushHistory(target.point)
   insertColumn(target.table, where === 'left' ? target.col : target.col + 1)
   // 左侧插入：光标那一列变成 +1；右侧插入：光标那一列不动
@@ -2181,12 +2316,13 @@ function removeTableColumn(): void {
   const target = tableTarget()
   if (!target) return
   if (target.table.columns <= 1) return
+  dropCellSelection()
   pushHistory(target.point)
   removeColumn(target.table, target.col)
   finishTableOp(target, target.row, Math.min(target.col, target.table.columns - 1), target.offset)
 }
 
-/** 行高两档（最小一行 / 最小两行）；锚点不变 */
+/** 行高两档（最小一行 / 最小两行；**只管正文行** —— 表头 / 附注行恒一行）；锚点不变 */
 function applyTableMinLines(minLines: 1 | 2): boolean {
   const target = tableTarget()
   if (!target) return false
@@ -2210,9 +2346,10 @@ function applyTableRoleRow(role: 'unit' | 'note', on: boolean): boolean {
   if (on && index >= 0) return false
   if (!on && index < 0) return false
 
+  // 表头行插在最前、附注行加在最后，两者都会让行列下标整体位移 → 复选先收起（同增删行列）
+  dropCellSelection()
   pushHistory(target.point)
   setRoleRow(table, role, on)
-
   if (role === 'unit') {
     if (on) {
       // 新行插在 0 号位，光标所在行整体 +1
@@ -2253,6 +2390,8 @@ function removeTable(): void {
   if (!target) return
   const index = doc.value.blocks.findIndex((block) => block.id === target.tableId)
   if (index < 0) return
+  // 整张表都没了，复选当然也留不住（refreshLayout 那侧还会兜一遍「表不在页面上」）
+  dropCellSelection()
   pushHistory(target.point)
   if (!removeTableOp(doc.value, target.tableId)) return
   refreshLayout({ anchor: tableAnchorAfterRemoval(index), force: true })
@@ -2276,46 +2415,379 @@ function tableAnchorAfterRemoval(index: number): DisplayPoint | null {
 }
 
 /**
- * 水平对齐三档（只有左 / 居中 / 右，不做两端对齐）。
+ * 水平对齐三档（只有左 / 居中 / 右，不做两端对齐）；作用于**整格操作的目标格列表**。
  * 与当前**实际生效值**相同 → 清除该维覆盖（回默认：unit 右 / note 左 / body 跟该格样式）。
  */
 function applyTableCellAlignH(value: Align): boolean {
-  const target = tableTarget()
-  if (!target) return false
-  const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
-  if (!cell) return false
-  const role = target.table.rows[target.row]?.role ?? 'body'
-  const styleAlign = resolved.value.styles[cell.kind ?? 'listItem'].align
-  const effective = cell.align?.h ?? defaultCellAlignH(role, styleAlign)
-  const next = effective === value ? null : value
-  if ((cell.align?.h ?? null) === next) return false
-  pushHistory(target.point)
-  setCellAlign(cell, 'h', next)
-  finishTableOp(target, target.row, target.col, target.offset)
-  return true
+  return applyCellsAlign('h', value)
 }
 
 function setTableCellAlignH(value: Align): void {
   repeatable(() => applyTableCellAlignH(value))
 }
 
-/** 垂直对齐三档；同样「点当前值 = 回默认 top」 */
+/** 垂直对齐三档；同样「点当前值 = 回默认 top」，同样作用于目标格列表 */
 function applyTableCellAlignV(value: CellVerticalAlign): boolean {
-  const target = tableTarget()
-  if (!target) return false
-  const cell = findCell(doc.value, cellId(target.tableId, target.row, target.col))
-  if (!cell) return false
-  const effective = cell.align?.v ?? 'top'
-  const next = effective === value ? null : value
-  if ((cell.align?.v ?? null) === next) return false
-  pushHistory(target.point)
-  setCellAlign(cell, 'v', next)
-  finishTableOp(target, target.row, target.col, target.offset)
-  return true
+  return applyCellsAlign('v', value)
 }
 
 function setTableCellAlignV(value: CellVerticalAlign): void {
   repeatable(() => applyTableCellAlignV(value))
+}
+
+/* -------------------------------------------------------------------------- */
+/* 表格：整格复选（拖动刷选 + Ctrl+点击追加，W7）                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 整格复选：一张表内的若干矩形格区间（模型坐标）。
+ *
+ * 它是**组件的交互状态**：既不进模型（模型只在批量操作执行时被改），也不进渲染函数 ——
+ * `renderTableFragment` 与量测共用，让「选中」去改它产出的 HTML，量测缓存签名与逐块量测对账
+ * 会一起崩。所以高亮是 **DOM 后处理**：组件按 `<td>` 上恒定的 `data-cell-id` 挂一个类名
+ * （见 render/css.ts 的 CELL_SELECTION_CLASS），只改底色，不动任何几何。
+ */
+interface CellSelection {
+  tableId: string
+  /** 一个矩形一块；Ctrl+追加就是往里再加一块，「选中了哪些格」由它现推 */
+  blocks: CellRect[]
+}
+
+/**
+ * 正在按下的这一次指针手势。
+ *
+ * Word 的规则照抄在这里：**在格内按下拖动、只要没出这个格子就还是普通的选文字**，
+ * 越过起点格的盒子才转成整格刷选（否则格内加粗、下划线这些就没法用了）。
+ */
+interface CellDrag {
+  tableId: string
+  /** 起点格在页面上的盒子（`<td>` 的矩形），用它判断「出格了没有」 */
+  box: { left: number; top: number; right: number; bottom: number }
+  /** 起点格（刷选时的第一个端点） */
+  from: CellRef
+  /** Ctrl 按下时：已有复选当基底；不按 Ctrl 时是空的（刷出来的矩形整块替换） */
+  base: CellRect[]
+  /** Ctrl 追加时的锚格（上一次整格操作的落点）；不按 Ctrl 时就是起点格 */
+  anchor: CellRef
+  ctrl: boolean
+  /** 已经转成整格刷选（越过起点格至少一次） */
+  brushing: boolean
+}
+
+/** 事件目标落在哪个格子里（不在格子里返回 null）；行列都归一化成模型坐标 */
+function cellHit(
+  target: EventTarget | null,
+): { tableId: string; table: TableBlock; cell: CellRef } | null {
+  if (!(target instanceof Element)) return null
+  /*
+   * 认格子的钩子是 `<td>` 上恒定的 `data-cell-id`，不是格内那层 div：指针落在格内的
+   * **任何**地方都算这一格 —— 点在 div 之外的空白处（内边距、下端那半截空格子）时
+   * `event.target` 就是 `<td>` 本身，只认 div 会把这些位置判成「不在格子里」。
+   * （2026-09-16 实测踩到：格内文字只占上半截，瞄着格子中心按下时目标就是 `<td>`。）
+   */
+  const td = target.closest<HTMLElement>('td[data-cell-id]')
+  if (!td) return null
+  const parsed = parseCellId(td.dataset.cellId ?? '')
+  if (!parsed) return null
+  const table = findTable(doc.value, parsed.tableId)
+  const row = table?.rows[parsed.row]
+  if (!table || !row) return null
+  const col = normalizeCellCol(table, parsed.row, parsed.col)
+  // 渲染时凑矩形补出来的幻影格没有容器，落点选它没有意义（同 edit/table.ts 的 rowSlots）
+  if (row.role === 'body' && !row.cells[col]) return null
+  return { tableId: parsed.tableId, table, cell: { row: parsed.row, col } }
+}
+
+/**
+ * 高亮重画：按模型坐标给命中的 `<td>` 挂类名。
+ *
+ * 只改 class、不碰几何、不重建 DOM —— 量测（与预览共用 renderTableFragment）与
+ * 「逐块量测对账」都因此完全不受影响。同一张表跨页时高亮跟着各片段各自画（按坐标判，不按元素记）。
+ */
+function paintCellSelection(): void {
+  const rootEl = root.value
+  if (!rootEl) return
+  const sel = cellSelection
+  const hit = new Set<string>()
+  if (sel) {
+    const table = findTable(doc.value, sel.tableId)
+    if (table) {
+      for (const { row, col } of cellsInRects(table, sel.blocks)) {
+        hit.add(cellId(sel.tableId, row, col))
+      }
+    }
+  }
+  for (const td of rootEl.querySelectorAll<HTMLElement>('td[data-cell-id]')) {
+    td.classList.toggle(CELL_SELECTION_CLASS, hit.has(td.dataset.cellId ?? ''))
+  }
+}
+
+/** 收起复选（只改状态与高亮，不 emit）。返回「原来有没有」 */
+function dropCellSelection(): boolean {
+  if (!cellSelection) return false
+  cellSelection = null
+  cellAnchor = null
+  paintCellSelection()
+  return true
+}
+
+/** 复选变了：重画高亮 + 把「选中了几格」报给调用方（不改 viewDoc / pages，也不重量测） */
+function commitCellSelection(): void {
+  paintCellSelection()
+  emitSelection()
+}
+
+/**
+ * 清空复选。退出条件（PLAN 13.2）：`Esc`、点正文别处、光标移出那张表、
+ * 重排后那张表不在页面上了 —— 一律走到这里。
+ */
+function clearCellSelection(): void {
+  if (dropCellSelection()) emitSelection()
+}
+
+/** 复选里**真实存在**的格（行优先、去重） */
+function cellSelectionCells(): CellRef[] {
+  const sel = cellSelection
+  if (!sel) return []
+  const table = findTable(doc.value, sel.tableId)
+  return table ? cellsInRects(table, sel.blocks) : []
+}
+
+/**
+ * 复选的概况（App 的「已选 N 格」与对齐/样式按钮的 active 态吃它）。
+ *
+ * 整批**一致**的值才带出去：不一致就省略那个字段 —— 调用方按它回显的话，
+ * 选中的格里对不齐时按钮一个都不会亮（正是我们要的）。
+ */
+function cellSelectionSummary(): CellSelectionSummary | null {
+  const sel = cellSelection
+  if (!sel) return null
+  const table = findTable(doc.value, sel.tableId)
+  if (!table) return null
+  const cells = cellSelectionCells()
+  if (cells.length === 0) return null
+  const spec = resolved.value
+  const kinds = new Set<BlockKind>()
+  const hs = new Set<Align>()
+  const vs = new Set<CellVerticalAlign>()
+  for (const { row, col } of cells) {
+    const cell = table.rows[row]?.cells[col]
+    const role = table.rows[row]?.role ?? 'body'
+    const kind = cell ? storedCellKind(cell) : 'listItem'
+    kinds.add(kind)
+    hs.add(cell?.align?.h ?? defaultCellAlignH(role, spec.styles[kind].align))
+    vs.add(cell?.align?.v ?? 'top')
+  }
+  const only = <T>(values: Set<T>): T | undefined =>
+    values.size === 1 ? [...values][0] : undefined
+  return {
+    tableId: sel.tableId,
+    count: cells.length,
+    multiple: cells.length > 1,
+    ...(only(kinds) ? { kind: only(kinds) } : {}),
+    ...(only(hs) ? { alignH: only(hs) } : {}),
+    ...(only(vs) ? { alignV: only(vs) } : {}),
+  }
+}
+
+/**
+ * 把原生选区折叠到它的起点。
+ *
+ * 「整格刷选」期间原生选区不再是选中态的载体（Word 也是整格高亮、不选文字），
+ * 但它还会顺着指针一路扩 —— 所以转模式的那一刻收一次、拖完再收一次，
+ * 保证刷选过后**没有残留的原生选区**（断言查的就是这一条）。
+ */
+function collapseNativeSelection(): void {
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0) return
+  const range = sel.getRangeAt(0)
+  if (range.collapsed) return
+  range.collapse(true)
+  sel.removeAllRanges()
+  sel.addRange(range)
+}
+
+function onPointerDown(event: PointerEvent): void {
+  if (!props.editable || event.button !== 0) return
+  cellDrag = null
+  const hit = cellHit(event.target)
+  if (!hit) {
+    // 点正文别处：复选收起
+    clearCellSelection()
+    return
+  }
+  const td = (event.target as Element).closest('td') ?? (event.target as Element)
+  const box = td.getBoundingClientRect()
+  const ctrl = event.ctrlKey || event.metaKey
+  const sameTable = cellSelection?.tableId === hit.tableId
+  cellDrag = {
+    tableId: hit.tableId,
+    box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+    from: hit.cell,
+    base: ctrl && sameTable ? (cellSelection?.blocks ?? []).slice() : [],
+    anchor: ctrl && sameTable && cellAnchor ? cellAnchor : hit.cell,
+    ctrl,
+    brushing: false,
+  }
+  // 不按 Ctrl：一按下就清（单击与「格内选文字」都算重新落点；Ctrl 那一下要拿旧复选当基底，不能清）
+  if (!ctrl) clearCellSelection()
+}
+
+function onPointerMove(event: PointerEvent): void {
+  const drag = cellDrag
+  if (!drag) return
+  if (!drag.brushing) {
+    const inside =
+      event.clientX >= drag.box.left &&
+      event.clientX <= drag.box.right &&
+      event.clientY >= drag.box.top &&
+      event.clientY <= drag.box.bottom
+    // 没出起点格：不接管，交给浏览器正常选文字（格内加粗、下划线全指着这条路）
+    if (inside) return
+    drag.brushing = true
+    collapseNativeSelection()
+  }
+  // 刷选期间一直拦着原生选区扩展（拖到表格外也拦，否则选区会一路扩到正文里去）
+  event.preventDefault()
+  const hit = cellHit(event.target)
+  if (!hit || hit.tableId !== drag.tableId) return
+  cellSelection = { tableId: drag.tableId, blocks: [...drag.base, cellRectBetween(drag.anchor, hit.cell)] }
+  cellAnchor = hit.cell
+  commitCellSelection()
+}
+
+function onPointerUp(): void {
+  const drag = cellDrag
+  cellDrag = null
+  if (!drag) return
+  if (drag.brushing) {
+    // 拖完再收一次：一路上被浏览器扩出来的原生选区在这里收干净
+    collapseNativeSelection()
+    commitCellSelection()
+    return
+  }
+  if (!drag.ctrl) return
+  /*
+   * Ctrl+点击：点在**已选中的格**上 = 去掉包含它的那一块（Word 的行为）；
+   * 否则以锚格为端点并上「锚格 ↔ 这一格」那块矩形。
+   */
+  const table = findTable(doc.value, drag.tableId)
+  if (!table) return
+  if (!cellSelection || cellSelection.tableId !== drag.tableId) {
+    cellSelection = { tableId: drag.tableId, blocks: [cellRectBetween(drag.from, drag.from)] }
+    cellAnchor = drag.from
+  } else {
+    const at = cellRectIndexOf(table, cellSelection.blocks, drag.from)
+    if (at >= 0) {
+      cellSelection.blocks.splice(at, 1)
+      if (cellSelection.blocks.length === 0) {
+        cellSelection = null
+        cellAnchor = null
+      }
+    } else {
+      cellSelection.blocks.push(cellRectBetween(drag.anchor, drag.from))
+      cellAnchor = drag.from
+    }
+  }
+  commitCellSelection()
+}
+
+function onPointerCancel(): void {
+  cellDrag = null
+}
+
+/**
+ * 整格操作的目标格列表（行优先、去重）。单选与多选走的是同一条代码：
+ *   · 有整格复选 → 就是那一批（拖动刷选 / Ctrl+点击出来的）；
+ *   · 没有复选 → 原生选区覆盖到的格子，一个都没有就回落到落点那一格。
+ * 返回 null = 这一下不作用于任何格子（调用方据此走段落那条路或空转）。
+ */
+function cellTargets(): { tableId: string; table: TableBlock; cells: CellRef[] } | null {
+  const sel = cellSelection
+  if (sel) {
+    const table = findTable(doc.value, sel.tableId)
+    if (!table) return null
+    const cells = cellsInRects(table, sel.blocks)
+    return cells.length > 0 ? { tableId: sel.tableId, table, cells } : null
+  }
+  const rootEl = root.value
+  const ids = new Set((rootEl ? selectedRanges(rootEl) : []).map((range) => range.blockId))
+  const caret = caretPoint()
+  if (caret) ids.add(caret.blockId)
+  const cells: CellRef[] = []
+  let tableId = ''
+  let table: TableBlock | undefined
+  for (const id of ids) {
+    const parsed = parseCellId(id)
+    if (!parsed) continue
+    const found = findTable(doc.value, parsed.tableId)
+    if (!found?.rows[parsed.row]) continue
+    // 跨表选区只取第一张表：原生选区跨两张表没有先例，多做反而会在两条路之间来回抖
+    if (tableId === '') {
+      tableId = parsed.tableId
+      table = found
+    }
+    if (parsed.tableId !== tableId) continue
+    cells.push({ row: parsed.row, col: normalizeCellCol(found, parsed.row, parsed.col) })
+  }
+  if (!table || tableId === '') return null
+  return { tableId, table, cells: sortCells(cells) }
+}
+
+/** 某一格该维的**实际生效值**（覆盖 ?? 角色 / 样式默认）—— 按钮回显与「再点同一个值就清除」都按它 */
+function effectiveCellAlign(table: TableBlock, row: number, col: number, part: 'h' | 'v'): string {
+  const cell = table.rows[row]?.cells[col]
+  if (part === 'v') return cell?.align?.v ?? 'top'
+  const role = table.rows[row]?.role ?? 'body'
+  const kind = cell ? storedCellKind(cell) : 'listItem'
+  return cell?.align?.h ?? defaultCellAlignH(role, resolved.value.styles[kind].align)
+}
+
+/**
+ * 批量改一组格的某一维对齐。
+ *
+ * 规则与单选时同一条：整批的实际生效值都等于 value → 清除覆盖，否则一律写 value。
+ * 一个格都不会变（本来就是这个值、又没有覆盖可清）→ 返回 false：一步都不许记撤销。
+ */
+function applyCellsAlign(part: 'h' | 'v', value: string): boolean {
+  const group = cellTargets()
+  if (!group) return false
+  const { table, cells } = group
+  const next = nextAlignValue(
+    cells.map(({ row, col }) => effectiveCellAlign(table, row, col, part)),
+    value,
+  )
+  if (cellsChangingAlign(table, cells, part, next).length === 0) return false
+  pushHistory(caretPoint())
+  setCellsAlign(table, cells, part, next)
+  finishCellsOp(group)
+  return true
+}
+
+/**
+ * 批量格操作的收尾：锚点落到目标格之一 → 重排 → 补一次回显。
+ *
+ * 重排会重建 DOM，插入符必须按坐标放回去。点位优先沿用落点（复选把原生选区塌掉之后
+ * 它仍在起点格里），落点不在这张表里就用第一格 —— 一次批量只 `pushHistory` 一次，
+ * 撤销一步就能退回整批。
+ */
+function finishCellsOp(group: { tableId: string; table: TableBlock; cells: CellRef[] }): void {
+  const first = group.cells[0]
+  const caret = caretPoint()
+  const parsed = caret ? parseCellId(caret.blockId) : null
+  const inside = parsed?.tableId === group.tableId && group.table.rows[parsed.row] !== undefined
+  const row = inside && parsed ? parsed.row : (first?.row ?? 0)
+  const col = inside && parsed ? normalizeCellCol(group.table, parsed.row, parsed.col) : (first?.col ?? 0)
+  const cell = group.table.rows[row]?.cells[col]
+  const offset = caret && inside ? caret.offset - prefixLength(caret.blockId) : 0
+  refreshLayout({
+    anchor: {
+      blockId: cellId(group.tableId, row, col),
+      offset: Math.min(Math.max(0, offset), cell ? containerLength(cell) : 0),
+    },
+    force: true,
+  })
+  void nextTick(emitSelection)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2650,12 +3122,23 @@ onMounted(async () => {
     }
   }
   document.addEventListener('selectionchange', onSelectionChange)
+  /*
+   * 整格刷选挂在 document 上：指针一旦拖出起点格，后续的移动与松手可能落在版心之外
+   * （别的页、工具栏、窗口外），只挂在 .wtp-content 上会丢事件。pointerdown 例外 ——
+   * 它只挂版心（见模板），点工具栏/侧栏时复选不该被清掉。
+   */
+  document.addEventListener('pointermove', onPointerMove)
+  document.addEventListener('pointerup', onPointerUp)
+  document.addEventListener('pointercancel', onPointerCancel)
   refreshLayout({ force: true })
   emitEditorFlags()
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('selectionchange', onSelectionChange)
+  document.removeEventListener('pointermove', onPointerMove)
+  document.removeEventListener('pointerup', onPointerUp)
+  document.removeEventListener('pointercancel', onPointerCancel)
   if (compSyncTimer !== null) clearTimeout(compSyncTimer)
 })
 
@@ -2760,6 +3243,13 @@ defineExpose({
   removeTable,
   setTableCellAlignH,
   setTableCellAlignV,
+  /** 整格复选里**真实存在**的格（行优先、模型坐标）—— 只读镜像，供验收脚本核对（W7） */
+  getCellSelection: (): { tableId: string; cells: CellRef[] } | null => {
+    const sel = cellSelection
+    if (!sel) return null
+    return { tableId: sel.tableId, cells: cellSelectionCells() }
+  },
+  clearCellSelection,
   deleteBreak,
   keepSelection,
   dropKeptSelection,
@@ -2790,6 +3280,7 @@ defineExpose({
             class="wtp-content"
             :contenteditable="editable ? 'true' : undefined"
             :spellcheck="editable ? 'false' : undefined"
+            @pointerdown="onPointerDown"
             @input="onInput"
             @keydown="onKeydown"
             @beforeinput="onBeforeInput"

@@ -56,10 +56,36 @@ export interface TableSelectionContext {
   minLines: 1 | 2
   hasUnit: boolean
   hasNote: boolean
-  /** 已按角色默认值解析过的实际水平对齐；按钮高亮要按它，不按有没有覆盖 */
-  alignH: Align
-  /** 已解析默认值（缺省 top）的实际垂直对齐 */
-  alignV: CellVerticalAlign
+  /**
+   * 已按角色默认值解析过的实际水平对齐；按钮高亮要按它，不按有没有覆盖。
+   * **整格复选**时给的是整批的一致值 —— 选中的格里对不齐（有覆盖、值不同）就整个省略，
+   * 调用方的按钮因此不该有一个显示成 active。
+   */
+  alignH?: Align
+  /** 已解析默认值（缺省 top）的实际垂直对齐；与 alignH 同一条「整批不一致就省略」的规则 */
+  alignV?: CellVerticalAlign
+}
+
+/**
+ * 表格「整格复选」的概况。
+ *
+ * 复选态本身是组件的交互状态（不进模型），而调用方手里只有这一次 `selection-change`，
+ * 所以「选中了几格 / 是不是多选」以及「整批一致的那个值」都得由组件现算后一并带出来。
+ * 只有在**真的存在整格复选**（拖动刷选或 Ctrl+点击产生的）时才带这个字段 ——
+ * 光标只是落在某个格子里（没有复选）时它不出现。
+ */
+export interface CellSelectionSummary {
+  tableId: string
+  /** 选中的格数（模型坐标下的真实格数：unit / note 行整行算一格） */
+  count: number
+  /** count > 1 */
+  multiple: boolean
+  /** 整批的格内样式一致才有值；不一致时省略 */
+  kind?: BlockKind
+  /** 整批的实际水平对齐一致才有值；不一致时省略 */
+  alignH?: Align
+  /** 整批的实际垂直对齐一致才有值；不一致时省略 */
+  alignV?: CellVerticalAlign
 }
 
 /** 工具栏要的选区信息（模型文字坐标，不含自动编号前缀） */
@@ -83,6 +109,8 @@ export interface EditorSelection {
   revisions: boolean
   /** 落点在表格格子里时给出表格上下文；不在格子里则没有这个字段 */
   table?: TableSelectionContext
+  /** 整格复选（拖动刷选 / Ctrl+点击）的概况；没有复选时没有这个字段 */
+  cellSelection?: CellSelectionSummary
   /** 光标所在节的上下文；供「节」上下文工具条回显与置灰 */
   section?: SectionSelectionContext
 }

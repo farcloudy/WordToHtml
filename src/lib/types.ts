@@ -142,7 +142,11 @@ export interface TableBlock {
   rows: TableRowModel[]
   /** body 行的最大格数；解析时保证 >= 1 */
   columns: number
-  /** 「最小一行 / 最小两行」，即 HeightRule.ATLEAST 的倍数 */
+  /**
+   * 「最小一行 / 最小两行」，即 HeightRule.ATLEAST 的倍数。
+   * **只管正文行**：表头行（unit）与附注行（note）恒为「最小一行」，不随它变
+   * （见 render/css.ts 与 docx/export.ts 的同一条规则）。
+   */
   minLines: 1 | 2
   /** 默认 true（「默认禁止跨页断行」= 行不跨页断开，即 Word 的 w:cantSplit） */
   cantSplit: boolean

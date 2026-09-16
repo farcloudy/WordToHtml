@@ -249,3 +249,168 @@ export function normalizeTable(table: TableBlock): void {
 export function setMinLines(table: TableBlock, minLines: 1 | 2): void {
   table.minLines = minLines
 }
+
+/* -------------------------------------------------------------------------- */
+/* 整格复选：矩形格区间、目标格列表、批量落笔（W7）                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 一个矩形格区间（模型坐标：行列都是 rows / cells 的下标、闭区间）。
+ *
+ * 复选态是**组件的交互状态**，不进模型 —— 模型只在批量操作执行时被改。之所以存矩形而不是
+ * 「选了哪些格」的平铺清单：同一张表跨页会渲成多个片段，高亮要按模型坐标下发，
+ * 矩形是唯一同时能表达「一块」与「跨页」的形状（不连续块之间不做合并显示，见 PLAN 13.2）。
+ */
+export interface CellRect {
+  r1: number
+  c1: number
+  r2: number
+  c2: number
+}
+
+/** 一个格子的模型坐标 */
+export interface CellRef {
+  row: number
+  col: number
+}
+
+/**
+ * 指针落在的格子归一化成模型坐标：unit / note 行整行一格，列一律归到 0。
+ *
+ * 这两行在渲染与导出里都只有第 0 格（展开成 columnSpan = columns），不归一化的话
+ * 「点在这两行的第 5 列」会指向一个不存在的格。
+ */
+export function normalizeCellCol(table: TableBlock, row: number, col: number): number {
+  return table.rows[row]?.role === 'body' ? col : 0
+}
+
+/** 两点之间的矩形（行列各自取 min / max），与两个端点的先后顺序无关 */
+export function cellRectBetween(a: CellRef, b: CellRef): CellRect {
+  return {
+    r1: Math.min(a.row, b.row),
+    c1: Math.min(a.col, b.col),
+    r2: Math.max(a.row, b.row),
+    c2: Math.max(a.col, b.col),
+  }
+}
+
+/**
+ * 矩形里**真实存在**的格（按扫描顺序，未排序）。
+ *
+ * 越界的行列跳过（正常不会发生；撤销、结构操作之后可能）；body 行只数模型里真有的格 ——
+ * 渲染时凑矩形补出来的幻影格没有容器，选中它没有意义（同 rowSlots 那条约定）。
+ * unit / note 行只有第 0 格：矩形要覆盖第 0 列才算选中它（与 normalizeCellCol 同一条约定）。
+ */
+export function cellsInRect(table: TableBlock, rect: CellRect): CellRef[] {
+  const r1 = Math.min(rect.r1, rect.r2)
+  const r2 = Math.max(rect.r1, rect.r2)
+  const c1 = Math.min(rect.c1, rect.c2)
+  const c2 = Math.max(rect.c1, rect.c2)
+  const out: CellRef[] = []
+  for (let r = r1; r <= r2; r += 1) {
+    const row = table.rows[r]
+    if (!row) continue
+    if (row.role !== 'body') {
+      if (c1 <= 0 && c2 >= 0) out.push({ row: r, col: 0 })
+      continue
+    }
+    for (let c = Math.max(0, c1); c <= c2 && c < row.cells.length; c += 1) {
+      out.push({ row: r, col: c })
+    }
+  }
+  return out
+}
+
+/** 行优先排序 + 去重。批量操作的遍历顺序必须稳定（一次批量 = 一步撤销） */
+export function sortCells(cells: readonly CellRef[]): CellRef[] {
+  const seen = new Set<string>()
+  const out: CellRef[] = []
+  for (const cell of cells) {
+    const key = `${cell.row},${cell.col}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ row: cell.row, col: cell.col })
+  }
+  return out.sort((a, b) => a.row - b.row || a.col - b.col)
+}
+
+/** 若干矩形块里的全部格（行优先、去重）—— 「选中了哪些格」由 blocks 现推 */
+export function cellsInRects(table: TableBlock, rects: readonly CellRect[]): CellRef[] {
+  return sortCells(rects.flatMap((rect) => cellsInRect(table, rect)))
+}
+
+/** 包含某格的块下标（Ctrl+点击已选中的格 = 去掉包含它的那一块）；没有就返回 -1 */
+export function cellRectIndexOf(
+  table: TableBlock,
+  rects: readonly CellRect[],
+  cell: CellRef,
+): number {
+  return rects.findIndex((rect) =>
+    cellsInRect(table, rect).some((c) => c.row === cell.row && c.col === cell.col),
+  )
+}
+
+/**
+ * 批量对齐的下一步值：目标格**每一格**的该维实际生效值都等于 value → 清除覆盖（null），
+ * 否则一律写 value。与单选「再点同一个值就是清除覆盖」是同一条规则，只是整批一起判。
+ * 实际生效值由调用方算好传进来（覆盖 ?? 角色 / 样式默认 —— 渲染、导出、工具条回显都按这一条）。
+ */
+export function nextAlignValue(effective: readonly (string | null)[], value: string): string | null {
+  return effective.length > 0 && effective.every((v) => v === value) ? null : value
+}
+
+/** 某格某一维对齐的**存储值**（没有覆盖就是 null）。批量改与「改了没有」的预判共用它 */
+export function storedCellAlign(cell: TableCellModel, part: 'h' | 'v'): string | null {
+  return (part === 'h' ? cell.align?.h : cell.align?.v) ?? null
+}
+
+/** 某格的**存储样式**（缺省语义 = listItem）。批量改与预判共用它 */
+export function storedCellKind(cell: TableCellModel): BlockKind {
+  return cell.kind ?? 'listItem'
+}
+
+/** 这一批格里「该维存储值与目标值不同」的格 —— 空数组 = 这一下是空转，调用方不该记撤销 */
+export function cellsChangingAlign(
+  table: TableBlock,
+  cells: readonly CellRef[],
+  part: 'h' | 'v',
+  value: string | null,
+): CellRef[] {
+  return sortCells(cells).filter(({ row, col }) => {
+    const cell = table.rows[row]?.cells[col]
+    return cell !== undefined && storedCellAlign(cell, part) !== value
+  })
+}
+
+/** 这一批格里「样式与目标样式不同」的格 —— 空数组 = 这一下是空转 */
+export function cellsChangingKind(
+  table: TableBlock,
+  cells: readonly CellRef[],
+  kind: BlockKind,
+): CellRef[] {
+  return sortCells(cells).filter(({ row, col }) => {
+    const cell = table.rows[row]?.cells[col]
+    return cell !== undefined && storedCellKind(cell) !== kind
+  })
+}
+
+/** 批量落笔：把这一批格设成同一个对齐值（null = 清除该维覆盖） */
+export function setCellsAlign(
+  table: TableBlock,
+  cells: readonly CellRef[],
+  part: 'h' | 'v',
+  value: string | null,
+): void {
+  for (const { row, col } of sortCells(cells)) {
+    const cell = table.rows[row]?.cells[col]
+    if (cell) setCellAlign(cell, part, value)
+  }
+}
+
+/** 批量落笔：把这一批格设成同一个样式（设回缺省 listItem 就删字段） */
+export function setCellsKind(table: TableBlock, cells: readonly CellRef[], kind: BlockKind): void {
+  for (const { row, col } of sortCells(cells)) {
+    const cell = table.rows[row]?.cells[col]
+    if (cell) setCellKind(cell, kind)
+  }
+}

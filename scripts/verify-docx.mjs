@@ -283,8 +283,8 @@ writeFileSync(outPath, buffer)
 
   /*
    * 表格：总宽/布局/行高/禁断行/整行合并/顶端对齐都必须在字节层面看得见。
-   * 期望值全部从模型与规格表推导（总宽 = 版心宽、行高 = minLines × 列表段落行距），
-   * 不从 Word 读回来的数推。
+   * 期望值全部从模型与规格表推导（总宽 = 版心宽、行高 = (body 行 ? minLines : 1) × 该行各格样式
+   * 行距的最大值），不从 Word 读回来的数推。
    */
   const tables = model.blocks.filter((b) => b.t === 'table')
   if (usedBuiltinSample && tables.length === 0) {
@@ -370,10 +370,11 @@ writeFileSync(outPath, buffer)
         problems.push(`表${ti}的 w:cantSplit 与模型不符（${rows} 行，模型 cantSplit=${t.cantSplit}）`)
       }
 
-      // 逐行行高 = minLines × 该行各格样式 linePt 的最大值（与导出侧同一条规则）
+      // 逐行行高 = (body 行 ? minLines : 1) × 该行各格样式 linePt 的最大值（与导出侧同一条规则）。
+      // 表头行 / 附注行恒**一行**（W7）：两行是整张表的装饰，不随行高设置变。
       const wantHeights = t.rows.map((row) => {
         const maxPt = Math.max(...renderedCells(t, row).map(linePtOf))
-        return Math.round(t.minLines * maxPt * 20)
+        return Math.round((row.role === 'body' ? t.minLines : 1) * maxPt * 20)
       })
       const gotHeights = [...xml.matchAll(/<w:trHeight w:val="(\d+)" w:hRule="atLeast"\/>/g)].map(
         (m) => Number(m[1]),

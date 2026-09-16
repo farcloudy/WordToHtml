@@ -132,6 +132,7 @@ export {
 } from './edit/model'
 export type {
   BlockPoint,
+  CellSelectionSummary,
   EditorSelection,
   InlineContainer,
   RevisionSpan,
@@ -142,22 +143,35 @@ export type {
 export {
   bodyInsertIndex,
   bodyRowIndexes,
+  cellRectBetween,
+  cellRectIndexOf,
+  cellsChangingAlign,
+  cellsChangingKind,
+  cellsInRect,
+  cellsInRects,
   findCell,
   findTable,
   insertBodyRow,
   insertColumn,
+  nextAlignValue,
+  normalizeCellCol,
   normalizeTable,
   removeBodyRow,
   removeColumn,
   removeTable,
   setCellAlign,
   setCellKind,
+  setCellsAlign,
+  setCellsKind,
   setMinLines,
   setRoleRow,
+  sortCells,
   stepCell,
+  storedCellAlign,
+  storedCellKind,
   verticalCell,
 } from './edit/table'
-export type { CellStep } from './edit/table'
+export type { CellRect, CellRef, CellStep } from './edit/table'
 
 export { formatAmount } from './edit/amount'
 
@@ -210,6 +224,7 @@ export { lineUnitPlan, patchStylesXml } from './docx/lineUnits'
 export type { LineUnit, LineUnitPlan } from './docx/lineUnits'
 
 export {
+  CELL_SELECTION_CLASS,
   KEEP_SELECTION_HIGHLIGHT,
   SEARCH_CURRENT_HIGHLIGHT,
   SEARCH_HIGHLIGHT,

@@ -25,6 +25,14 @@ export const KEEP_SELECTION_HIGHLIGHT = `${WTP}-keep-selection`
 export const SEARCH_HIGHLIGHT = `${WTP}-search-match`
 export const SEARCH_CURRENT_HIGHLIGHT = `${WTP}-search-current`
 
+/**
+ * 整格复选（表格）的高亮类名。组件按模型坐标把它挂在命中的 `<td>` 上（见 render/html.ts 的
+ * `data-cell-id`），这里只给一条底色规则 —— 这条规则**绝不能**动 padding / height / border：
+ * 量测与预览共用 renderTableFragment，选中态要是改了盒模型，
+ * 「量到的就是看到的」这个前提当场就不成立了。
+ */
+export const CELL_SELECTION_CLASS = `${WTP}-cellsel`
+
 function quote(name: string): string {
   return `"${name.replace(/"/g, '')}"`
 }
@@ -101,9 +109,15 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
    * 那层 div 的 min-height 上 —— 那样 div 自己就被撑成两行高，而字仍待在 div 顶部，
    * 于是 `<td>` 上的 vertical-align 挪的是「已经填满格子的 div」，一点视觉效果都没有
    * （2026-09-15 用户实测：最小两行 + 单行文字时垂直对齐失效，设成居中/底端都不动）。
+   *
    * 格内文字可以换成别的样式（`TableCellModel.kind`），所以这里按 STYLE_KEYS 逐条样式生成
    * —— 一行里各格取自己样式的那条，实际行高天然是各格的最大值
    * （docx 侧的 w:trHeight 用同一条规则算，两侧同源）。
+   *
+   * **表头行 / 附注行（`td.wtp-td-plain`）恒为一行高**（W7）：`minLines` 只管正文行，
+   * 所以带 `-min2` 的那条规则把 plain 行排除在外，plain 行的下限由下面不带 `-min2` 的
+   * 那条规则提供（1 行高）。两行的高度是「整张表的装饰」而不是内容，
+   * 跟着行高设置一起变高只会白白把表格撑长（导出侧同一条规则，见 docx/export.ts 的 rowHeight）。
    *
    * 另有一处已知偏差（PLAN 6.8）：列表段落样式的 CSS line-height 是固定值 12pt，
    * 而 Word 的 atLeast 12pt 是「不小于」。单行格两者相同（minLines=2 → 24pt），
@@ -115,11 +129,17 @@ export function buildCss(spec: Spec, ns: string = WTP): string {
       `overflow-wrap: break-word; }`,
     // unit / note 行整行一格且无边框（与导出侧的 NO_BORDERS 对应）
     `.${ns}-table td.${ns}-td-plain { border: 0; }`,
+    // 整格复选的高亮：只给底色。类名由组件在 DOM 上按 data-cell-id 挂（见 CELL_SELECTION_CLASS），
+    // 不进 renderTableFragment —— 那样会把选中态带进量测路径。
+    `.${ns}-table td.${ns}-cellsel { background: rgba(31, 111, 235, 0.22); }`,
   )
   for (const kind of STYLE_KEYS) {
     out.push(
       `.${ns}-table td.${ns}-td-${kind} { height: ${spec.styles[kind].linePt}pt; }`,
-      `.${ns}-table-min2 td.${ns}-td-${kind} { height: ${spec.styles[kind].linePt * 2}pt; }`,
+      // :not(.wtp-td-plain) 是「表头行 / 附注行恒一行」的落点：那条规则在特异性上必须真的落空，
+      // 否则 plain 行的 height 会被它盖掉（两条规则的类数不同，靠 :not 排除最稳）
+      `.${ns}-table-min2 td.${ns}-td-${kind}:not(.${ns}-td-plain) { ` +
+        `height: ${spec.styles[kind].linePt * 2}pt; }`,
     )
   }
   out.push(
