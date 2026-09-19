@@ -35,6 +35,7 @@ export type {
   BlockKind,
   DeepPartial,
   DocTemplate,
+  GridType,
   Length,
   LineRule,
   MarginPreset,

@@ -50,7 +50,7 @@ import type {
 import JSZip from 'jszip'
 
 import { STYLE_KEYS, lengthToPx, lineSpacePt, ptToHalfPoints, ptToTwips } from '../spec'
-import type { Align, LineRule, Spec, TextStyleSpec } from '../spec'
+import type { Align, GridType, LineRule, Spec, TextStyleSpec } from '../spec'
 import type {
   Block,
   CellVerticalAlign,
@@ -106,8 +106,66 @@ function lineRuleOf(r: LineRule): (typeof LineRuleType)[keyof typeof LineRuleTyp
     case 'atLeast':
       return LineRuleType.AT_LEAST
     case 'auto':
+    case 'grid':
+      // 'grid' = 单倍行距吸附文档网格：Word 那侧就是「单倍行距」（每行吸附到一个网格行），
+      // 「一行 = 一个网格行」这件事由 w:docGrid 的 linePitch 兜着，不需要在这里写磅值。
+      // 预览那侧没有网格吸附，由 resolveSpec() 把它的 linePt 折算成网格行高（见 spec.ts）。
       return LineRuleType.AUTO
   }
+}
+
+/**
+ * 文档网格类型。'none'（无网格）不写 `w:type` —— type 的默认值就是 default（无网格），
+ * 这也正是 Word 自己把一份有网格的文档改成「无网格」之后写出来的样子
+ * （2026-09-19 实测：Word 写出 `<w:docGrid w:linePitch="579"/>`，读回 LayoutMode=0）。
+ */
+function gridTypeOf(t: GridType): (typeof DocumentGridType)[keyof typeof DocumentGridType] | undefined {
+  switch (t) {
+    case 'none':
+      return undefined
+    case 'lines':
+      return DocumentGridType.LINES
+    case 'linesAndChars':
+      return DocumentGridType.LINES_AND_CHARS
+  }
+}
+
+/**
+ * 字距向内收的余量，缇。
+ *
+ * 「正好排满」的字距（版心宽 ÷ 每行字数）恰好落在窗口**上缘**上，而窗口是
+ * `(版心宽 ÷ (N+1), 版心宽 ÷ N]` —— 取上缘就意味着「Word 侧的版心宽不能比我们的算术小
+ * 哪怕一缇」。实测 Word 把 `'210mm'` 这类长度换算成缇时比我们的算术**宽 2 缇**
+ * （210mm 准确是 11905.5 缇、Word 用了 11907；28mm 取 1587 也是截断），所以本机取上缘
+ * 也能排成 N 字（独立验收实测：charSpace = −848 时 Word 报 CharsLine = 28）。
+ * 但这个偏差的方向与大小是 Word 的实现细节，换个版本可能就反过来 —— 收 2 缇之后
+ * 版心宽有 ±(2N) 缇（公文那套 0.5mm）的容差，怎么取整都不会掉成 N−1 字。
+ */
+const CHAR_PITCH_MARGIN_TWIPS = 2
+
+/**
+ * 字符网格：把「每行 N 字」换算成 Word 的 `w:charSpace`（`gridCharsPerLine` 没设则返回
+ * undefined = 不限制字数）。算式是在本机 Word 16.0 上**反推**出来的（2026-09-19）：
+ * 把该版面的 CharsLine 依次设成 20/24/26/27/28/29/30，读出 Word 自己写的那七个
+ * charSpace，全落在同一条直线上：
+ *
+ *     charSpace = 204.8 × (字距 − 默认字号)     （三个量都是缇，1pt = 20 缇）
+ *     字距      = 版心宽 ÷ 每行字数
+ *
+ * 204.8 = 4096 ÷ 20，所以 charSpace 的单位是 1/4096 磅；默认字号取 docDefaults 的字号
+ * （就是正文的字号，见 buildDocument 的 `default.document.run.size`）—— Word 的字符网格
+ * 正是以文档默认字号为一个字符格的。
+ *
+ * 代价：字距比「正好排满」小 2 缇，左对齐的整行末尾会比版心右缘短 2N 缇（公文那套
+ * ≈1mm）。两端对齐的段落由 Word 撑满，最后一行的长短本来就无所谓，实际看不出来。
+ */
+function charSpaceOf(spec: Spec): number | undefined {
+  const perLine = spec.page.gridCharsPerLine
+  if (perLine === undefined) return undefined
+  // 版心宽按**纵向**算：字符网格是页面设置的一部分，不随某一节的横排而变化
+  // （横排节的版心更宽，同样的字距自然就排下更多字）。
+  const pitch = contentWidthTwips(spec) / perLine - CHAR_PITCH_MARGIN_TWIPS
+  return Math.round(204.8 * (pitch - ptToTwips(spec.styles.body.sizePt)))
 }
 
 /**
@@ -118,8 +176,8 @@ function lineRuleOf(r: LineRule): (typeof LineRuleType)[keyof typeof LineRuleTyp
  * 不支持这对属性的渲染器才退回到这里的磅值 —— 两者必须同源，否则「谁在用什么」
  * 会变成一个看不出来的分叉。
  *
- * 行距一律显式写出（含 auto → 单倍 240 twips）：正文的默认行距被定义成了
- * 固定值，样式若不写就会继承它 —— 页脚那类要单倍行距的样式会被撑高。
+ * 行距一律显式写出（含 auto / grid → 单倍 240 twips）：正文的默认行距可能不是单倍，
+ * 样式若不写就会继承它 —— 页脚那类要单倍行距的样式会被撑高。
  */
 function spacingOf(
   s: TextStyleSpec,
@@ -133,7 +191,7 @@ function spacingOf(
   return {
     before: ptToTwips(lineSpacePt(s.spaceBeforeLines, spec)),
     after: ptToTwips(lineSpacePt(s.spaceAfterLines, spec)),
-    line: s.lineRule === 'auto' ? 240 : ptToTwips(s.linePt),
+    line: s.lineRule === 'exact' || s.lineRule === 'atLeast' ? ptToTwips(s.linePt) : 240,
     lineRule: lineRuleOf(s.lineRule),
   }
 }
@@ -284,7 +342,7 @@ const BODY_BORDERS = {
 }
 
 /**
- * 表格总宽（twips）= 版心宽 = 页面宽 − 左右页边距。
+ * 版心宽（twips）= 页面宽 − 左右页边距。表格总宽与字符网格的字距都从这里取。
  * 1in = 1440twips = 96px，所以 px * 15（四舍五入）就是缇；换算只在这里做一次。
  */
 function contentWidthTwips(spec: Spec): number {
@@ -505,6 +563,8 @@ export function buildDocument(
     b.t === 'textBlock' ? spec.styles[b.kind].numbering : 'none',
   )
   const liveSections = resolveSections(doc, spec)
+  // 字符网格与具体哪一节无关（字距按纵向版心算），先算一次
+  const charSpace = charSpaceOf(spec)
   const sections: ISectionOptions[] = groupSections(doc).map((group, index) => {
     const children = sectionParagraphs(group, spec, numbering)
     if (children.length === 0) children.push(new Paragraph({}))
@@ -541,13 +601,16 @@ export function buildDocument(
           // w:pgNumType 只在「从 1 重排」时写；不写就接着上一节往下数
           ...(settings?.restartAtOne ? { pageNumbers: { start: 1 } } : {}),
         },
-        // 文档网格。Word 的「行」单位段距（w:beforeLines）以它的 linePitch 为基准，
-        // 没有它 Word 会按一套我们控制不了的行高去算，段间距就对不上了。
-        // 网格类型取 lines（对齐行网格）：行距写成固定值的段落不受网格影响，
-        // 量出来的行盒仍与预览一致 —— 它在这里的作用只是给「1 行」定一个磅值。
+        // 文档网格。两种作用：
+        //   ① Word 的「行」单位段距（w:beforeLines）以它的 linePitch 为基准，没有它
+        //      Word 会按一套我们控制不了的行高去算，段间距就对不上了；
+        //   ② lineRule: 'grid' 的段落靠它把每一行吸附成一个网格行（预览那一侧由
+        //      resolveSpec() 折算成同样的行高），linesAndChars 时还决定每行几个字。
+        // 'none'（无网格）时只留 linePitch、不写 type —— 见 gridTypeOf 的说明。
         grid: {
-          type: DocumentGridType.LINES,
+          type: gridTypeOf(spec.page.gridType),
           linePitch: ptToTwips(spec.page.gridLinePt),
+          ...(charSpace !== undefined ? { charSpace } : {}),
         },
       },
       // 关联前节时**整个 footers 都不写** —— 不写才没有 <w:footerReference>，

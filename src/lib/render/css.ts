@@ -41,6 +41,11 @@ function fontStack(ascii: string, eastAsia: string): string {
   return `${quote(ascii)}, ${quote(eastAsia)}, serif`
 }
 
+/**
+ * 行高。`auto`（单倍）交给浏览器算；其余都用固定值 —— 包括 `grid`（Word 里的「单倍行距
+ * 吸附文档网格」）：浏览器没有网格吸附，只能画成网格行高，而 `resolveSpec()` 已经保证
+ * 这种样式的 `linePt` 就是 `page.gridLinePt`（见 spec.ts）。
+ */
 function lineHeightOf(s: TextStyleSpec): string {
   return s.lineRule === 'auto' ? 'normal' : `${s.linePt}pt`
 }

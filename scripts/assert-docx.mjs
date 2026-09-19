@@ -50,7 +50,12 @@ console.log(`=== 文件模板：${template.label}（${template.key}）===`)
 
 // Word 的枚举取值
 const ALIGN = { left: 0, center: 1, right: 2, both: 3 }
-const LINE_RULE = { auto: 0, atLeast: 3, exact: 4 }
+// wdLineSpaceSingle / wdLineSpaceAtLeast / wdLineSpaceExactly。
+// 'grid'（单倍行距吸附文档网格）在 Word 里就报「单倍」—— 一行正好一个网格行这件事
+// 由文档网格兜着，行距规则本身看不出来（Word 报的 LineSpacing 是它的「单倍」240 缇）。
+const LINE_RULE = { auto: 0, atLeast: 3, exact: 4, grid: 0 }
+// wdLayoutMode：无网格 / 指定行和字符网格 / 只指定行网格
+const LAYOUT_MODE = { none: 0, linesAndChars: 1, lines: 2 }
 const WD_FIELD_PAGE = 33
 const WD_REVISION_INSERT = 1
 const WD_REVISION_DELETE = 2
@@ -115,7 +120,11 @@ for (const kind of Object.keys(spec.styles)) {
     eq(`${s.name}·加粗`, st.bold, s.bold ? -1 : 0),
     eq(`${s.name}·对齐`, st.alignment, ALIGN[s.align]),
     eq(`${s.name}·行距规则`, st.lineSpacingRule, LINE_RULE[s.lineRule]),
-    s.lineRule === 'auto' ? true : eq(`${s.name}·行距(磅)`, st.lineSpacing, s.linePt),
+    // 'auto' / 'grid' 的行距值不判：Word 报的是它自己的「单倍」（240 缇 = 12pt），
+    // 与规格表里那个只在预览用的行高不是一回事（'grid' 的实际行高见下面的文档网格一条）
+    s.lineRule === 'auto' || s.lineRule === 'grid'
+      ? true
+      : eq(`${s.name}·行距(磅)`, st.lineSpacing, s.linePt),
     // 段前/段后的「行」以文档网格行高为基准（lineSpacePt），不是本段行距。
     // Word 报的 SpaceBefore/SpaceAfter 就是 w:before/w:after 这对后备值。
     eq(`${s.name}·段前(磅)`, st.spaceBefore, round2(lineSpacePt(s.spaceBeforeLines, spec))),
@@ -491,6 +500,44 @@ eq('节数', dump.sectionCount, sectionBreaks + 1)
     near(`${tag}·右边距(磅)`, sec.rightMargin, toPt(spec.page.margin.right), 0.1)
     near(`${tag}·页脚距(磅)`, sec.footerDistance, toPt(spec.page.footer), 0.1)
 
+    /*
+     * 文档网格（Word 的「页面设置 → 文档网格」那一栏）。
+     *
+     * 类型直接由规格表推：'none' = 无网格、'linesAndChars' = 指定行和字符网格、
+     * 'lines' = 只指定行网格。
+     *
+     * 每行字数只在**纵向**节上等于规格表的 `gridCharsPerLine`：字符网格的字距是按纵向
+     * 版心算的（见 docx/export.ts 的 charSpaceOf），横排节的版心更宽，同样的字距自然
+     * 排下更多字 —— 这不是缺陷，正是 Word 自己的行为。两种情况都断言，跑不掉。
+     *
+     * 每页行数只在 linesAndChars 上判：那个数就是「版心高 ÷ 网格行高」向下取整
+     * （公文那套 = 22，实测 Word 报的就是 22）；'lines' 时 Word 报的是它按字体算出来的
+     * 数（管理人文件那套报 36，与版心 ÷ 网格行高对不上），不是网格行数，不能拿它判。
+     */
+    eq(`${tag}·网格类型`, sec.layoutMode, LAYOUT_MODE[spec.page.gridType])
+    if (spec.page.gridCharsPerLine !== undefined) {
+      if (live.settings.orientation === 'landscape') {
+        ok(
+          `${tag}·每行字数（横排节版心更宽）`,
+          sec.charsLine > spec.page.gridCharsPerLine,
+          `横排节 CharsLine=${sec.charsLine}，应比纵向的 ${spec.page.gridCharsPerLine} 多`,
+        )
+      } else {
+        eq(`${tag}·每行字数`, sec.charsLine, spec.page.gridCharsPerLine)
+      }
+      if (spec.page.gridType === 'linesAndChars') {
+        // 每页行数 = 这一节的版心高 ÷ 网格行高向下取整（横排节的高是纸的另一边，
+        // 所以按 resolveSections 换算过的 live.page.size 算，不写死 22）
+        const pageLines = Math.floor(
+          (toPt(live.page.size.height) -
+            toPt(spec.page.margin.top) -
+            toPt(spec.page.margin.bottom)) /
+            spec.page.gridLinePt,
+        )
+        eq(`${tag}·每页行数`, sec.linesPage, pageLines)
+      }
+    }
+
     // 关联前节 = 页脚挂在上一节上（Word 报 LinkToPrevious = 1 = True）；
     // 独立设页脚 = 0。首节没有前节，resolveSections 已把它强制成 false → 0
     eq(`${tag}·页脚是否关联前节`, sec.linkedToPrevious, live.settings.linkPrevious ? 1 : 0)
@@ -515,6 +562,7 @@ eq('节数', dump.sectionCount, sectionBreaks + 1)
       `ok   ${tag} ${round2(sec.pageWidth)}×${round2(sec.pageHeight)}磅 ` +
         `方向${sec.orientation} 边距${round2(sec.topMargin)}/${round2(sec.bottomMargin)}/${round2(sec.leftMargin)}/${round2(sec.rightMargin)} ` +
         `页脚"${text}" 关联前节${sec.linkedToPrevious} 域${JSON.stringify(sec.footerFieldTypes)} ` +
+        `网格${sec.layoutMode}(${sec.charsLine}字×${sec.linesPage}行) ` +
         `（${live.settings.linkPrevious ? '继承前一节' : '独立页脚'}，` +
         `${live.settings.restartAtOne ? '从 1 重排' : '接着往下数'}）`,
     )

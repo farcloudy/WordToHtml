@@ -220,24 +220,63 @@ writeFileSync(outPath, buffer)
 
   const problems = []
 
-  // 正文（docDefaults）也要写成行单位
-  const defaults = /<w:pPrDefault\b[\s\S]*?<\/w:pPrDefault>/.exec(stylesXml)?.[0] ?? ''
-  if (!/w:beforeLines=/.test(defaults)) problems.push('docDefaults（正文）没写 beforeLines')
-
-  // 规格表里每条样式（不含正文）都该带上
+  /*
+   * 段前/段后的「行」只在**有文档网格**时写：没有网格时 Word 把「1 行」算作 12pt，
+   * 与规格表的换算基准 15.6pt 无关（见 docx/lineUnits.ts）。所以两种模板正反各验一遍 ——
+   * 该写的样式一处都不能少，不该写的模板一处都不能有（少写会静默变成磅值、
+   * 多写会被 Word 按它自己的「一行」算，两种都是看不见的错误）。
+   */
   const styleIds = Object.entries(spec.styles)
     .filter(([key]) => key !== 'body')
     .map(([, s]) => s.id)
-  const bare = styleIds.filter((id) => {
-    const block = new RegExp(
-      `<w:style\\b[^>]*?w:styleId="${id}"[^>]*>[\\s\\S]*?</w:style>`,
-    ).exec(stylesXml)?.[0]
-    return !block || !/w:beforeLines=/.test(block)
-  })
-  if (bare.length > 0) problems.push(`这些样式没写 beforeLines：${bare.join('、')}`)
+  const hasGrid = spec.page.gridType !== 'none'
 
+  if (hasGrid) {
+    // 正文（docDefaults）也要写成行单位
+    const defaults = /<w:pPrDefault\b[\s\S]*?<\/w:pPrDefault>/.exec(stylesXml)?.[0] ?? ''
+    if (!/w:beforeLines=/.test(defaults)) problems.push('docDefaults（正文）没写 beforeLines')
+
+    const bare = styleIds.filter((id) => {
+      const block = new RegExp(
+        `<w:style\\b[^>]*?w:styleId="${id}"[^>]*>[\\s\\S]*?</w:style>`,
+      ).exec(stylesXml)?.[0]
+      return !block || !/w:beforeLines=/.test(block)
+    })
+    if (bare.length > 0) problems.push(`这些样式没写 beforeLines：${bare.join('、')}`)
+  } else {
+    const lineUnits = [...stylesXml.matchAll(/w:beforeLines=/g)].length
+    if (lineUnits > 0) {
+      problems.push(`无网格的模板不该写 beforeLines（实际 ${lineUnits} 处）`)
+    }
+  }
+
+  /*
+   * 文档网格：每节一枚。'none'（无网格）时**不写 type** —— type 的默认值 default 就是
+   * 无网格，这也正是 Word 自己写出来的样子（见 docx/export.ts 的 gridTypeOf）；
+   * 有网格时 type 必须与规格表一致，设了每行字数就必须带上 charSpace
+   * （Word 读回来报成「每行几字」由 check-docx.ps1 的 CharsLine 验）。
+   */
   const grids = [...docXml.matchAll(/<w:docGrid\b[^>]*>/g)].map((m) => m[0])
-  if (grids.length === 0) problems.push('document.xml 里没有 w:docGrid（「行」就没有基准）')
+  const expectedGrids = resolveSections(model, spec).length
+  if (grids.length !== expectedGrids) {
+    problems.push(`document.xml 里 w:docGrid ${grids.length} 处，应为 ${expectedGrids} 处（每节一枚）`)
+  }
+  const wantedGridType = { lines: 'lines', linesAndChars: 'linesAndChars' }[spec.page.gridType]
+  for (const tag of grids) {
+    if (!hasGrid) {
+      if (/w:type=/.test(tag)) problems.push(`无网格的模板不该写 w:type：${tag}`)
+      continue
+    }
+    if (!tag.includes(`w:type="${wantedGridType}"`)) {
+      problems.push(`网格类型不符：期望 ${wantedGridType}，实际 ${tag}`)
+    }
+    const charSpace = /w:charSpace="(-?\d+)"/.exec(tag)?.[1]
+    if (spec.page.gridCharsPerLine === undefined) {
+      if (charSpace !== undefined) problems.push(`没设每行字数却写了 charSpace：${tag}`)
+    } else if (charSpace === undefined) {
+      problems.push(`设了每行 ${spec.page.gridCharsPerLine} 字，却没写 charSpace：${tag}`)
+    }
+  }
 
   /*
    * 下划线必须在 OOXML 层面看得见。Word 报的 Font.Underline 只能说明「渲染成了下划线」，
@@ -637,8 +676,11 @@ writeFileSync(outPath, buffer)
     process.exit(1)
   }
   console.log(
-    `[ok] 行单位段距：${styleIds.length + 1} 处 spacing 带 beforeLines/afterLines，` +
-      `${grids.length} 处 docGrid（${grids[0]}）`,
+    hasGrid
+      ? `[ok] 行单位段距：${styleIds.length + 1} 处 spacing 带 beforeLines/afterLines，` +
+          `${grids.length} 处 docGrid（${grids[0]}）`
+      : `[ok] 无网格模板：一处 beforeLines/afterLines 都不写（Word 就按磅值排），` +
+          `${grids.length} 处 docGrid 不带 type（${grids[0]}）`,
   )
   console.log(`[ok] 下划线：${underlineTags.length} 处 w:u，全部 val="single"`)
   console.log(`[ok] 软换行：${softBreakTags} 处 <w:br/>（模型里 ${modelSoftBreaks} 枚）`)

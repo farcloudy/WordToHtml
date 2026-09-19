@@ -58,6 +58,11 @@ try {
       footerFieldTypes      = $types
       linkedToPrevious      = [int]$foot.LinkToPrevious
       orientation           = [int]$ps.Orientation
+      # Document grid: 0 = none, 1 = lines and chars, 2 = lines only. CharsLine /
+      # LinesPage are what Word's page-setup dialog shows for this grid.
+      layoutMode            = [int]$ps.LayoutMode
+      charsLine             = [int]$ps.CharsLine
+      linesPage             = [int]$ps.LinesPage
       pageWidth             = [math]::Round([double]$ps.PageWidth, 2)
       pageHeight            = [math]::Round([double]$ps.PageHeight, 2)
       topMargin             = [math]::Round([double]$ps.TopMargin, 2)

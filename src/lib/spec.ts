@@ -50,8 +50,29 @@ export type StyleKey = BlockKind | 'footer'
 
 export const STYLE_KEYS: readonly StyleKey[] = [...BLOCK_KINDS, 'footer']
 
-export type LineRule = 'exact' | 'atLeast' | 'auto'
+/**
+ * 行距规则。
+ *
+ * - `exact`   固定值：行盒恒为 `linePt`，字再大也不撑开；
+ * - `atLeast` 最小值：不小于 `linePt`，字大就跟着撑开；
+ * - `auto`    单倍行距：预览写 `line-height: normal`，docx 写 `w:lineRule="auto"`；
+ * - `grid`    **单倍行距吸附文档网格**：Word 里一行正好占一个网格行，字大了也吸附到
+ *             整数个网格行；浏览器的排版引擎没有网格吸附，预览只能画成固定值
+ *             `page.gridLinePt`。两边因此仍然同源 —— Word 写单倍、预览画网格行高，
+ *             表达的都是「一行 = 一个网格行」（2026-09-19 在 Word 实测：公文那套八条
+ *             样式从固定值 28.95pt 改成它之后，22 行/页与页数一个都没变）。
+ *
+ * 所以 `lineRule: 'grid'` 的样式，其 `linePt` 由 `resolveSpec()` 强制成
+ * `page.gridLinePt`：网格行高只有一个数，写两处迟早会分家。
+ */
+export type LineRule = 'exact' | 'atLeast' | 'auto' | 'grid'
 export type Align = 'left' | 'center' | 'right' | 'both'
+
+/**
+ * 文档网格类型，对应 Word「页面设置 → 文档网格」那三档
+ * （Word COM 的 `PageSetup.LayoutMode`：0 / 2 / 1 依次是下面三种）。
+ */
+export type GridType = 'none' | 'lines' | 'linesAndChars'
 
 /** 自动编号样式；'none' 表示该级不编号 */
 export type NumberingStyle =
@@ -126,18 +147,37 @@ export interface PageSpec {
   /** 页眉顶边到纸张顶边的距离 */
   header: Length
   /**
+   * 文档网格类型。`'none'`（无网格）是 Word 的默认，也是「管理人文件」模板的取值。
+   *
+   * 它不只是「写不写 w:docGrid」：**没有网格时 Word 把「1 行」算作 12pt**（2026-09-19
+   * 实测：段前 1.5 行从 23.4pt 掉到 18pt），与这里的换算基准 15.6pt 无关 —— 所以
+   * `'none'` 的模板连 `w:beforeLines` / `w:afterLines` 也一概不写，只写磅值，
+   * 否则 Word 里的实际段距会静默与预览分家（见 docx/lineUnits.ts）。
+   */
+  gridType: GridType
+  /**
    * 文档网格的行高，pt。**全文只有一个**（docx 里它是节属性 `w:docGrid/@w:linePitch`），
-   * 而段前/段后的「行」就以它为基准 —— 所以行距各不相同的样式用的是同一个基准。
+   * 而段前/段后的「行」、以及 `lineRule: 'grid'` 的行高都以它为基准。
    *
    * 取 15.6pt（312 缇）：这是 Word 中文默认文档的网格（A4 默认页边距下「每页 44 行」），
    * 也是真实公文里实际生效的值 —— 据一份真实公文导出的 styles.xml 实测，Normal 的
    * 「0.5 行」写作 before="156"、Title 的「1.5 行」写作 before="468"，反推 1 行都是
    * 312 缇。按这个基准导出，段前/段后与那份公文逐字相同。
    *
-   * 网格类型用 `lines`（对齐行网格）。文档里行距是固定值的段落不受网格影响，
-   * 量出来的行盒与预览一致；`page.gridLinePt` 只决定「1 行」等于多少磅。
+   * `gridType === 'none'` 时它退化成纯换算常数（预览的段距、docx 的磅值后备都用它，
+   * 两边照旧一致），不再代表 Word 眼里的「一行」。
    */
   gridLinePt: number
+  /**
+   * `gridType === 'linesAndChars'` 时每行排多少字（Word 的「指定行和字符网格」）。
+   * 省略 = 不限制字数，按字号自然排。
+   *
+   * ⚠️ **这一项在预览与导出之间是有意不一致的**：156mm 版心放得下 27 个三号字，浏览器
+   * 不会像 Word 那样压缩字符间距，所以**预览只能排 27 字**（2026-09-16 用户已接受）；
+   * 导出侧照这个数写 `w:charSpace`，Word 打开就是真的 28 字。两边的页数仍要对得上
+   * （实测同一份 demo 源码 27 字与 28 字在 Word 里都是 5 页，与预览一致）。
+   */
+  gridCharsPerLine?: number
 }
 
 /**
@@ -175,10 +215,15 @@ const GOV_MARGIN: MarginSpec = {
  * 每页 22 行的算术：上 37 / 下 35 的版心高 = 637.795pt，÷ 22 = 28.99pt；**取 28.95pt
  * （= 579 缇）才装得下 22 行**（22 × 28.95 = 636.90pt，余 0.90pt），取 29pt 就只剩 21 行。
  *
- * 各条样式一律写「固定值 28.95pt」而不是「单倍行距」：Word 里「单倍行距 + 文档网格每页
- * 22 行」靠的是把每一行**吸附到行网格**，浏览器的排版引擎没有这个能力（`line-height`
- * 只有固定值能表达）。写成固定值，两边的行高与每页行数才一致 —— `verify:pages` 拿预览
- * 页数与 Word 页数逐套模板对账，这条等价关系就是它验的。
+ * 各条样式写的是 `lineRule: 'grid'`（单倍行距吸附文档网格），**不是固定值 28.95pt**：
+ * Word 那侧该是什么就是什么（用户在 Word 里看到的行距是「单倍行距」），而浏览器没有网格
+ * 吸附，预览由 `resolveSpec()` 把这一档的行高折算成网格行高 28.95pt —— 两边仍然是
+ * 「一行 = 一个网格行」。`verify:pages` 拿预览页数与 Word 页数逐套模板对账，验的就是
+ * 这条等价关系（2026-09-19 实测：改成它之后 Word 报 LineSpacingRule=单倍、每页 22 行、
+ * 页数不变）。
+ *
+ * 这一套的网格类型是**指定行和字符网格**（`gridCharsPerLine: 28`）：字符那一维只有 Word
+ * 排得出来，预览排 27 字（见 `PageSpec.gridCharsPerLine` 的说明）。
  */
 const GOV_LINE_PT = 28.95
 
@@ -199,9 +244,9 @@ const GOV_LINE_PT = 28.95
  */
 const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
   /**
-   * 文本标题：二号方正小标宋简体，居中、不加粗。行高**强行**取网格行高 —— 公文里标题
-   * 也占一行网格，整篇的行基线才对得齐（22pt 字的单倍行高是 25.27pt，装得进 28.95pt
-   * 的固定行盒，不会被裁）。段后空一行。
+   * 文本标题：二号方正小标宋简体，居中、不加粗。行高取**网格行**（`lineRule: 'grid'`）
+   * —— 公文里标题也占一行网格，整篇的行基线才对得齐（22pt 字的单倍行高是 25.27pt，
+   * 吸附到一个 28.95pt 的网格行里，不会被裁）。段后空一行。
    */
   title: {
     eastAsia: '方正小标宋简体',
@@ -210,7 +255,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'center',
     firstLineChars: 0,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 1,
@@ -224,7 +269,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'both',
     firstLineChars: 2,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -238,7 +283,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'both',
     firstLineChars: 2,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -252,7 +297,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'both',
     firstLineChars: 2,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -266,7 +311,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'both',
     firstLineChars: 2,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -280,7 +325,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'left',
     firstLineChars: 0,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -294,7 +339,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'right',
     firstLineChars: 0,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 0,
@@ -311,7 +356,7 @@ const GOV_STYLES: { [K in StyleKey]?: Partial<TextStyleSpec> } = {
     bold: false,
     align: 'both',
     firstLineChars: 0,
-    lineRule: 'exact',
+    lineRule: 'grid',
     linePt: GOV_LINE_PT,
     spaceBeforeLines: 0,
     spaceAfterLines: 1,
@@ -387,13 +432,22 @@ export const DOC_TEMPLATES: readonly [DocTemplate, ...DocTemplate[]] = [
   {
     key: 'manager',
     label: '管理人文件',
-    spec: { page: { margin: DEFAULT_MARGIN } },
+    // 「管理人文件」= Word 的常规排版：四边 25mm、**无文档网格**（Word 默认）。
+    // 页面上不设网格之后，段前/段后也不再写「行」单位（见 docx/lineUnits.ts）——
+    // 那样 Word 的实际段距才与本规格表的磅值逐项相同。
+    spec: { page: { margin: DEFAULT_MARGIN, gridType: 'none' } },
   },
   {
     key: 'govDoc',
     label: '简易公文格式',
     spec: {
-      page: { margin: GOV_MARGIN, gridLinePt: GOV_LINE_PT },
+      // 公文标准的版心 + 每页 22 行的行网格 + 每行 28 字的字符网格（后者只有 Word 排得出来）
+      page: {
+        margin: GOV_MARGIN,
+        gridType: 'linesAndChars',
+        gridLinePt: GOV_LINE_PT,
+        gridCharsPerLine: 28,
+      },
       styles: GOV_STYLES,
     },
   },
@@ -444,7 +498,10 @@ export const DEFAULT_SPEC: Spec = {
     margin: DEFAULT_MARGIN,
     footer: '12.5mm',
     header: '12.5mm',
-    // 312 缇 = 15.6pt，Word 中文默认文档网格（见 PageSpec.gridLinePt 的说明）
+    // 无网格 = Word 的默认（「管理人文件」模板就是它，见 DOC_TEMPLATES）
+    gridType: 'none',
+    // 312 缇 = 15.6pt，Word 中文默认文档网格。无网格的模板里它只是「行」的换算常数
+    // （见 PageSpec.gridLinePt 的说明）
     gridLinePt: 15.6,
   },
   styles: {
@@ -642,23 +699,29 @@ export type DeepPartial<T> = T extends readonly (infer U)[]
 /** 把局部覆盖合并到默认规格上。注意 Record 的合并是逐 key 的浅层字段覆盖。 */
 export function resolveSpec(override?: DeepPartial<Spec>): Spec {
   const p = override?.page
+  const page: PageSpec = {
+    size: { ...DEFAULT_SPEC.page.size, ...p?.size },
+    margin: { ...DEFAULT_SPEC.page.margin, ...p?.margin },
+    footer: p?.footer ?? DEFAULT_SPEC.page.footer,
+    header: p?.header ?? DEFAULT_SPEC.page.header,
+    gridType: p?.gridType ?? DEFAULT_SPEC.page.gridType,
+    gridLinePt: p?.gridLinePt ?? DEFAULT_SPEC.page.gridLinePt,
+  }
+  // 可选字段只在真的设了的时候落（与「默认值不落」的仓库约定一致）
+  const charsPerLine = p?.gridCharsPerLine ?? DEFAULT_SPEC.page.gridCharsPerLine
+  if (charsPerLine !== undefined) page.gridCharsPerLine = charsPerLine
+
+  // `lineRule: 'grid'` 的行高只有一个来源：网格行高。调用方覆盖的 linePt 在这里被
+  // 归一化掉 —— 预览画的就是网格行高，留着一个不同的 linePt 只会让「预览 = Word」
+  // 在两个数之间无声地分家（导出的单倍行距根本不看它，最容易漏）。
   const styles = Object.fromEntries(
-    STYLE_KEYS.map((key) => [
-      key,
-      { ...DEFAULT_SPEC.styles[key], ...override?.styles?.[key] },
-    ]),
+    STYLE_KEYS.map((key) => {
+      const s = { ...DEFAULT_SPEC.styles[key], ...override?.styles?.[key] }
+      return [key, s.lineRule === 'grid' ? { ...s, linePt: page.gridLinePt } : s]
+    }),
   ) as Record<StyleKey, TextStyleSpec>
 
-  return {
-    page: {
-      size: { ...DEFAULT_SPEC.page.size, ...p?.size },
-      margin: { ...DEFAULT_SPEC.page.margin, ...p?.margin },
-      footer: p?.footer ?? DEFAULT_SPEC.page.footer,
-      header: p?.header ?? DEFAULT_SPEC.page.header,
-      gridLinePt: p?.gridLinePt ?? DEFAULT_SPEC.page.gridLinePt,
-    },
-    styles,
-  }
+  return { page, styles }
 }
 
 /* -------------------------------------------------------------------------- */
